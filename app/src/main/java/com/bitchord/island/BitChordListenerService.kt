@@ -97,9 +97,9 @@ class BitChordListenerService : NotificationListenerService() {
         LyricsPlaybackStore.onPlayPause = {
             val ctrl = activeController
             if (ctrl?.playbackState?.state == PlaybackState.STATE_PLAYING) {
-                ctrl.transportControls.pause()
+                ctrl.transportControls?.pause()
             } else {
-                ctrl?.transportControls.play()
+                ctrl?.transportControls?.play()
             }
         }
         LyricsPlaybackStore.onNext = { activeController?.transportControls?.skipToNext() }
@@ -176,7 +176,7 @@ class BitChordListenerService : NotificationListenerService() {
             ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
 
         if (title.isBlank()) return
-        val key = "$title\vert{}$artist"
+        val key = "$title|$artist"
         currentTitle = title
         currentArtist = artist
         if (durationMs > 0L) {
@@ -237,3 +237,47 @@ class BitChordListenerService : NotificationListenerService() {
 
         if (isCarModeActive()) {
             suspendForCarMode()
+            return
+        }
+
+        val posMs = LyricsPlaybackStore.currentPositionMs()
+        val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
+        val currLine = if (idx >= 0) currentLines[idx] else null
+        val (chunkIdx, _) = notifier.getMicroChunk(currLine, posMs, currentTitle)
+
+        val renderKey = "$currentTrackKey|$idx|$chunkIdx|$isPlaying"
+        if (renderKey == lastRenderKey) return
+        lastRenderKey = renderKey
+
+        val next1 = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
+        val next2 = if (idx >= 0 && idx + 2 < currentLines.size) currentLines[idx + 2].fullText else ""
+
+        if (!isForegroundStarted) {
+            val notif = notifier.buildNotification(
+                currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying
+            )
+            try {
+                startForeground(
+                    HyperIslandNotifier.NOTIFICATION_ID,
+                    notif,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                )
+                isForegroundStarted = true
+            } catch (_: Exception) {
+                notifier.update(currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying)
+            }
+        } else {
+            notifier.update(currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying)
+        }
+    }
+
+    override fun onDestroy() {
+        stopTicker()
+        fetchJob?.cancel()
+        activeController?.unregisterCallback(mediaCallback)
+        unregisterReceiver(carModeReceiver)
+        suspendForCarMode()
+        scope.cancel()
+        super.onDestroy()
+    }
+}
