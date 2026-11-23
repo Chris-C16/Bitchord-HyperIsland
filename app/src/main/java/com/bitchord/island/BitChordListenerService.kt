@@ -55,7 +55,7 @@ class BitChordListenerService : NotificationListenerService() {
         override fun run() {
             if (!isTicking) return
             syncLyrics(isPlaying = true)
-            handler.postDelayed(this, 180L)
+            handler.postDelayed(this, 350L)
         }
     }
 
