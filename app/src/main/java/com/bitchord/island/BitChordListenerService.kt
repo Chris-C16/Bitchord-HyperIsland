@@ -37,7 +37,7 @@ class BitChordListenerService : NotificationListenerService() {
         override fun run() {
             if (!isTicking) return
             syncLyrics(isPlaying = true)
-            handler.postDelayed(this, 120L)
+            handler.postDelayed(this, 110L)
         }
     }
 
@@ -54,6 +54,8 @@ class BitChordListenerService : NotificationListenerService() {
             syncPlaybackClock(state)
             val playing = state?.state == PlaybackState.STATE_PLAYING
             if (playing) {
+                // Ricontrolla sempre i metadati quando riparte la riproduzione
+                handleMetadata(activeController?.metadata)
                 startTicker()
             } else {
                 stopTicker()
@@ -92,13 +94,18 @@ class BitChordListenerService : NotificationListenerService() {
     }
 
     private fun attachToBitChord(controllers: List<MediaController>?) {
-        // Ignora la nostra stessa MediaSession e aggancia BitChord (o altro player attivo)
         val externalControllers = controllers?.filter { it.packageName != packageName }.orEmpty()
         val target = externalControllers.firstOrNull {
             it.packageName.contains("bitchord", ignoreCase = true)
         } ?: externalControllers.firstOrNull()
 
-        if (target?.sessionToken == activeController?.sessionToken) return
+        if (target?.sessionToken == activeController?.sessionToken) {
+            if (target != null) {
+                handleMetadata(target.metadata)
+                syncPlaybackClock(target.playbackState)
+            }
+            return
+        }
 
         activeController?.unregisterCallback(mediaCallback)
         activeController = target
@@ -133,8 +140,8 @@ class BitChordListenerService : NotificationListenerService() {
 
     private fun handleMetadata(metadata: MediaMetadata?) {
         metadata ?: return
-        val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
-        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
+        val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty().trim()
+        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty().trim()
         val durationMs = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
         val cover = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
             ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
@@ -143,7 +150,7 @@ class BitChordListenerService : NotificationListenerService() {
         val key = "$title|$artist"
         currentTitle = title
         currentArtist = artist
-        currentDurationMs = durationMs
+        if (durationMs > 0L) currentDurationMs = durationMs
 
         LyricsPlaybackStore.title.value = title
         LyricsPlaybackStore.artist.value = artist
@@ -155,20 +162,29 @@ class BitChordListenerService : NotificationListenerService() {
             LyricsPlaybackStore.palette.value = currentPalette
         }
 
-        if (key != currentTrackKey) {
+        // Ricarica anche se currentLines è ancora vuoto (es. se il primo tentativo era arrivato prima dell'artista)
+        if (key != currentTrackKey || (currentLines.isEmpty() && fetchJob?.isActive != true)) {
             currentTrackKey = key
             currentLines = emptyList()
             LyricsPlaybackStore.lines.value = emptyList()
             lastLineIndex = -2
-            syncLyrics(isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING)
+
+            val playingNow = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+            syncLyrics(isPlaying = playingNow)
 
             fetchJob?.cancel()
             fetchJob = scope.launch {
-                val loaded = LyricsRepository.fetchSyncedLyrics(title, artist, durationMs / 1000L)
+                // Breve attesa per far assestare eventuali metadati secondari di BitChord
+                delay(250L)
+                val loaded = LyricsRepository.fetchSyncedLyrics(currentTitle, currentArtist, currentDurationMs / 1000L)
                 currentLines = loaded
                 LyricsPlaybackStore.lines.value = loaded
                 lastLineIndex = -2
+                syncPlaybackClock(activeController?.playbackState)
                 syncLyrics(isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING)
+                if (activeController?.playbackState?.state == PlaybackState.STATE_PLAYING) {
+                    startTicker()
+                }
             }
         }
     }
@@ -193,12 +209,12 @@ class BitChordListenerService : NotificationListenerService() {
         if (idx == lastLineIndex && isPlaying) return
         lastLineIndex = idx
 
-        val curr = if (idx >= 0) currentLines[idx].fullText else ""
+        val currLine = if (idx >= 0) currentLines[idx] else null
         val next = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
 
         if (!isForegroundStarted) {
             val notif = notifier.buildNotification(
-                currentTitle, currentArtist, curr, next, currentCover, currentDurationMs, posMs, isPlaying
+                currentTitle, currentArtist, currLine, next, currentCover, currentDurationMs, posMs, isPlaying
             )
             try {
                 startForeground(
@@ -209,12 +225,12 @@ class BitChordListenerService : NotificationListenerService() {
                 isForegroundStarted = true
             } catch (_: Exception) {
                 notifier.update(
-                    currentTitle, currentArtist, curr, next, currentCover, currentDurationMs, posMs, isPlaying
+                    currentTitle, currentArtist, currLine, next, currentCover, currentDurationMs, posMs, isPlaying
                 )
             }
         } else {
             notifier.update(
-                currentTitle, currentArtist, curr, next, currentCover, currentDurationMs, posMs, isPlaying
+                currentTitle, currentArtist, currLine, next, currentCover, currentDurationMs, posMs, isPlaying
             )
         }
     }
