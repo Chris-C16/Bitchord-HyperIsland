@@ -6,43 +6,31 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.media.MediaMetadata
-import android.media.session.MediaSession
-import android.media.session.PlaybackState
-import android.os.SystemClock
+import android.os.Build
+import android.os.Bundle
+import androidx.compose.ui.graphics.toArgb
 
 class HyperIslandNotifier(private val context: Context) {
     companion object {
-        const val CHANNEL_ID = "bitchord_media_island"
+        const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
     }
 
     private val manager = context.getSystemService(NotificationManager::class.java)
-    val mediaSession = MediaSession(context, "BitChordHyperIslandLyrics")
 
     init {
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "HyperIsland Lyrics Player",
-            NotificationManager.IMPORTANCE_LOW
+            "HyperIsland Lyrics (Live)",
+            NotificationManager.IMPORTANCE_DEFAULT
         ).apply {
-            description = "Pillola HyperIsland con testi sincronizzati"
+            description = "Seconda pillola HyperIsland dedicata ai testi"
+            setSound(null, null)
+            enableVibration(false)
             setShowBadge(false)
             lockscreenVisibility = Notification.VISIBILITY_PUBLIC
         }
         manager.createNotificationChannel(channel)
-
-        val pendingLyrics = createLyricsPendingIntent()
-        mediaSession.setSessionActivity(pendingLyrics)
-        mediaSession.setCallback(object : MediaSession.Callback() {
-            override fun onPlay() { LyricsPlaybackStore.onPlayPause?.invoke() }
-            override fun onPause() { LyricsPlaybackStore.onPlayPause?.invoke() }
-            override fun onSkipToNext() { LyricsPlaybackStore.onNext?.invoke() }
-            override fun onSkipToPrevious() { LyricsPlaybackStore.onPrevious?.invoke() }
-            override fun onSeekTo(pos: Long) { LyricsPlaybackStore.onSeekTo?.invoke(pos) }
-        })
-        mediaSession.isActive = true
     }
 
     private fun createLyricsPendingIntent(): PendingIntent {
@@ -56,36 +44,39 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     /**
-     * Formatta il testo su 2 righe (Titolo + Sottotitolo della card HyperIsland)
-     * evitando che i versi lunghi vengano tagliati con "..."
+     * Senza cover grande a destra, la card ha tutta la larghezza disponibile (~42 caratteri per riga).
+     * Se il verso supera i 42 caratteri, lo spezza in modo pulito tra riga 1 e riga 2.
      */
-    private fun formatTwoLines(currentLyric: String, nextLyric: String, title: String, artist: String): Pair<String, String> {
-        if (currentLyric.isBlank()) {
-            return title to artist
-        }
-        // Se il verso corrente è lungo (> 25 caratteri), lo spezziamo su entrambe le righe
-        // così lo leggi tutto intero e chiaro senza troncamenti!
-        if (currentLyric.length > 25) {
-            val words = currentLyric.split(" ")
-            val firstLine = StringBuilder()
-            val secondLine = StringBuilder()
-            for (w in words) {
-                if (firstLine.length + w.length <= 24) {
-                    if (firstLine.isNotEmpty()) firstLine.append(" ")
-                    firstLine.append(w)
-                } else {
-                    if (secondLine.isNotEmpty()) secondLine.append(" ")
-                    secondLine.append(w)
-                }
-            }
-            val top = firstLine.toString().ifBlank { currentLyric.take(24) }
-            val bottom = secondLine.toString().take(34)
-            return top to bottom
+    private fun formatFullWidthLines(
+        currentLine: LyricLine?,
+        nextLyric: String,
+        title: String,
+        artist: String
+    ): Pair<String, String> {
+        val full = currentLine?.fullText?.trim().orEmpty()
+        if (full.isBlank()) return "$title — $artist" to "In attesa del testo..."
+
+        if (full.length <= 42) {
+            val second = nextLyric.trim().ifBlank { "$title • $artist" }.take(46)
+            return full to second
         }
 
-        // Altrimenti riga 1 = verso attivo, riga 2 = verso successivo intero (senza "• Titolo" che rubava spazio)
-        val bottom = nextLyric.ifBlank { "$title — $artist" }.take(34)
-        return currentLyric to bottom
+        // Verso lungo: distribuisce le parole su tutta la larghezza delle due righe senza mischiare altri versi
+        val words = full.split(" ")
+        val line1 = StringBuilder()
+        val line2 = StringBuilder()
+        for (w in words) {
+            if (line1.length + w.length + 1 <= 40) {
+                if (line1.isNotEmpty()) line1.append(" ")
+                line1.append(w)
+            } else {
+                if (line2.length + w.length + 1 <= 44) {
+                    if (line2.isNotEmpty()) line2.append(" ")
+                    line2.append(w)
+                }
+            }
+        }
+        return line1.toString() to line2.toString()
     }
 
     fun buildNotification(
@@ -93,75 +84,88 @@ class HyperIslandNotifier(private val context: Context) {
         artist: String,
         currentLine: LyricLine?,
         nextLyric: String,
-        cover: Bitmap?,
-        songDurationMs: Long,
+        palette: CoverPalette,
         songPositionMs: Long,
         isPlaying: Boolean
     ): Notification {
-        if (!mediaSession.isActive) mediaSession.isActive = true
+        val (topLine, bottomLine) = formatFullWidthLines(currentLine, nextLyric, title, artist)
 
-        val (topLine, bottomLine) = formatTwoLines(
-            currentLine?.fullText.orEmpty(),
-            nextLyric,
-            title,
-            artist
-        )
+        // Testo compatto per la pillola chiusa in cima (scorrevole sul verso attivo)
+        val miniPillText = buildMiniPillText(currentLine, songPositionMs, title)
 
-        // La barra di avanzamento della HyperIsland anima il progresso del SINGOLO VERSO corrente!
-        val barDuration = if (currentLine != null) {
-            (currentLine.endMs - currentLine.startMs).coerceAtLeast(400L)
-        } else {
-            songDurationMs.coerceAtLeast(1L)
-        }
-        val barPosition = if (currentLine != null) {
-            (songPositionMs - currentLine.startMs).coerceIn(0L, barDuration)
-        } else {
-            songPositionMs.coerceAtLeast(0L)
+        // Progresso (0..100) del singolo verso per la barra animata nella card espansa
+        val lineProgress = if (currentLine != null) {
+            val dur = (currentLine.endMs - currentLine.startMs).coerceAtLeast(300L)
+            (((songPositionMs - currentLine.startMs).toFloat() / dur) * 100f).toInt().coerceIn(0, 100)
+        } else 0
+
+        val accentColor = palette.accent.toArgb()
+        val extras = Bundle().apply {
+            putBoolean("android.requestPromotedOngoing", true)
         }
 
-        val metaBuilder = MediaMetadata.Builder()
-            .putString(MediaMetadata.METADATA_KEY_TITLE, topLine)
-            .putString(MediaMetadata.METADATA_KEY_ARTIST, bottomLine)
-            .putString(MediaMetadata.METADATA_KEY_ALBUM, "$title • $artist")
-            .putLong(MediaMetadata.METADATA_KEY_DURATION, barDuration)
-
-        if (cover != null) {
-            metaBuilder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, cover)
-            metaBuilder.putBitmap(MediaMetadata.METADATA_KEY_ART, cover)
-        }
-        mediaSession.setMetadata(metaBuilder.build())
-
-        val stateCode = if (isPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
-        val actions = PlaybackState.ACTION_PLAY or
-                PlaybackState.ACTION_PAUSE or
-                PlaybackState.ACTION_PLAY_PAUSE or
-                PlaybackState.ACTION_SKIP_TO_NEXT or
-                PlaybackState.ACTION_SKIP_TO_PREVIOUS or
-                PlaybackState.ACTION_SEEK_TO
-
-        mediaSession.setPlaybackState(
-            PlaybackState.Builder()
-                .setActions(actions)
-                .setState(stateCode, barPosition, if (isPlaying) 1f else 0f, SystemClock.elapsedRealtime())
-                .build()
-        )
-
-        val pendingLyrics = createLyricsPendingIntent()
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(topLine)
             .setContentText(bottomLine)
+            .setColor(accentColor)
+            .setColorized(false)
+            .setShowWhen(false)
             .setOngoing(isPlaying)
             .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_PROGRESS)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .setContentIntent(pendingLyrics)
-            .setStyle(
-                Notification.MediaStyle()
-                    .setMediaSession(mediaSession.sessionToken)
-            )
+            .setContentIntent(createLyricsPendingIntent())
+            .addExtras(extras)
 
-        if (cover != null) builder.setLargeIcon(cover)
+        // API ufficiali Android 16 Live Updates (seconda pillola Super Island)
+        if (Build.VERSION.SDK_INT >= 36) {
+            try {
+                Notification.Builder::class.java
+                    .getMethod("setRequestPromotedOngoing", Boolean::class.javaPrimitiveType)
+                    .invoke(builder, true)
+                Notification.Builder::class.java
+                    .getMethod("setShortCriticalText", CharSequence::class.java)
+                    .invoke(builder, miniPillText)
+
+                // Applica Notification.ProgressStyle nativo di Android 16 se disponibile
+                val progressStyleClass = Class.forName("android.app.Notification\$ProgressStyle")
+                val progressStyle = progressStyleClass.getDeclaredConstructor().newInstance()
+                progressStyleClass.getMethod("setProgress", Int::class.javaPrimitiveType)
+                    .invoke(progressStyle, lineProgress)
+                progressStyleClass.getMethod("setStyledByProgress", Boolean::class.javaPrimitiveType)
+                    .invoke(progressStyle, true)
+
+                Notification.Builder::class.java
+                    .getMethod("setStyle", Notification.Style::class.java)
+                    .invoke(builder, progressStyle)
+            } catch (_: Throwable) {
+                builder.setProgress(100, lineProgress, false)
+            }
+        } else {
+            builder.setProgress(100, lineProgress, false)
+        }
+
         return builder.build()
+    }
+
+    private fun buildMiniPillText(currentLine: LyricLine?, songPositionMs: Long, fallbackTitle: String): String {
+        val full = currentLine?.fullText?.trim().orEmpty()
+        if (full.isBlank()) return fallbackTitle.take(18)
+        if (full.length <= 20) return full
+
+        val dur = (currentLine!!.endMs - currentLine.startMs).coerceAtLeast(1L)
+        val progress = ((songPositionMs - currentLine.startMs).toFloat() / dur).coerceIn(0f, 1f)
+        return if (progress < 0.48f) {
+            val sub = full.substring(0, 20)
+            val sp = sub.lastIndexOf(' ')
+            if (sp > 10) sub.substring(0, sp) else sub
+        } else {
+            val start = (full.length - 20).coerceAtLeast(0)
+            val sub = full.substring(start)
+            val sp = sub.indexOf(' ')
+            if (sp in 1..9) sub.substring(sp + 1) else sub
+        }
     }
 
     fun update(
@@ -169,20 +173,15 @@ class HyperIslandNotifier(private val context: Context) {
         artist: String,
         currentLine: LyricLine?,
         nextLyric: String,
-        cover: Bitmap?,
-        songDurationMs: Long,
+        palette: CoverPalette,
         songPositionMs: Long,
         isPlaying: Boolean
     ) {
         manager.notify(
             NOTIFICATION_ID,
-            buildNotification(title, artist, currentLine, nextLyric, cover, songDurationMs, songPositionMs, isPlaying)
+            buildNotification(title, artist, currentLine, nextLyric, palette, songPositionMs, isPlaying)
         )
     }
 
-    fun release() {
-        mediaSession.isActive = false
-        mediaSession.release()
-        manager.cancel(NOTIFICATION_ID)
-    }
+    fun cancel() = manager.cancel(NOTIFICATION_ID)
 }
