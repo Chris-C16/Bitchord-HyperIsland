@@ -9,7 +9,7 @@
     <application
         android:allowBackup="true"
         android:label="Lyrics"
-        android:icon="@drawable/ic_lyrics_note"
+        android:icon="@drawable/ic_launcher_lyrics"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
         <activity
