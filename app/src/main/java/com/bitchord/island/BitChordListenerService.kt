@@ -197,13 +197,12 @@ class BitChordListenerService : NotificationListenerService() {
         handler.removeCallbacks(tickRunnable)
     }
 
-    private fun syncLyrics(isPlaying: Boolean) {
+   private fun syncLyrics(isPlaying: Boolean) {
         if (currentTitle.isBlank()) return
         val posMs = LyricsPlaybackStore.currentPositionMs()
         val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
         val currLine = if (idx >= 0) currentLines[idx] else null
 
-        // Aggiorna ogni ~12% di avanzamento del verso per muovere fluidamente la barra senza spammare SystemUI
         val step = if (currLine != null) {
             val dur = (currLine.endMs - currLine.startMs).coerceAtLeast(300L)
             (((posMs - currLine.startMs).toFloat() / dur) * 8f).toInt().coerceIn(0, 8)
@@ -213,11 +212,12 @@ class BitChordListenerService : NotificationListenerService() {
         if (renderKey == lastRenderKey && isPlaying) return
         lastRenderKey = renderKey
 
-        val next = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
+        val next1 = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
+        val next2 = if (idx >= 0 && idx + 2 < currentLines.size) currentLines[idx + 2].fullText else ""
 
         if (!isForegroundStarted) {
             val notif = notifier.buildNotification(
-                currentTitle, currentArtist, currLine, next, currentPalette, posMs, isPlaying
+                currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying
             )
             try {
                 startForeground(
@@ -227,13 +227,13 @@ class BitChordListenerService : NotificationListenerService() {
                 )
                 isForegroundStarted = true
             } catch (_: Exception) {
-                notifier.update(currentTitle, currentArtist, currLine, next, currentPalette, posMs, isPlaying)
+                notifier.update(currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying)
             }
         } else {
-            notifier.update(currentTitle, currentArtist, currLine, next, currentPalette, posMs, isPlaying)
+            notifier.update(currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying)
         }
     }
-
+   
     override fun onDestroy() {
         stopTicker()
         fetchJob?.cancel()
