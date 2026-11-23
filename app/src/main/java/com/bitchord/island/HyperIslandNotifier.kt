@@ -1,182 +1,133 @@
 package com.bitchord.island
 
-import android.content.BroadcastReceiver
-import android.content.ComponentName
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
-import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
-import android.media.MediaMetadata
-import android.media.session.MediaController
-import android.media.session.MediaSessionManager
-import android.media.session.PlaybackState
-import android.os.SystemClock
-import android.provider.Settings
-import android.service.notification.NotificationListenerService
-import kotlinx.coroutines.*
+import android.graphics.drawable.Icon
+import android.os.Build
+import android.os.Bundle
+import org.json.JSONObject
 
-class BitChordListenerService : NotificationListenerService() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private lateinit var notifier: HyperIslandNotifier
-    private lateinit var overlay: MiniLyricsOverlay
-    private lateinit var sessionManager: MediaSessionManager
+class HyperIslandNotifier(private val context: Context) {
+    companion object {
+        const val CHANNEL_ID = "bitchord_hyperisland_live"
+        const val NOTIFICATION_ID = 3601
+        const val ACTION_TOGGLE_OVERLAY = "com.bitchord.island.TOGGLE_OVERLAY"
+    }
 
-    private var activeController: MediaController? = null
-    private var tickerJob: Job? = null
-    private var fetchJob: Job? = null
-    private var isForegroundStarted = false
-    private var userDismissedOverlay = false
+    private val manager = context.getSystemService(NotificationManager::class.java)
 
-    private var currentTrackKey = ""
-    private var currentTitle = ""
-    private var currentArtist = ""
-    private var currentCover: Bitmap? = null
-    private var currentPalette = CoverPalette()
-    private var currentLines: List<LyricLine> = emptyList()
-    private var lastIslandLine = ""
-
-    private val toggleReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == HyperIslandNotifier.ACTION_TOGGLE_OVERLAY && Settings.canDrawOverlays(this@BitChordListenerService)) {
-                if (overlay.uiState.value.isVisible) {
-                    userDismissedOverlay = true
-                    overlay.hide()
-                } else {
-                    userDismissedOverlay = false
-                    overlay.show()
-                }
-            }
+    init {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "HyperIsland Lyrics",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Testi sincronizzati"
+            setShowBadge(false)
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
         }
+        manager.createNotificationChannel(channel)
     }
 
-    private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener { attachToBitChord(it) }
-
-    private val mediaCallback = object : MediaController.Callback() {
-        override fun onMetadataChanged(metadata: MediaMetadata?) = handleMetadata(metadata)
-        override fun onPlaybackStateChanged(state: PlaybackState?) {
-            if (state?.state == PlaybackState.STATE_PLAYING) {
-                if (!userDismissedOverlay && Settings.canDrawOverlays(this@BitChordListenerService)) {
-                    overlay.show()
-                }
-                startTicker()
-            } else {
-                tickerJob?.cancel()
-                overlay.hide()
-                pushIslandUpdate(isPlaying = false)
-            }
-        }
-    }
-
-    override fun onCreate() {
-        super.onCreate()
-        notifier = HyperIslandNotifier(this)
-        overlay = MiniLyricsOverlay(this)
-        sessionManager = getSystemService(MediaSessionManager::class.java)
-        registerReceiver(toggleReceiver, IntentFilter(HyperIslandNotifier.ACTION_TOGGLE_OVERLAY), RECEIVER_NOT_EXPORTED)
-    }
-
-    override fun onListenerConnected() {
-        super.onListenerConnected()
-        val component = ComponentName(this, BitChordListenerService::class.java)
-        try {
-            sessionManager.addOnActiveSessionsChangedListener(sessionsListener, component)
-            attachToBitChord(sessionManager.getActiveSessions(component))
-        } catch (_: SecurityException) {}
-    }
-
-    private fun attachToBitChord(controllers: List<MediaController>?) {
-        val target = controllers?.firstOrNull { it.packageName.contains("bitchord", ignoreCase = true) } ?: controllers?.firstOrNull()
-        if (target?.sessionToken == activeController?.sessionToken) return
-        activeController?.unregisterCallback(mediaCallback)
-        activeController = target
-        target?.registerCallback(mediaCallback)
-        if (target != null) {
-            handleMetadata(target.metadata)
-            if (target.playbackState?.state == PlaybackState.STATE_PLAYING) {
-                if (!userDismissedOverlay && Settings.canDrawOverlays(this)) overlay.show()
-                startTicker()
-            }
-        } else {
-            tickerJob?.cancel()
-            overlay.hide()
-            if (isForegroundStarted) { stopForeground(STOP_FOREGROUND_REMOVE); isForegroundStarted = false }
-            notifier.cancel()
-        }
-    }
-
-    private fun handleMetadata(metadata: MediaMetadata?) {
-        metadata ?: return
-        val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
-        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
-        val durationMs = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
-        val cover = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
-        if (title.isBlank()) return
-        val key = "$title|$artist"
-        currentTitle = title
-        currentArtist = artist
-        if (cover != null) { currentCover = cover; currentPalette = LyricsRepository.extractPalette(cover) }
-        if (key != currentTrackKey) {
-            currentTrackKey = key
-            userDismissedOverlay = false
-            currentLines = emptyList()
-            lastIslandLine = ""
-            pushIslandUpdate(isPlaying = true)
-            if (Settings.canDrawOverlays(this)) overlay.show()
-            fetchJob?.cancel()
-            fetchJob = scope.launch {
-                currentLines = LyricsRepository.fetchSyncedLyrics(title, artist, durationMs / 1000L)
-                updateOverlayState(computeExactPositionMs())
-            }
-        }
-    }
-
-    private fun computeExactPositionMs(): Long {
-        val state = activeController?.playbackState ?: return 0L
-        if (state.state != PlaybackState.STATE_PLAYING) return state.position
-        return state.position + ((SystemClock.elapsedRealtime() - state.lastPositionUpdateTime) * state.playbackSpeed).toLong()
-    }
-
-    private fun startTicker() {
-        tickerJob?.cancel()
-        tickerJob = scope.launch {
-            while (isActive) {
-                val posMs = computeExactPositionMs()
-                val activeLine = currentLines.lastOrNull { posMs >= it.startMs }?.fullText.orEmpty()
-                if (activeLine != lastIslandLine) { lastIslandLine = activeLine; pushIslandUpdate(isPlaying = true) }
-                if (overlay.uiState.value.isVisible) updateOverlayState(posMs)
-                delay(33L)
-            }
-        }
-    }
-
-    private fun pushIslandUpdate(isPlaying: Boolean) {
-        if (currentTitle.isBlank()) return
-        val notif = notifier.buildNotification(currentTitle, currentArtist, lastIslandLine, currentCover, isPlaying)
-        if (!isForegroundStarted) {
-            try {
-                startForeground(HyperIslandNotifier.NOTIFICATION_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-                isForegroundStarted = true
-            } catch (_: Exception) {
-                notifier.update(currentTitle, currentArtist, lastIslandLine, currentCover, isPlaying)
-            }
-        } else {
-            notifier.update(currentTitle, currentArtist, lastIslandLine, currentCover, isPlaying)
-        }
-    }
-
-    private fun updateOverlayState(posMs: Long) {
-        overlay.uiState.value = overlay.uiState.value.copy(
-            title = currentTitle, artist = currentArtist, cover = currentCover,
-            palette = currentPalette, lines = currentLines, positionMs = posMs
+    fun buildNotification(
+        title: String,
+        artist: String,
+        currentLyric: String,
+        cover: Bitmap?,
+        isPlaying: Boolean
+    ): Notification {
+        val toggleIntent = Intent(ACTION_TOGGLE_OVERLAY).setPackage(context.packageName)
+        val pendingToggle = PendingIntent.getBroadcast(
+            context, 1, toggleIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+
+        val displayLine = currentLyric.ifBlank { title }
+        val shortChip = displayLine.take(22)
+
+        val focusJson = JSONObject().apply {
+            put("param_v2", JSONObject().apply {
+                put("protocol", 1)
+                put("enableFloat", false)
+                put("updatable", true)
+                put("islandProperty", 1)
+                put("baseInfo", JSONObject().apply {
+                    put("type", 2)
+                    put("title", displayLine)
+                    put("content", "$title — $artist")
+                })
+                put("island", JSONObject().apply {
+                    put("islandOrder", true)
+                    put("bigIslandArea", JSONObject().apply {
+                        put("imageTextInfoLeft", JSONObject().apply {
+                            put("type", 1)
+                            put("picInfo", JSONObject().apply {
+                                put("type", 1)
+                                put("pic", "miui.focus.pic_cover")
+                            })
+                            put("textInfo", JSONObject().apply {
+                                put("title", shortChip)
+                                put("showHighlightColor", true)
+                            })
+                        })
+                    })
+                    put("smallIslandArea", JSONObject().apply {
+                        put("picInfo", JSONObject().apply {
+                            put("type", 1)
+                            put("pic", "miui.focus.pic_cover")
+                        })
+                    })
+                })
+            })
+        }
+
+        val extras = Bundle().apply {
+            putString("miui.focus.param", focusJson.toString())
+            putBoolean("android.requestPromotedOngoing", true)
+            if (cover != null) {
+                putBundle("miui.focus.pics", Bundle().apply {
+                    putParcelable("miui.focus.pic_cover", Icon.createWithBitmap(cover))
+                })
+            }
+        }
+
+        val builder = Notification.Builder(context, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle(displayLine)
+            .setContentText("$title — $artist")
+            .setShowWhen(false)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_PROGRESS)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setContentIntent(pendingToggle)
+            .addExtras(extras)
+
+        if (cover != null) builder.setLargeIcon(cover)
+
+        if (Build.VERSION.SDK_INT >= 36) {
+            try {
+                Notification.Builder::class.java
+                    .getMethod("setRequestPromotedOngoing", Boolean::class.javaPrimitiveType)
+                    .invoke(builder, true)
+                Notification.Builder::class.java
+                    .getMethod("setShortCriticalText", CharSequence::class.java)
+                    .invoke(builder, shortChip)
+            } catch (_: Throwable) {
+            }
+        }
+
+        return builder.build()
     }
 
-    override fun onDestroy() {
-        tickerJob?.cancel(); fetchJob?.cancel()
-        activeController?.unregisterCallback(mediaCallback)
-        unregisterReceiver(toggleReceiver)
-        overlay.destroy(); scope.cancel()
-        super.onDestroy()
+    fun update(title: String, artist: String, currentLyric: String, cover: Bitmap?, isPlaying: Boolean) {
+        manager.notify(NOTIFICATION_ID, buildNotification(title, artist, currentLyric, cover, isPlaying))
     }
+
+    fun cancel() = manager.cancel(NOTIFICATION_ID)
 }
