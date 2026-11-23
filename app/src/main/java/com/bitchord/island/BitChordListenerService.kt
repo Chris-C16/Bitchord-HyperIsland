@@ -1,207 +1,239 @@
 package com.bitchord.island
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
+import android.app.UiModeManager
+import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.os.Build
-import android.os.Bundle
-import androidx.compose.ui.graphics.toArgb
+import android.content.IntentFilter
+import android.content.pm.ServiceInfo
+import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.media.MediaMetadata
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.service.notification.NotificationListenerService
+import kotlinx.coroutines.*
 
-class HyperIslandNotifier(private val context: Context) {
-    companion object {
-        const val CHANNEL_ID = "bitchord_lyrics_live_pill"
-        const val NOTIFICATION_ID = 3601
-        private const val MAX_PILL_CHARS = 7
-    }
+class BitChordListenerService : NotificationListenerService() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var notifier: HyperIslandNotifier
+    private lateinit var sessionManager: MediaSessionManager
+    private lateinit var uiModeManager: UiModeManager
 
-    private val manager = context.getSystemService(NotificationManager::class.java)
+    private var activeController: MediaController? = null
+    private var fetchJob: Job? = null
+    private var isForegroundStarted = false
+    private var isTicking = false
 
-    init {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "HyperIsland Lyrics (Live)",
-            NotificationManager.IMPORTANCE_DEFAULT
-        ).apply {
-            description = "Seconda pillola HyperIsland dedicata ai testi"
-            setSound(null, null)
-            enableVibration(false)
-            setShowBadge(false)
-            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-        }
-        manager.createNotificationChannel(channel)
-    }
+    private var currentTrackKey = ""
+    private var currentTitle = ""
+    private var currentArtist = ""
+    private var currentDurationMs = 0L
+    private var currentCover: Bitmap? = null
+    private var currentPalette = CoverPalette()
+    private var currentLines: List<LyricLine> = emptyList()
+    private var lastRenderKey = ""
 
-    private fun createLyricsPendingIntent(): PendingIntent {
-        val openLyricsIntent = Intent(context, LyricsPlayerActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        return PendingIntent.getActivity(
-            context,
-            10,
-            openLyricsIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-    }
-
-    private fun formatMultiParagraphLyrics(
-        currentLine: LyricLine?,
-        nextLyric1: String,
-        nextLyric2: String,
-        title: String,
-        artist: String
-    ): Pair<String, String> {
-        val active = currentLine?.fullText?.trim().orEmpty()
-        if (active.isBlank()) {
-            return title to "$artist\nIn attesa del testo sincronizzato..."
-        }
-
-        val p1 = nextLyric1.trim()
-        val p2 = nextLyric2.trim()
-
-        val bottomParagraphs = when {
-            p1.isNotBlank() && p2.isNotBlank() -> "$p1\n$p2"
-            p1.isNotBlank() -> "$p1\n♪ $title"
-            else -> "$title — $artist"
-        }
-
-        return active to bottomParagraphs
-    }
-
-    fun getMicroChunk(currentLine: LyricLine?, songPositionMs: Long, fallbackTitle: String): Pair<Int, String> {
-        val full = currentLine?.fullText?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
-        if (full.isBlank()) {
-            return 0 to buildChunks(fallbackTitle.trim(), MAX_PILL_CHARS).firstOrNull().orEmpty()
-        }
-
-        val chunks = buildChunks(full, MAX_PILL_CHARS)
-        if (chunks.size <= 1) return 0 to chunks.first()
-
-        val rawDuration = currentLine!!.endMs - currentLine.startMs
-        val safeDuration = if (rawDuration > 500L) rawDuration else 3500L
-        val elapsed = (songPositionMs - currentLine.startMs).coerceAtLeast(0L)
-        val ratio = (elapsed.toFloat() / safeDuration).coerceIn(0f, 0.999f)
-        val chunkIdx = (ratio * chunks.size).toInt().coerceIn(0, chunks.lastIndex)
-        return chunkIdx to chunks[chunkIdx]
-    }
-
-    private fun buildChunks(text: String, maxLen: Int): List<String> {
-        val words = text.split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (words.isEmpty()) return listOf("")
-
-        val result = mutableListOf<String>()
-        val current = StringBuilder()
-
-        for (w in words) {
-            if (w.length > maxLen) {
-                if (current.isNotEmpty()) {
-                    result.add(current.toString())
-                    current.clear()
-                }
-                var i = 0
-                while (i < w.length) {
-                    val end = (i + maxLen).coerceAtMost(w.length)
-                    result.add(w.substring(i, end))
-                    i += maxLen
-                }
-                continue
-            }
-
-            if (current.isEmpty()) {
-                current.append(w)
-            } else if (current.length + 1 + w.length <= maxLen) {
-                current.append(" ").append(w)
+    private val carModeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (isCarModeActive()) {
+                suspendForCarMode()
             } else {
-                result.add(current.toString())
-                current.clear()
-                current.append(w)
+                lastRenderKey = ""
+                syncLyrics(isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING)
             }
         }
-        if (current.isNotEmpty()) result.add(current.toString())
-        return result
     }
 
-    fun buildNotification(
-        title: String,
-        artist: String,
-        currentLine: LyricLine?,
-        nextLyric1: String,
-        nextLyric2: String,
-        palette: CoverPalette,
-        songPositionMs: Long,
-        isPlaying: Boolean
-    ): Notification {
-        val (topLine, bottomParagraphs) = formatMultiParagraphLyrics(
-            currentLine, nextLyric1, nextLyric2, title, artist
-        )
-        val (_, miniPillChunk) = getMicroChunk(currentLine, songPositionMs, title)
-        val accentColor = palette.accent.toArgb()
+    private val tickRunnable = object : Runnable {
+        override fun run() {
+            if (!isTicking) return
+            syncLyrics(isPlaying = true)
+            handler.postDelayed(this, 180L)
+        }
+    }
 
-        val extras = Bundle().apply {
-            putBoolean("android.requestPromotedOngoing", true)
+    private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener {
+        attachToBitChord(it)
+    }
+
+    private val mediaCallback = object : MediaController.Callback() {
+        override fun onMetadataChanged(metadata: MediaMetadata?) {
+            handleMetadata(metadata)
         }
 
-        val builder = Notification.Builder(context, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(topLine)
-            .setContentText(bottomParagraphs)
-            .setSubText("$title • $artist")
-            .setColor(accentColor)
-            .setColorized(false)
-            .setShowWhen(false)
-            .setOngoing(isPlaying)
-            .setOnlyAlertOnce(true)
-            .setCategory(Notification.CATEGORY_PROGRESS)
-            .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .setContentIntent(createLyricsPendingIntent())
-            .addExtras(extras)
+        override fun onPlaybackStateChanged(state: PlaybackState?) {
+            syncPlaybackClock(state)
+            val playing = state?.state == PlaybackState.STATE_PLAYING
+            if (playing) {
+                handleMetadata(activeController?.metadata)
+                startTicker()
+            } else {
+                stopTicker()
+                lastRenderKey = ""
+                syncLyrics(isPlaying = false)
+            }
+        }
+    }
 
-        if (Build.VERSION.SDK_INT >= 36) {
-            try {
-                Notification.Builder::class.java
-                    .getMethod("setRequestPromotedOngoing", Boolean::class.javaPrimitiveType)
-                    .invoke(builder, true)
-                Notification.Builder::class.java
-                    .getMethod("setShortCriticalText", CharSequence::class.java)
-                    .invoke(builder, miniPillChunk)
+    override fun onCreate() {
+        super.onCreate()
+        notifier = HyperIslandNotifier(this)
+        sessionManager = getSystemService(MediaSessionManager::class.java)
+        uiModeManager = getSystemService(UiModeManager::class.java)
 
-                val progressStyleClass = Class.forName("android.app.Notification\$ProgressStyle")
-                val progressStyle = progressStyleClass.getDeclaredConstructor().newInstance()
-                progressStyleClass.getMethod("setProgress", Int::class.javaPrimitiveType)
-                    .invoke(progressStyle, 50)
-                progressStyleClass.getMethod("setStyledByProgress", Boolean::class.javaPrimitiveType)
-                    .invoke(progressStyle, true)
+        val carFilter = IntentFilter().apply {
+            addAction(UiModeManager.ACTION_ENTER_CAR_MODE)
+            addAction(UiModeManager.ACTION_EXIT_CAR_MODE)
+        }
+        registerReceiver(carModeReceiver, carFilter, RECEIVER_NOT_EXPORTED)
 
-                Notification.Builder::class.java
-                    .getMethod("setStyle", Notification.Style::class.java)
-                    .invoke(builder, progressStyle)
-            } catch (_: Throwable) {
-                builder.setProgress(100, 50, false)
+        LyricsPlaybackStore.onPlayPause = {
+            val ctrl = activeController
+            if (ctrl?.playbackState?.state == PlaybackState.STATE_PLAYING) {
+                ctrl.transportControls.pause()
+            } else {
+                ctrl?.transportControls.play()
+            }
+        }
+        LyricsPlaybackStore.onNext = { activeController?.transportControls?.skipToNext() }
+        LyricsPlaybackStore.onPrevious = { activeController?.transportControls?.skipToPrevious() }
+        LyricsPlaybackStore.onSeekTo = { posMs -> activeController?.transportControls?.seekTo(posMs) }
+    }
+
+    private fun isCarModeActive(): Boolean {
+        return uiModeManager.currentModeType == Configuration.UI_MODE_TYPE_CAR
+    }
+
+    private fun suspendForCarMode() {
+        notifier.cancel()
+        if (isForegroundStarted) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            isForegroundStarted = false
+        }
+    }
+
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        val component = ComponentName(this, BitChordListenerService::class.java)
+        try {
+            sessionManager.addOnActiveSessionsChangedListener(sessionsListener, component)
+            attachToBitChord(sessionManager.getActiveSessions(component))
+        } catch (_: SecurityException) {
+        }
+    }
+
+    private fun attachToBitChord(controllers: List<MediaController>?) {
+        val target = controllers?.filter { it.packageName != packageName }?.firstOrNull()
+
+        if (target?.sessionToken == activeController?.sessionToken) {
+            if (target != null) {
+                handleMetadata(target.metadata)
+                syncPlaybackClock(target.playbackState)
+            }
+            return
+        }
+
+        activeController?.unregisterCallback(mediaCallback)
+        activeController = target
+        target?.registerCallback(mediaCallback)
+
+        if (target != null) {
+            handleMetadata(target.metadata)
+            syncPlaybackClock(target.playbackState)
+            if (target.playbackState?.state == PlaybackState.STATE_PLAYING) {
+                startTicker()
             }
         } else {
-            builder.setProgress(100, 50, false)
+            stopTicker()
+            LyricsPlaybackStore.isPlaying.value = false
+            suspendForCarMode()
+        }
+    }
+
+    private fun syncPlaybackClock(state: PlaybackState?) {
+        state ?: return
+        val playing = state.state == PlaybackState.STATE_PLAYING
+        LyricsPlaybackStore.isPlaying.value = playing
+        LyricsPlaybackStore.basePositionMs.value = state.position
+        LyricsPlaybackStore.baseRealtimeMs.value =
+            if (state.lastPositionUpdateTime > 0L) state.lastPositionUpdateTime else SystemClock.elapsedRealtime()
+        LyricsPlaybackStore.speed.value = if (state.playbackSpeed > 0f) state.playbackSpeed else 1f
+    }
+
+    private fun handleMetadata(metadata: MediaMetadata?) {
+        metadata ?: return
+        val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty().trim()
+        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty().trim()
+        val durationMs = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
+        val cover = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+
+        if (title.isBlank()) return
+        val key = "$title\vert{}$artist"
+        currentTitle = title
+        currentArtist = artist
+        if (durationMs > 0L) {
+            currentDurationMs = durationMs
+            LyricsPlaybackStore.durationMs.value = durationMs
         }
 
-        return builder.build()
+        LyricsPlaybackStore.title.value = title
+        LyricsPlaybackStore.artist.value = artist
+
+        if (cover != null) {
+            currentCover = cover
+            currentPalette = LyricsRepository.extractPalette(cover)
+            LyricsPlaybackStore.cover.value = cover
+            LyricsPlaybackStore.palette.value = currentPalette
+        }
+
+        if (key != currentTrackKey || (currentLines.isEmpty() && fetchJob?.isActive != true)) {
+            currentTrackKey = key
+            currentLines = emptyList()
+            LyricsPlaybackStore.lines.value = emptyList()
+            LyricsPlaybackStore.syncOffsetMs.value = 0L
+            lastRenderKey = ""
+
+            val playingNow = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+            syncLyrics(isPlaying = playingNow)
+
+            fetchJob?.cancel()
+            fetchJob = scope.launch {
+                delay(250L)
+                val loaded = LyricsRepository.fetchSyncedLyrics(currentTitle, currentArtist, currentDurationMs / 1000L)
+                currentLines = loaded
+                LyricsPlaybackStore.lines.value = loaded
+                lastRenderKey = ""
+                syncPlaybackClock(activeController?.playbackState)
+                syncLyrics(isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING)
+                if (activeController?.playbackState?.state == PlaybackState.STATE_PLAYING) {
+                    startTicker()
+                }
+            }
+        }
     }
 
-    fun update(
-        title: String,
-        artist: String,
-        currentLine: LyricLine?,
-        nextLyric1: String,
-        nextLyric2: String,
-        palette: CoverPalette,
-        songPositionMs: Long,
-        isPlaying: Boolean
-    ) {
-        manager.notify(
-            NOTIFICATION_ID,
-            buildNotification(title, artist, currentLine, nextLyric1, nextLyric2, palette, songPositionMs, isPlaying)
-        )
+    private fun startTicker() {
+        if (isTicking) return
+        isTicking = true
+        handler.removeCallbacks(tickRunnable)
+        handler.post(tickRunnable)
     }
 
-    fun cancel() = manager.cancel(NOTIFICATION_ID)
-}
+    private fun stopTicker() {
+        isTicking = false
+        handler.removeCallbacks(tickRunnable)
+    }
+
+    private fun syncLyrics(isPlaying: Boolean) {
+        if (currentTitle.isBlank()) return
+
+        if (isCarModeActive()) {
+            suspendForCarMode()
