@@ -45,7 +45,7 @@ class HyperIslandNotifier(private val context: Context) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
     }
-
+    
     private fun formatMultiParagraphLyrics(
         currentLine: LyricLine?,
         nextLyric1: String,
