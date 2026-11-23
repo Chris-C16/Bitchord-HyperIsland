@@ -4,6 +4,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
 
     <application
         android:allowBackup="true"
@@ -20,7 +21,6 @@
             </intent-filter>
         </activity>
 
-        <!-- Player Lyrics stile BitChord che si apre toccando la pillola HyperIsland -->
         <activity
             android:name=".LyricsPlayerActivity"
             android:exported="false"
