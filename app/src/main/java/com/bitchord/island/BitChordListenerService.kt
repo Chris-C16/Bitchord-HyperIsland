@@ -31,13 +31,13 @@ class BitChordListenerService : NotificationListenerService() {
     private var currentCover: Bitmap? = null
     private var currentPalette = CoverPalette()
     private var currentLines: List<LyricLine> = emptyList()
-    private var lastLineIndex = -2
+    private var lastRenderKey = ""
 
     private val tickRunnable = object : Runnable {
         override fun run() {
             if (!isTicking) return
             syncLyrics(isPlaying = true)
-            handler.postDelayed(this, 110L)
+            handler.postDelayed(this, 180L)
         }
     }
 
@@ -54,12 +54,11 @@ class BitChordListenerService : NotificationListenerService() {
             syncPlaybackClock(state)
             val playing = state?.state == PlaybackState.STATE_PLAYING
             if (playing) {
-                // Ricontrolla sempre i metadati quando riparte la riproduzione
                 handleMetadata(activeController?.metadata)
                 startTicker()
             } else {
                 stopTicker()
-                lastLineIndex = -2
+                lastRenderKey = ""
                 syncLyrics(isPlaying = false)
             }
         }
@@ -94,10 +93,9 @@ class BitChordListenerService : NotificationListenerService() {
     }
 
     private fun attachToBitChord(controllers: List<MediaController>?) {
-        val externalControllers = controllers?.filter { it.packageName != packageName }.orEmpty()
-        val target = externalControllers.firstOrNull {
+        val target = controllers?.firstOrNull {
             it.packageName.contains("bitchord", ignoreCase = true)
-        } ?: externalControllers.firstOrNull()
+        } ?: controllers?.firstOrNull()
 
         if (target?.sessionToken == activeController?.sessionToken) {
             if (target != null) {
@@ -124,7 +122,7 @@ class BitChordListenerService : NotificationListenerService() {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 isForegroundStarted = false
             }
-            notifier.release()
+            notifier.cancel()
         }
     }
 
@@ -162,24 +160,22 @@ class BitChordListenerService : NotificationListenerService() {
             LyricsPlaybackStore.palette.value = currentPalette
         }
 
-        // Ricarica anche se currentLines è ancora vuoto (es. se il primo tentativo era arrivato prima dell'artista)
         if (key != currentTrackKey || (currentLines.isEmpty() && fetchJob?.isActive != true)) {
             currentTrackKey = key
             currentLines = emptyList()
             LyricsPlaybackStore.lines.value = emptyList()
-            lastLineIndex = -2
+            lastRenderKey = ""
 
             val playingNow = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
             syncLyrics(isPlaying = playingNow)
 
             fetchJob?.cancel()
             fetchJob = scope.launch {
-                // Breve attesa per far assestare eventuali metadati secondari di BitChord
                 delay(250L)
                 val loaded = LyricsRepository.fetchSyncedLyrics(currentTitle, currentArtist, currentDurationMs / 1000L)
                 currentLines = loaded
                 LyricsPlaybackStore.lines.value = loaded
-                lastLineIndex = -2
+                lastRenderKey = ""
                 syncPlaybackClock(activeController?.playbackState)
                 syncLyrics(isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING)
                 if (activeController?.playbackState?.state == PlaybackState.STATE_PLAYING) {
@@ -205,16 +201,23 @@ class BitChordListenerService : NotificationListenerService() {
         if (currentTitle.isBlank()) return
         val posMs = LyricsPlaybackStore.currentPositionMs()
         val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
-
-        if (idx == lastLineIndex && isPlaying) return
-        lastLineIndex = idx
-
         val currLine = if (idx >= 0) currentLines[idx] else null
+
+        // Aggiorna ogni ~12% di avanzamento del verso per muovere fluidamente la barra senza spammare SystemUI
+        val step = if (currLine != null) {
+            val dur = (currLine.endMs - currLine.startMs).coerceAtLeast(300L)
+            (((posMs - currLine.startMs).toFloat() / dur) * 8f).toInt().coerceIn(0, 8)
+        } else 0
+
+        val renderKey = "$currentTrackKey|$idx|$step|$isPlaying"
+        if (renderKey == lastRenderKey && isPlaying) return
+        lastRenderKey = renderKey
+
         val next = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
 
         if (!isForegroundStarted) {
             val notif = notifier.buildNotification(
-                currentTitle, currentArtist, currLine, next, currentCover, currentDurationMs, posMs, isPlaying
+                currentTitle, currentArtist, currLine, next, currentPalette, posMs, isPlaying
             )
             try {
                 startForeground(
@@ -224,14 +227,10 @@ class BitChordListenerService : NotificationListenerService() {
                 )
                 isForegroundStarted = true
             } catch (_: Exception) {
-                notifier.update(
-                    currentTitle, currentArtist, currLine, next, currentCover, currentDurationMs, posMs, isPlaying
-                )
+                notifier.update(currentTitle, currentArtist, currLine, next, currentPalette, posMs, isPlaying)
             }
         } else {
-            notifier.update(
-                currentTitle, currentArtist, currLine, next, currentCover, currentDurationMs, posMs, isPlaying
-            )
+            notifier.update(currentTitle, currentArtist, currLine, next, currentPalette, posMs, isPlaying)
         }
     }
 
@@ -239,7 +238,6 @@ class BitChordListenerService : NotificationListenerService() {
         stopTicker()
         fetchJob?.cancel()
         activeController?.unregisterCallback(mediaCallback)
-        notifier.release()
         scope.cancel()
         super.onDestroy()
     }
