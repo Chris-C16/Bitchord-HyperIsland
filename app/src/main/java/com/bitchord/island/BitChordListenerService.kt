@@ -243,10 +243,12 @@ class BitChordListenerService : NotificationListenerService() {
         val posMs = LyricsPlaybackStore.currentPositionMs()
         val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
         val currLine = if (idx >= 0) currentLines[idx] else null
+        val (chunkIdx, _) = notifier.getMicroChunk(currLine, posMs, currentTitle)
 
-        val renderKey = "$currentTrackKey|$idx|$isPlaying"
+        val renderKey = "$currentTrackKey|$idx|$chunkIdx|$isPlaying"
         if (renderKey == lastRenderKey) return
         lastRenderKey = renderKey
+
 
         val next1 = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
         val next2 = if (idx >= 0 && idx + 2 < currentLines.size) currentLines[idx + 2].fullText else ""
