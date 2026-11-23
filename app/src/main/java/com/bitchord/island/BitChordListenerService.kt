@@ -1,32 +1,28 @@
 package com.bitchord.island
 
-import android.content.BroadcastReceiver
 import android.content.ComponentName
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
-import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import kotlinx.coroutines.*
 
 class BitChordListenerService : NotificationListenerService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val handler = Handler(Looper.getMainLooper())
     private lateinit var notifier: HyperIslandNotifier
-    private lateinit var overlay: MiniLyricsOverlay
     private lateinit var sessionManager: MediaSessionManager
 
     private var activeController: MediaController? = null
-    private var tickerJob: Job? = null
     private var fetchJob: Job? = null
     private var isForegroundStarted = false
-    private var userDismissedOverlay = false
+    private var isTicking = false
 
     private var currentTrackKey = ""
     private var currentTitle = ""
@@ -34,36 +30,33 @@ class BitChordListenerService : NotificationListenerService() {
     private var currentCover: Bitmap? = null
     private var currentPalette = CoverPalette()
     private var currentLines: List<LyricLine> = emptyList()
-    private var lastIslandLine = ""
+    private var lastLineIndex = -2
 
-    private val toggleReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == HyperIslandNotifier.ACTION_TOGGLE_OVERLAY && Settings.canDrawOverlays(this@BitChordListenerService)) {
-                if (overlay.uiState.value.isVisible) {
-                    userDismissedOverlay = true
-                    overlay.hide()
-                } else {
-                    userDismissedOverlay = false
-                    overlay.show()
-                }
-            }
+    private val tickRunnable = object : Runnable {
+        override fun run() {
+            if (!isTicking) return
+            syncLyricsToIsland(isPlaying = true)
+            handler.postDelayed(this, 180L)
         }
     }
 
-    private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener { attachToBitChord(it) }
+    private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener {
+        attachToBitChord(it)
+    }
 
     private val mediaCallback = object : MediaController.Callback() {
-        override fun onMetadataChanged(metadata: MediaMetadata?) = handleMetadata(metadata)
+        override fun onMetadataChanged(metadata: MediaMetadata?) {
+            handleMetadata(metadata)
+        }
+
         override fun onPlaybackStateChanged(state: PlaybackState?) {
-            if (state?.state == PlaybackState.STATE_PLAYING) {
-                if (!userDismissedOverlay && Settings.canDrawOverlays(this@BitChordListenerService)) {
-                    overlay.show()
-                }
+            val playing = state?.state == PlaybackState.STATE_PLAYING
+            if (playing) {
                 startTicker()
             } else {
-                tickerJob?.cancel()
-                overlay.hide()
-                pushIslandUpdate(isPlaying = false)
+                stopTicker()
+                lastLineIndex = -2
+                syncLyricsToIsland(isPlaying = false)
             }
         }
     }
@@ -71,9 +64,7 @@ class BitChordListenerService : NotificationListenerService() {
     override fun onCreate() {
         super.onCreate()
         notifier = HyperIslandNotifier(this)
-        overlay = MiniLyricsOverlay(this)
         sessionManager = getSystemService(MediaSessionManager::class.java)
-        registerReceiver(toggleReceiver, IntentFilter(HyperIslandNotifier.ACTION_TOGGLE_OVERLAY), RECEIVER_NOT_EXPORTED)
     }
 
     override fun onListenerConnected() {
@@ -82,25 +73,32 @@ class BitChordListenerService : NotificationListenerService() {
         try {
             sessionManager.addOnActiveSessionsChangedListener(sessionsListener, component)
             attachToBitChord(sessionManager.getActiveSessions(component))
-        } catch (_: SecurityException) {}
+        } catch (_: SecurityException) {
+        }
     }
 
     private fun attachToBitChord(controllers: List<MediaController>?) {
-        val target = controllers?.firstOrNull { it.packageName.contains("bitchord", ignoreCase = true) } ?: controllers?.firstOrNull()
+        val target = controllers?.firstOrNull {
+            it.packageName.contains("bitchord", ignoreCase = true)
+        } ?: controllers?.firstOrNull()
+
         if (target?.sessionToken == activeController?.sessionToken) return
+
         activeController?.unregisterCallback(mediaCallback)
         activeController = target
         target?.registerCallback(mediaCallback)
+
         if (target != null) {
             handleMetadata(target.metadata)
             if (target.playbackState?.state == PlaybackState.STATE_PLAYING) {
-                if (!userDismissedOverlay && Settings.canDrawOverlays(this)) overlay.show()
                 startTicker()
             }
         } else {
-            tickerJob?.cancel()
-            overlay.hide()
-            if (isForegroundStarted) { stopForeground(STOP_FOREGROUND_REMOVE); isForegroundStarted = false }
+            stopTicker()
+            if (isForegroundStarted) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                isForegroundStarted = false
+            }
             notifier.cancel()
         }
     }
@@ -110,23 +108,29 @@ class BitChordListenerService : NotificationListenerService() {
         val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
         val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
         val durationMs = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
-        val cover = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+        val cover = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+
         if (title.isBlank()) return
         val key = "$title|$artist"
         currentTitle = title
         currentArtist = artist
-        if (cover != null) { currentCover = cover; currentPalette = LyricsRepository.extractPalette(cover) }
+        if (cover != null) {
+            currentCover = cover
+            currentPalette = LyricsRepository.extractPalette(cover)
+        }
+
         if (key != currentTrackKey) {
             currentTrackKey = key
-            userDismissedOverlay = false
             currentLines = emptyList()
-            lastIslandLine = ""
-            pushIslandUpdate(isPlaying = true)
-            if (Settings.canDrawOverlays(this)) overlay.show()
+            lastLineIndex = -2
+            syncLyricsToIsland(isPlaying = true)
+
             fetchJob?.cancel()
             fetchJob = scope.launch {
                 currentLines = LyricsRepository.fetchSyncedLyrics(title, artist, durationMs / 1000L)
-                updateOverlayState(computeExactPositionMs())
+                lastLineIndex = -2
+                syncLyricsToIsland(isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING)
             }
         }
     }
@@ -134,49 +138,60 @@ class BitChordListenerService : NotificationListenerService() {
     private fun computeExactPositionMs(): Long {
         val state = activeController?.playbackState ?: return 0L
         if (state.state != PlaybackState.STATE_PLAYING) return state.position
-        return state.position + ((SystemClock.elapsedRealtime() - state.lastPositionUpdateTime) * state.playbackSpeed).toLong()
+        val delta = (SystemClock.elapsedRealtime() - state.lastPositionUpdateTime).coerceAtLeast(0L)
+        val speed = if (state.playbackSpeed > 0f) state.playbackSpeed else 1f
+        return state.position + (delta * speed).toLong()
     }
 
     private fun startTicker() {
-        tickerJob?.cancel()
-        tickerJob = scope.launch {
-            while (isActive) {
-                val posMs = computeExactPositionMs()
-                val activeLine = currentLines.lastOrNull { posMs >= it.startMs }?.fullText.orEmpty()
-                if (activeLine != lastIslandLine) { lastIslandLine = activeLine; pushIslandUpdate(isPlaying = true) }
-                if (overlay.uiState.value.isVisible) updateOverlayState(posMs)
-                delay(33L)
-            }
-        }
+        if (isTicking) return
+        isTicking = true
+        handler.removeCallbacks(tickRunnable)
+        handler.post(tickRunnable)
     }
 
-    private fun pushIslandUpdate(isPlaying: Boolean) {
+    private fun stopTicker() {
+        isTicking = false
+        handler.removeCallbacks(tickRunnable)
+    }
+
+    private fun syncLyricsToIsland(isPlaying: Boolean) {
         if (currentTitle.isBlank()) return
-        val notif = notifier.buildNotification(currentTitle, currentArtist, lastIslandLine, currentCover, isPlaying)
+        val posMs = computeExactPositionMs()
+        val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
+
+        // Aggiorna la HyperIsland solo quando cambia effettivamente il verso
+        if (idx == lastLineIndex) return
+        lastLineIndex = idx
+
+        val prev = if (idx > 0) currentLines[idx - 1].fullText else ""
+        val curr = if (idx >= 0) currentLines[idx].fullText else ""
+        val next = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
+
         if (!isForegroundStarted) {
+            val notif = notifier.buildNotification(
+                currentTitle, currentArtist, prev, curr, next, currentCover, currentPalette, isPlaying
+            )
             try {
-                startForeground(HyperIslandNotifier.NOTIFICATION_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                startForeground(
+                    HyperIslandNotifier.NOTIFICATION_ID,
+                    notif,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                )
                 isForegroundStarted = true
             } catch (_: Exception) {
-                notifier.update(currentTitle, currentArtist, lastIslandLine, currentCover, isPlaying)
+                notifier.update(currentTitle, currentArtist, prev, curr, next, currentCover, currentPalette, isPlaying)
             }
         } else {
-            notifier.update(currentTitle, currentArtist, lastIslandLine, currentCover, isPlaying)
+            notifier.update(currentTitle, currentArtist, prev, curr, next, currentCover, currentPalette, isPlaying)
         }
-    }
-
-    private fun updateOverlayState(posMs: Long) {
-        overlay.uiState.value = overlay.uiState.value.copy(
-            title = currentTitle, artist = currentArtist, cover = currentCover,
-            palette = currentPalette, lines = currentLines, positionMs = posMs
-        )
     }
 
     override fun onDestroy() {
-        tickerJob?.cancel(); fetchJob?.cancel()
+        stopTicker()
+        fetchJob?.cancel()
         activeController?.unregisterCallback(mediaCallback)
-        unregisterReceiver(toggleReceiver)
-        overlay.destroy(); scope.cancel()
+        scope.cancel()
         super.onDestroy()
     }
 }
