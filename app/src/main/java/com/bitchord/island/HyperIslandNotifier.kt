@@ -108,7 +108,7 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         val builder = Notification.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_lyrics_note)
+            .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(topLine)
             .setContentText(bottomParagraphs)
             .setSubText("$title • $artist")
