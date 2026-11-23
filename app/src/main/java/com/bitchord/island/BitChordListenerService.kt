@@ -26,6 +26,7 @@ class BitChordListenerService : NotificationListenerService() {
     private var tickerJob: Job? = null
     private var fetchJob: Job? = null
     private var isForegroundStarted = false
+    private var userDismissedOverlay = false
 
     private var currentTrackKey = ""
     private var currentTitle = ""
@@ -38,7 +39,13 @@ class BitChordListenerService : NotificationListenerService() {
     private val toggleReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == HyperIslandNotifier.ACTION_TOGGLE_OVERLAY && Settings.canDrawOverlays(this@BitChordListenerService)) {
-                if (overlay.uiState.value.isVisible) overlay.hide() else overlay.show()
+                if (overlay.uiState.value.isVisible) {
+                    userDismissedOverlay = true
+                    overlay.hide()
+                } else {
+                    userDismissedOverlay = false
+                    overlay.show()
+                }
             }
         }
     }
@@ -48,8 +55,16 @@ class BitChordListenerService : NotificationListenerService() {
     private val mediaCallback = object : MediaController.Callback() {
         override fun onMetadataChanged(metadata: MediaMetadata?) = handleMetadata(metadata)
         override fun onPlaybackStateChanged(state: PlaybackState?) {
-            if (state?.state == PlaybackState.STATE_PLAYING) startTicker()
-            else { tickerJob?.cancel(); pushIslandUpdate(isPlaying = false) }
+            if (state?.state == PlaybackState.STATE_PLAYING) {
+                if (!userDismissedOverlay && Settings.canDrawOverlays(this@BitChordListenerService)) {
+                    overlay.show()
+                }
+                startTicker()
+            } else {
+                tickerJob?.cancel()
+                overlay.hide()
+                pushIslandUpdate(isPlaying = false)
+            }
         }
     }
 
@@ -78,7 +93,10 @@ class BitChordListenerService : NotificationListenerService() {
         target?.registerCallback(mediaCallback)
         if (target != null) {
             handleMetadata(target.metadata)
-            if (target.playbackState?.state == PlaybackState.STATE_PLAYING) startTicker()
+            if (target.playbackState?.state == PlaybackState.STATE_PLAYING) {
+                if (!userDismissedOverlay && Settings.canDrawOverlays(this)) overlay.show()
+                startTicker()
+            }
         } else {
             tickerJob?.cancel()
             overlay.hide()
@@ -100,9 +118,11 @@ class BitChordListenerService : NotificationListenerService() {
         if (cover != null) { currentCover = cover; currentPalette = LyricsRepository.extractPalette(cover) }
         if (key != currentTrackKey) {
             currentTrackKey = key
+            userDismissedOverlay = false
             currentLines = emptyList()
             lastIslandLine = ""
             pushIslandUpdate(isPlaying = true)
+            if (Settings.canDrawOverlays(this)) overlay.show()
             fetchJob?.cancel()
             fetchJob = scope.launch {
                 currentLines = LyricsRepository.fetchSyncedLyrics(title, artist, durationMs / 1000L)
