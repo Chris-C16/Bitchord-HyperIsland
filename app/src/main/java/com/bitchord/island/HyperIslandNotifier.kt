@@ -39,61 +39,56 @@ class HyperIslandNotifier(private val context: Context) {
         }
         return PendingIntent.getActivity(
             context, 10, openLyricsIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_UPDATE_CURRENT or Intent.FLAG_IMMUTABLE
         )
     }
 
     /**
-     * Senza cover grande a destra, la card ha tutta la larghezza disponibile (~42 caratteri per riga).
-     * Se il verso supera i 42 caratteri, lo spezza in modo pulito tra riga 1 e riga 2.
+     * Formatta 3 versi consecutivi nella card espansa:
+     * - Titolo (grassetto): Verso attivo corrente
+     * - Corpo (2 paragrafi su due righe con \n): Verso +1 e Verso +2
      */
-    private fun formatFullWidthLines(
+    private fun formatMultiParagraphLyrics(
         currentLine: LyricLine?,
-        nextLyric: String,
+        nextLyric1: String,
+        nextLyric2: String,
         title: String,
         artist: String
     ): Pair<String, String> {
-        val full = currentLine?.fullText?.trim().orEmpty()
-        if (full.isBlank()) return "$title — $artist" to "In attesa del testo..."
-
-        if (full.length <= 42) {
-            val second = nextLyric.trim().ifBlank { "$title • $artist" }.take(46)
-            return full to second
+        val active = currentLine?.fullText?.trim().orEmpty()
+        if (active.isBlank()) {
+            return title to "$artist\nIn attesa del testo sincronizzato..."
         }
 
-        // Verso lungo: distribuisce le parole su tutta la larghezza delle due righe senza mischiare altri versi
-        val words = full.split(" ")
-        val line1 = StringBuilder()
-        val line2 = StringBuilder()
-        for (w in words) {
-            if (line1.length + w.length + 1 <= 40) {
-                if (line1.isNotEmpty()) line1.append(" ")
-                line1.append(w)
-            } else {
-                if (line2.length + w.length + 1 <= 44) {
-                    if (line2.isNotEmpty()) line2.append(" ")
-                    line2.append(w)
-                }
-            }
+        val p1 = nextLyric1.trim()
+        val p2 = nextLyric2.trim()
+
+        val bottomParagraphs = when {
+            p1.isNotBlank() && p2.isNotBlank() -> "$p1\n$p2"
+            p1.isNotBlank() -> "$p1\n♪ $title"
+            else -> "$title — $artist"
         }
-        return line1.toString() to line2.toString()
+
+        return active to bottomParagraphs
     }
 
     fun buildNotification(
         title: String,
         artist: String,
         currentLine: LyricLine?,
-        nextLyric: String,
+        nextLyric1: String,
+        nextLyric2: String,
         palette: CoverPalette,
         songPositionMs: Long,
         isPlaying: Boolean
     ): Notification {
-        val (topLine, bottomLine) = formatFullWidthLines(currentLine, nextLyric, title, artist)
+        val (topLine, bottomParagraphs) = formatMultiParagraphLyrics(
+            currentLine, nextLyric1, nextLyric2, title, artist
+        )
 
-        // Testo compatto per la pillola chiusa in cima (scorrevole sul verso attivo)
+        // Nella pillola chiusa a destra della fotocamera (max ~15 caratteri netti senza tagli bruschi)
         val miniPillText = buildMiniPillText(currentLine, songPositionMs, title)
 
-        // Progresso (0..100) del singolo verso per la barra animata nella card espansa
         val lineProgress = if (currentLine != null) {
             val dur = (currentLine.endMs - currentLine.startMs).coerceAtLeast(300L)
             (((songPositionMs - currentLine.startMs).toFloat() / dur) * 100f).toInt().coerceIn(0, 100)
@@ -105,11 +100,12 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         val builder = Notification.Builder(context, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_lyrics_note)
             .setContentTitle(topLine)
-            .setContentText(bottomLine)
+            .setContentText(bottomParagraphs)
+            .setSubText("$title • $artist")
             .setColor(accentColor)
-            .setColorized(false)
+            .setColorized(true)
             .setShowWhen(false)
             .setOngoing(isPlaying)
             .setOnlyAlertOnce(true)
@@ -118,7 +114,6 @@ class HyperIslandNotifier(private val context: Context) {
             .setContentIntent(createLyricsPendingIntent())
             .addExtras(extras)
 
-        // API ufficiali Android 16 Live Updates (seconda pillola Super Island)
         if (Build.VERSION.SDK_INT >= 36) {
             try {
                 Notification.Builder::class.java
@@ -128,7 +123,6 @@ class HyperIslandNotifier(private val context: Context) {
                     .getMethod("setShortCriticalText", CharSequence::class.java)
                     .invoke(builder, miniPillText)
 
-                // Applica Notification.ProgressStyle nativo di Android 16 se disponibile
                 val progressStyleClass = Class.forName("android.app.Notification\$ProgressStyle")
                 val progressStyle = progressStyleClass.getDeclaredConstructor().newInstance()
                 progressStyleClass.getMethod("setProgress", Int::class.javaPrimitiveType)
@@ -151,35 +145,41 @@ class HyperIslandNotifier(private val context: Context) {
 
     private fun buildMiniPillText(currentLine: LyricLine?, songPositionMs: Long, fallbackTitle: String): String {
         val full = currentLine?.fullText?.trim().orEmpty()
-        if (full.isBlank()) return fallbackTitle.take(18)
-        if (full.length <= 20) return full
+        if (full.isBlank()) return trimWord(fallbackTitle, 15)
+        if (full.length <= 15) return full
 
         val dur = (currentLine!!.endMs - currentLine.startMs).coerceAtLeast(1L)
         val progress = ((songPositionMs - currentLine.startMs).toFloat() / dur).coerceIn(0f, 1f)
         return if (progress < 0.48f) {
-            val sub = full.substring(0, 20)
-            val sp = sub.lastIndexOf(' ')
-            if (sp > 10) sub.substring(0, sp) else sub
+            trimWord(full, 15)
         } else {
-            val start = (full.length - 20).coerceAtLeast(0)
+            val start = (full.length - 15).coerceAtLeast(0)
             val sub = full.substring(start)
             val sp = sub.indexOf(' ')
-            if (sp in 1..9) sub.substring(sp + 1) else sub
+            if (sp in 1..7) sub.substring(sp + 1) else sub
         }
+    }
+
+    private fun trimWord(text: String, maxLen: Int): String {
+        if (text.length <= maxLen) return text
+        val sub = text.substring(0, maxLen)
+        val sp = sub.lastIndexOf(' ')
+        return if (sp > maxLen / 2) sub.substring(0, sp) else sub
     }
 
     fun update(
         title: String,
         artist: String,
         currentLine: LyricLine?,
-        nextLyric: String,
+        nextLyric1: String,
+        nextLyric2: String,
         palette: CoverPalette,
         songPositionMs: Long,
         isPlaying: Boolean
     ) {
         manager.notify(
             NOTIFICATION_ID,
-            buildNotification(title, artist, currentLine, nextLyric, palette, songPositionMs, isPlaying)
+            buildNotification(title, artist, currentLine, nextLyric1, nextLyric2, palette, songPositionMs, isPlaying)
         )
     }
 
