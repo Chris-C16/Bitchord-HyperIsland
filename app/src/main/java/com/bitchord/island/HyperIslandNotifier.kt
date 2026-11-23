@@ -14,7 +14,7 @@ class HyperIslandNotifier(private val context: Context) {
     companion object {
         const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
-        private const val MAX_PILL_CHARS = 8
+        private const val MAX_PILL_CHARS = 7
     }
 
     private val manager = context.getSystemService(NotificationManager::class.java)
@@ -71,7 +71,7 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     fun getMicroChunk(currentLine: LyricLine?, songPositionMs: Long, fallbackTitle: String): Pair<Int, String> {
-        val full = currentLine?.fullText?.trim().orEmpty()
+        val full = currentLine?.fullText?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
         if (full.isBlank()) {
             return 0 to buildChunks(fallbackTitle.trim(), MAX_PILL_CHARS).firstOrNull().orEmpty()
         }
@@ -79,29 +79,44 @@ class HyperIslandNotifier(private val context: Context) {
         val chunks = buildChunks(full, MAX_PILL_CHARS)
         if (chunks.size <= 1) return 0 to chunks.first()
 
-        val dur = (currentLine!!.endMs - currentLine.startMs).coerceAtLeast(400L)
-        val ratio = ((songPositionMs - currentLine.startMs).toFloat() / dur).coerceIn(0f, 0.999f)
+        val rawDuration = currentLine!!.endMs - currentLine.startMs
+        val safeDuration = if (rawDuration > 500L) rawDuration else 3500L
+        val elapsed = (songPositionMs - currentLine.startMs).coerceAtLeast(0L)
+        val ratio = (elapsed.toFloat() / safeDuration).coerceIn(0f, 0.999f)
         val chunkIdx = (ratio * chunks.size).toInt().coerceIn(0, chunks.lastIndex)
         return chunkIdx to chunks[chunkIdx]
     }
 
     private fun buildChunks(text: String, maxLen: Int): List<String> {
-        val words = text.split(" ").filter { it.isNotBlank() }
+        val words = text.split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.isEmpty()) return listOf("")
 
         val result = mutableListOf<String>()
         val current = StringBuilder()
 
         for (w in words) {
-            val cleanWord = if (w.length > maxLen) w.substring(0, maxLen) else w
+            if (w.length > maxLen) {
+                if (current.isNotEmpty()) {
+                    result.add(current.toString())
+                    current.clear()
+                }
+                var i = 0
+                while (i < w.length) {
+                    val end = (i + maxLen).coerceAtMost(w.length)
+                    result.add(w.substring(i, end))
+                    i += maxLen
+                }
+                continue
+            }
+
             if (current.isEmpty()) {
-                current.append(cleanWord)
-            } else if (current.length + 1 + cleanWord.length <= maxLen) {
-                current.append(" ").append(cleanWord)
+                current.append(w)
+            } else if (current.length + 1 + w.length <= maxLen) {
+                current.append(" ").append(w)
             } else {
                 result.add(current.toString())
                 current.clear()
-                current.append(cleanWord)
+                current.append(w)
             }
         }
         if (current.isNotEmpty()) result.add(current.toString())
