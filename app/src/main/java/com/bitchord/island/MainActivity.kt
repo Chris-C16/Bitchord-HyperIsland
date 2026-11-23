@@ -2,7 +2,6 @@ package com.bitchord.island
 
 import android.Manifest
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -32,20 +31,14 @@ class MainActivity : ComponentActivity() {
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 Spacer(modifier = Modifier.height(24.dp))
-                Text("BitChord HyperIsland", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                Text("Attiva i permessi qui sotto, poi avvia un brano su BitChord.", color = Color.White.copy(0.7f), fontSize = 14.sp)
+                Text("HyperIsland Lyrics", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                Text("Attiva i 2 permessi qui sotto, poi avvia un brano su BitChord.", color = Color.White.copy(0.7f), fontSize = 14.sp)
                 Spacer(modifier = Modifier.height(8.dp))
                 PermissionButton("1. Accesso alle Notifiche (legge BitChord)") {
                     startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                 }
-                PermissionButton("2. Mostra sopra altre app (Mini Lyrics Card)") {
-                    startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-                }
-                PermissionButton("3. Abilita Live Updates / Super Island") {
+                PermissionButton("2. Abilita Live Updates / Super Island") {
                     startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply { putExtra(Settings.EXTRA_APP_PACKAGE, packageName) })
-                }
-                PermissionButton("4. Apri/Chiudi Anteprima Mini Lyrics") {
-                    sendBroadcast(Intent(HyperIslandNotifier.ACTION_TOGGLE_OVERLAY).setPackage(packageName))
                 }
             }
         }
