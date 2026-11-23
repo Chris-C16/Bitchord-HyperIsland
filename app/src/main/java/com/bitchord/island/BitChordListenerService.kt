@@ -130,9 +130,7 @@ class BitChordListenerService : NotificationListenerService() {
     }
 
     private fun attachToBitChord(controllers: List<MediaController>?) {
-        val target = controllers?.firstOrNull {
-            it.packageName.contains("bitchord", ignoreCase = true)
-        }
+        val target = controllers?.filter { it.packageName != packageName }?.firstOrNull()
 
         if (target?.sessionToken == activeController?.sessionToken) {
             if (target != null) {
@@ -234,7 +232,7 @@ class BitChordListenerService : NotificationListenerService() {
         handler.removeCallbacks(tickRunnable)
     }
 
-        private fun syncLyrics(isPlaying: Boolean) {
+    private fun syncLyrics(isPlaying: Boolean) {
         if (currentTitle.isBlank()) return
 
         if (isCarModeActive()) {
@@ -246,44 +244,8 @@ class BitChordListenerService : NotificationListenerService() {
         val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
         val currLine = if (idx >= 0) currentLines[idx] else null
 
-        // Aggiorna SystemUI SOLO quando cambia effettivamente il verso o play/pausa (elimina il lag della HyperIsland)
         val renderKey = "$currentTrackKey|$idx|$isPlaying"
         if (renderKey == lastRenderKey) return
-        lastRenderKey = renderKey
-
-        val next1 = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
-        val next2 = if (idx >= 0 && idx + 2 < currentLines.size) currentLines[idx + 2].fullText else ""
-
-        if (!isForegroundStarted) {
-            val notif = notifier.buildNotification(
-                currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying
-            )
-            try {
-                startForeground(
-                    HyperIslandNotifier.NOTIFICATION_ID,
-                    notif,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                )
-                isForegroundStarted = true
-            } catch (_: Exception) {
-                notifier.update(currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying)
-            }
-        } else {
-            notifier.update(currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying)
-        }
-    }
-
-        val posMs = LyricsPlaybackStore.currentPositionMs()
-        val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
-        val currLine = if (idx >= 0) currentLines[idx] else null
-
-        val step = if (currLine != null) {
-            val dur = (currLine.endMs - currLine.startMs).coerceAtLeast(300L)
-            (((posMs - currLine.startMs).toFloat() / dur) * 8f).toInt().coerceIn(0, 8)
-        } else 0
-
-        val renderKey = "$currentTrackKey|$idx|$step|$isPlaying"
-        if (renderKey == lastRenderKey && isPlaying) return
         lastRenderKey = renderKey
 
         val next1 = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
