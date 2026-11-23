@@ -1,7 +1,13 @@
 package com.bitchord.island
 
+import android.app.UiModeManager
+import android.content.BroadcastReceiver
 import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.media.MediaMetadata
 import android.media.session.MediaController
@@ -18,6 +24,7 @@ class BitChordListenerService : NotificationListenerService() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var notifier: HyperIslandNotifier
     private lateinit var sessionManager: MediaSessionManager
+    private lateinit var uiModeManager: UiModeManager
 
     private var activeController: MediaController? = null
     private var fetchJob: Job? = null
@@ -32,6 +39,17 @@ class BitChordListenerService : NotificationListenerService() {
     private var currentPalette = CoverPalette()
     private var currentLines: List<LyricLine> = emptyList()
     private var lastRenderKey = ""
+
+    private val carModeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (isCarModeActive()) {
+                suspendForCarMode()
+            } else {
+                lastRenderKey = ""
+                syncLyrics(isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING)
+            }
+        }
+    }
 
     private val tickRunnable = object : Runnable {
         override fun run() {
@@ -68,6 +86,13 @@ class BitChordListenerService : NotificationListenerService() {
         super.onCreate()
         notifier = HyperIslandNotifier(this)
         sessionManager = getSystemService(MediaSessionManager::class.java)
+        uiModeManager = getSystemService(UiModeManager::class.java)
+
+        val carFilter = IntentFilter().apply {
+            addAction(UiModeManager.ACTION_ENTER_CAR_MODE)
+            addAction(UiModeManager.ACTION_EXIT_CAR_MODE)
+        }
+        registerReceiver(carModeReceiver, carFilter, RECEIVER_NOT_EXPORTED)
 
         LyricsPlaybackStore.onPlayPause = {
             val ctrl = activeController
@@ -80,6 +105,18 @@ class BitChordListenerService : NotificationListenerService() {
         LyricsPlaybackStore.onNext = { activeController?.transportControls?.skipToNext() }
         LyricsPlaybackStore.onPrevious = { activeController?.transportControls?.skipToPrevious() }
         LyricsPlaybackStore.onSeekTo = { posMs -> activeController?.transportControls?.seekTo(posMs) }
+    }
+
+    private fun isCarModeActive(): Boolean {
+        return uiModeManager.currentModeType == Configuration.UI_MODE_TYPE_CAR
+    }
+
+    private fun suspendForCarMode() {
+        notifier.cancel()
+        if (isForegroundStarted) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            isForegroundStarted = false
+        }
     }
 
     override fun onListenerConnected() {
@@ -95,7 +132,7 @@ class BitChordListenerService : NotificationListenerService() {
     private fun attachToBitChord(controllers: List<MediaController>?) {
         val target = controllers?.firstOrNull {
             it.packageName.contains("bitchord", ignoreCase = true)
-        } ?: controllers?.firstOrNull()
+        }
 
         if (target?.sessionToken == activeController?.sessionToken) {
             if (target != null) {
@@ -118,11 +155,7 @@ class BitChordListenerService : NotificationListenerService() {
         } else {
             stopTicker()
             LyricsPlaybackStore.isPlaying.value = false
-            if (isForegroundStarted) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                isForegroundStarted = false
-            }
-            notifier.cancel()
+            suspendForCarMode()
         }
     }
 
@@ -148,7 +181,10 @@ class BitChordListenerService : NotificationListenerService() {
         val key = "$title|$artist"
         currentTitle = title
         currentArtist = artist
-        if (durationMs > 0L) currentDurationMs = durationMs
+        if (durationMs > 0L) {
+            currentDurationMs = durationMs
+            LyricsPlaybackStore.durationMs.value = durationMs
+        }
 
         LyricsPlaybackStore.title.value = title
         LyricsPlaybackStore.artist.value = artist
@@ -164,6 +200,7 @@ class BitChordListenerService : NotificationListenerService() {
             currentTrackKey = key
             currentLines = emptyList()
             LyricsPlaybackStore.lines.value = emptyList()
+            LyricsPlaybackStore.syncOffsetMs.value = 0L
             lastRenderKey = ""
 
             val playingNow = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
@@ -197,8 +234,14 @@ class BitChordListenerService : NotificationListenerService() {
         handler.removeCallbacks(tickRunnable)
     }
 
-   private fun syncLyrics(isPlaying: Boolean) {
+    private fun syncLyrics(isPlaying: Boolean) {
         if (currentTitle.isBlank()) return
+
+        if (isCarModeActive()) {
+            suspendForCarMode()
+            return
+        }
+
         val posMs = LyricsPlaybackStore.currentPositionMs()
         val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
         val currLine = if (idx >= 0) currentLines[idx] else null
@@ -233,11 +276,13 @@ class BitChordListenerService : NotificationListenerService() {
             notifier.update(currentTitle, currentArtist, currLine, next1, next2, currentPalette, posMs, isPlaying)
         }
     }
-   
+
     override fun onDestroy() {
         stopTicker()
         fetchJob?.cancel()
         activeController?.unregisterCallback(mediaCallback)
+        unregisterReceiver(carModeReceiver)
+        suspendForCarMode()
         scope.cancel()
         super.onDestroy()
     }

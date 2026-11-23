@@ -6,11 +6,6 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Paint
-import android.graphics.Path
-import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
 import androidx.compose.ui.graphics.toArgb
@@ -22,7 +17,6 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private val manager = context.getSystemService(NotificationManager::class.java)
-    private val noteIcon: Icon by lazy { createMusicNoteIcon() }
 
     init {
         val channel = NotificationChannel(
@@ -37,30 +31,6 @@ class HyperIslandNotifier(private val context: Context) {
             lockscreenVisibility = Notification.VISIBILITY_PUBLIC
         }
         manager.createNotificationChannel(channel)
-    }
-
-    private fun createMusicNoteIcon(): Icon {
-        val size = 72
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = android.graphics.Color.WHITE
-            style = Paint.Style.FILL
-        }
-        // Testa della nota
-        canvas.drawCircle(27f, 51f, 10f, paint)
-        // Gambo e bandierina della nota musicale
-        val path = Path().apply {
-            moveTo(33f, 51f)
-            lineTo(33f, 15f)
-            lineTo(54f, 21f)
-            lineTo(54f, 30f)
-            lineTo(39f, 26f)
-            lineTo(39f, 51f)
-            close()
-        }
-        canvas.drawPath(path, paint)
-        return Icon.createWithBitmap(bmp)
     }
 
     private fun createLyricsPendingIntent(): PendingIntent {
@@ -99,6 +69,19 @@ class HyperIslandNotifier(private val context: Context) {
         return active to bottomParagraphs
     }
 
+    private fun buildStaticMiniPillText(currentLine: LyricLine?, fallbackTitle: String): String {
+        val full = currentLine?.fullText?.trim().orEmpty()
+        val source = full.ifBlank { fallbackTitle.trim() }
+        return trimWord(source, 15)
+    }
+
+    private fun trimWord(text: String, maxLen: Int): String {
+        if (text.length <= maxLen) return text
+        val sub = text.substring(0, maxLen)
+        val sp = sub.lastIndexOf(' ')
+        return if (sp > maxLen / 2) sub.substring(0, sp) else sub
+    }
+
     fun buildNotification(
         title: String,
         artist: String,
@@ -112,8 +95,7 @@ class HyperIslandNotifier(private val context: Context) {
         val (topLine, bottomParagraphs) = formatMultiParagraphLyrics(
             currentLine, nextLyric1, nextLyric2, title, artist
         )
-
-        val miniPillText = buildMiniPillText(currentLine, songPositionMs, title)
+        val miniPillText = buildStaticMiniPillText(currentLine, title)
 
         val lineProgress = if (currentLine != null) {
             val dur = (currentLine.endMs - currentLine.startMs).coerceAtLeast(300L)
@@ -126,7 +108,7 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         val builder = Notification.Builder(context, CHANNEL_ID)
-            .setSmallIcon(noteIcon)
+            .setSmallIcon(R.drawable.ic_lyrics_note)
             .setContentTitle(topLine)
             .setContentText(bottomParagraphs)
             .setSubText("$title • $artist")
@@ -167,30 +149,6 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         return builder.build()
-    }
-
-    private fun buildMiniPillText(currentLine: LyricLine?, songPositionMs: Long, fallbackTitle: String): String {
-        val full = currentLine?.fullText?.trim().orEmpty()
-        if (full.isBlank()) return trimWord(fallbackTitle, 15)
-        if (full.length <= 15) return full
-
-        val dur = (currentLine!!.endMs - currentLine.startMs).coerceAtLeast(1L)
-        val progress = ((songPositionMs - currentLine.startMs).toFloat() / dur).coerceIn(0f, 1f)
-        return if (progress < 0.48f) {
-            trimWord(full, 15)
-        } else {
-            val start = (full.length - 15).coerceAtLeast(0)
-            val sub = full.substring(start)
-            val sp = sub.indexOf(' ')
-            if (sp in 1..7) sub.substring(sp + 1) else sub
-        }
-    }
-
-    private fun trimWord(text: String, maxLen: Int): String {
-        if (text.length <= maxLen) return text
-        val sub = text.substring(0, maxLen)
-        val sp = sub.lastIndexOf(' ')
-        return if (sp > maxLen / 2) sub.substring(0, sp) else sub
     }
 
     fun update(

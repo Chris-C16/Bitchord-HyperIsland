@@ -14,9 +14,9 @@ import java.net.URLEncoder
 data class LyricWord(val text: String, val startMs: Long, val endMs: Long)
 data class LyricLine(val startMs: Long, val endMs: Long, val fullText: String, val words: List<LyricWord>)
 data class CoverPalette(
-    val primary: Color = Color(0xFF2B2440),
-    val secondary: Color = Color(0xFF15121E),
-    val accent: Color = Color(0xFF5A4B8A)
+    val primary: Color = Color(0xFF282038),
+    val secondary: Color = Color(0xFF14111C),
+    val accent: Color = Color(0xFF564787)
 )
 
 object LyricsRepository {
@@ -29,17 +29,14 @@ object LyricsRepository {
             val cleanTitle = title.replace(Regex("""\s*[\(\[].*?[\)\]]"""), "").trim()
             val cleanArtist = artist.split(",", "&", "feat.", "ft.").firstOrNull()?.trim().orEmpty()
 
-            // 1. Tentativo diretto /api/get
             val direct = queryGetEndpoint(title, artist, durationSec)
             if (direct.isNotEmpty()) return@withContext direct
 
-            // 2. Tentativo con titolo pulito senza (feat. / Remastered)
             if (cleanTitle != title || cleanArtist != artist) {
                 val cleaned = queryGetEndpoint(cleanTitle, cleanArtist, durationSec)
                 if (cleaned.isNotEmpty()) return@withContext cleaned
             }
 
-            // 3. Fallback su /api/search (risolve il 99% dei mancati caricamenti)
             querySearchEndpoint(cleanTitle, cleanArtist)
         }
 
@@ -49,7 +46,7 @@ object LyricsRepository {
             val qArtist = URLEncoder.encode(artist, "UTF-8")
             val url = "https://lrclib.net/api/get?track_name=$qTitle&artist_name=$qArtist" +
                     if (durationSec > 0) "&duration=$durationSec" else ""
-            val req = Request.Builder().url(url).header("User-Agent", "BitChordIsland/1.1").build()
+            val req = Request.Builder().url(url).header("User-Agent", "BitChordIsland/2.0").build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return emptyList()
                 val body = resp.body?.string() ?: return emptyList()
@@ -66,7 +63,7 @@ object LyricsRepository {
             val q = URLEncoder.encode("$title $artist".trim(), "UTF-8")
             val req = Request.Builder()
                 .url("https://lrclib.net/api/search?q=$q")
-                .header("User-Agent", "BitChordIsland/1.1")
+                .header("User-Agent", "BitChordIsland/2.0")
                 .build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return emptyList()
