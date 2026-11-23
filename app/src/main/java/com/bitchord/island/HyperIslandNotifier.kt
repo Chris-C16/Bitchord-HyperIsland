@@ -6,6 +6,11 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
 import androidx.compose.ui.graphics.toArgb
@@ -17,6 +22,7 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private val manager = context.getSystemService(NotificationManager::class.java)
+    private val noteIcon: Icon by lazy { createMusicNoteIcon() }
 
     init {
         val channel = NotificationChannel(
@@ -33,21 +39,42 @@ class HyperIslandNotifier(private val context: Context) {
         manager.createNotificationChannel(channel)
     }
 
+    private fun createMusicNoteIcon(): Icon {
+        val size = 72
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.WHITE
+            style = Paint.Style.FILL
+        }
+        // Testa della nota
+        canvas.drawCircle(27f, 51f, 10f, paint)
+        // Gambo e bandierina della nota musicale
+        val path = Path().apply {
+            moveTo(33f, 51f)
+            lineTo(33f, 15f)
+            lineTo(54f, 21f)
+            lineTo(54f, 30f)
+            lineTo(39f, 26f)
+            lineTo(39f, 51f)
+            close()
+        }
+        canvas.drawPath(path, paint)
+        return Icon.createWithBitmap(bmp)
+    }
+
     private fun createLyricsPendingIntent(): PendingIntent {
         val openLyricsIntent = Intent(context, LyricsPlayerActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         return PendingIntent.getActivity(
-            context, 10, openLyricsIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or Intent.FLAG_IMMUTABLE
+            context,
+            10,
+            openLyricsIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
     }
 
-    /**
-     * Formatta 3 versi consecutivi nella card espansa:
-     * - Titolo (grassetto): Verso attivo corrente
-     * - Corpo (2 paragrafi su due righe con \n): Verso +1 e Verso +2
-     */
     private fun formatMultiParagraphLyrics(
         currentLine: LyricLine?,
         nextLyric1: String,
@@ -86,7 +113,6 @@ class HyperIslandNotifier(private val context: Context) {
             currentLine, nextLyric1, nextLyric2, title, artist
         )
 
-        // Nella pillola chiusa a destra della fotocamera (max ~15 caratteri netti senza tagli bruschi)
         val miniPillText = buildMiniPillText(currentLine, songPositionMs, title)
 
         val lineProgress = if (currentLine != null) {
@@ -100,7 +126,7 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         val builder = Notification.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_lyrics_note)
+            .setSmallIcon(noteIcon)
             .setContentTitle(topLine)
             .setContentText(bottomParagraphs)
             .setSubText("$title • $artist")
