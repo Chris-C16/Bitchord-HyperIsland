@@ -113,7 +113,7 @@ class HyperIslandNotifier(private val context: Context) {
             .setContentText(bottomParagraphs)
             .setSubText("$title • $artist")
             .setColor(accentColor)
-            .setColorized(true)
+            .setColorized(false)
             .setShowWhen(false)
             .setOngoing(isPlaying)
             .setOnlyAlertOnce(true)
