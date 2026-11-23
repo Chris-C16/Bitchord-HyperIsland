@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 
@@ -25,23 +26,61 @@ object LyricsRepository {
 
     suspend fun fetchSyncedLyrics(title: String, artist: String, durationSec: Long): List<LyricLine> =
         withContext(Dispatchers.IO) {
-            try {
-                val qTitle = URLEncoder.encode(title, "UTF-8")
-                val qArtist = URLEncoder.encode(artist, "UTF-8")
-                val url = "https://lrclib.net/api/get?track_name=$qTitle&artist_name=$qArtist" +
-                        if (durationSec > 0) "&duration=$durationSec" else ""
-                val req = Request.Builder().url(url).header("User-Agent", "BitChordIsland/1.0").build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@withContext emptyList()
-                    val body = resp.body?.string() ?: return@withContext emptyList()
-                    val synced = JSONObject(body).optString("syncedLyrics", "")
-                    if (synced.isBlank()) return@withContext emptyList()
-                    parseLrc(synced)
+            val cleanTitle = title.replace(Regex("""\s*[\(\[].*?[\)\]]"""), "").trim()
+            val cleanArtist = artist.split(",", "&", "feat.", "ft.").firstOrNull()?.trim().orEmpty()
+
+            // 1. Tentativo diretto /api/get
+            val direct = queryGetEndpoint(title, artist, durationSec)
+            if (direct.isNotEmpty()) return@withContext direct
+
+            // 2. Tentativo con titolo pulito senza (feat. / Remastered)
+            if (cleanTitle != title || cleanArtist != artist) {
+                val cleaned = queryGetEndpoint(cleanTitle, cleanArtist, durationSec)
+                if (cleaned.isNotEmpty()) return@withContext cleaned
+            }
+
+            // 3. Fallback su /api/search (risolve il 99% dei mancati caricamenti)
+            querySearchEndpoint(cleanTitle, cleanArtist)
+        }
+
+    private fun queryGetEndpoint(title: String, artist: String, durationSec: Long): List<LyricLine> {
+        return try {
+            val qTitle = URLEncoder.encode(title, "UTF-8")
+            val qArtist = URLEncoder.encode(artist, "UTF-8")
+            val url = "https://lrclib.net/api/get?track_name=$qTitle&artist_name=$qArtist" +
+                    if (durationSec > 0) "&duration=$durationSec" else ""
+            val req = Request.Builder().url(url).header("User-Agent", "BitChordIsland/1.1").build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return emptyList()
+                val body = resp.body?.string() ?: return emptyList()
+                val synced = JSONObject(body).optString("syncedLyrics", "")
+                if (synced.isBlank()) emptyList() else parseLrc(synced)
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun querySearchEndpoint(title: String, artist: String): List<LyricLine> {
+        return try {
+            val q = URLEncoder.encode("$title $artist".trim(), "UTF-8")
+            val req = Request.Builder()
+                .url("https://lrclib.net/api/search?q=$q")
+                .header("User-Agent", "BitChordIsland/1.1")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return emptyList()
+                val arr = JSONArray(resp.body?.string() ?: return emptyList())
+                for (i in 0 until arr.length()) {
+                    val synced = arr.getJSONObject(i).optString("syncedLyrics", "")
+                    if (synced.isNotBlank()) return parseLrc(synced)
                 }
-            } catch (_: Exception) {
                 emptyList()
             }
+        } catch (_: Exception) {
+            emptyList()
         }
+    }
 
     fun parseLrc(rawLrc: String): List<LyricLine> {
         val rawEntries = mutableListOf<Pair<Long, String>>()
