@@ -14,7 +14,7 @@ class HyperIslandNotifier(private val context: Context) {
     companion object {
         const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
-        private const val MAX_PILL_CHARS = 7
+        private const val MAX_PILL_CHARS = 12
     }
 
     private val manager = context.getSystemService(NotificationManager::class.java)
