@@ -145,8 +145,8 @@ class HyperIslandNotifier(private val context: Context) {
 
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(topLine)
-            .setContentText(bottomParagraphs)
+            .setContentTitle(miniPillChunk)
+            .setContentText("$topLine\n$bottomParagraphs")
             .setSubText("$title • $artist")
             .setColor(accentColor)
             .setColorized(false)
