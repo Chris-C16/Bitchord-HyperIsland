@@ -14,6 +14,7 @@ class HyperIslandNotifier(private val context: Context) {
     companion object {
         const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
+        private const val MAX_PILL_CHARS = 9
     }
 
     private val manager = context.getSystemService(NotificationManager::class.java)
@@ -69,32 +70,42 @@ class HyperIslandNotifier(private val context: Context) {
         return active to bottomParagraphs
     }
 
-    private fun splitForLeftAndRightPill(currentLine: LyricLine?, fallbackTitle: String): Pair<String, String> {
-        val full = currentLine?.fullText?.trim().orEmpty().ifBlank { fallbackTitle.trim() }
-        val words = full.split(" ").filter { it.isNotBlank() }
-        if (words.size <= 1) return "♪" to trimWord(full, 15)
-
-        val left = StringBuilder()
-        val right = StringBuilder()
-        for (w in words) {
-            if (left.length + w.length + 1 <= 12) {
-                if (left.isNotEmpty()) left.append(" ")
-                left.append(w)
-            } else if (right.length + w.length + 1 <= 15) {
-                if (right.isNotEmpty()) right.append(" ")
-                right.append(w)
-            }
+    fun getMicroChunk(currentLine: LyricLine?, songPositionMs: Long, fallbackTitle: String): Pair<Int, String> {
+        val full = currentLine?.fullText?.trim().orEmpty()
+        if (full.isBlank()) {
+            return 0 to buildChunks(fallbackTitle.trim(), MAX_PILL_CHARS).firstOrNull().orEmpty()
         }
-        val leftStr = left.toString().ifBlank { "♪" }
-        val rightStr = right.toString().ifBlank { trimWord(full, 15) }
-        return leftStr to rightStr
+
+        val chunks = buildChunks(full, MAX_PILL_CHARS)
+        if (chunks.size <= 1) return 0 to chunks.first()
+
+        val dur = (currentLine!!.endMs - currentLine.startMs).coerceAtLeast(400L)
+        val ratio = ((songPositionMs - currentLine.startMs).toFloat() / dur).coerceIn(0f, 0.999f)
+        val chunkIdx = (ratio * chunks.size).toInt().coerceIn(0, chunks.lastIndex)
+        return chunkIdx to chunks[chunkIdx]
     }
 
-    private fun trimWord(text: String, maxLen: Int): String {
-        if (text.length <= maxLen) return text
-        val sub = text.substring(0, maxLen)
-        val sp = sub.lastIndexOf(' ')
-        return if (sp > maxLen / 2) sub.substring(0, sp) else sub
+    private fun buildChunks(text: String, maxLen: Int): List<String> {
+        val words = text.split(" ").filter { it.isNotBlank() }
+        if (words.isEmpty()) return listOf("")
+
+        val result = mutableListOf<String>()
+        val current = StringBuilder()
+
+        for (w in words) {
+            val cleanWord = if (w.length > maxLen) w.substring(0, maxLen) else w
+            if (current.isEmpty()) {
+                current.append(cleanWord)
+            } else if (current.length + 1 + cleanWord.length <= maxLen) {
+                current.append(" ").append(cleanWord)
+            } else {
+                result.add(current.toString())
+                current.clear()
+                current.append(cleanWord)
+            }
+        }
+        if (current.isNotEmpty()) result.add(current.toString())
+        return result
     }
 
     fun buildNotification(
@@ -110,43 +121,11 @@ class HyperIslandNotifier(private val context: Context) {
         val (topLine, bottomParagraphs) = formatMultiParagraphLyrics(
             currentLine, nextLyric1, nextLyric2, title, artist
         )
-        val (leftSideText, rightSideText) = splitForLeftAndRightPill(currentLine, title)
-        val singleRightText = trimWord(currentLine?.fullText?.trim().orEmpty().ifBlank { title }, 15)
-
+        val (_, miniPillChunk) = getMicroChunk(currentLine, songPositionMs, title)
         val accentColor = palette.accent.toArgb()
-        val hexAccent = String.format("#%06X", 0xFFFFFF and accentColor)
-
-        // Parametri nativi HyperOS Focus / Super Island per popolare anche il lato sinistro della pillola
-        val focusJson = """
-            {
-              "param_v2": {
-                "protocol": 1,
-                "business": "lyrics_island",
-                "ticker": "${singleRightText.replace("\"", "'")}",
-                "enableFloat": false,
-                "island": {
-                  "islandProperty": 1,
-                  "bigIslandArea": {
-                    "imageTextInfoLeft": {
-                      "type": 1,
-                      "textInfo": { "title": "${leftSideText.replace("\"", "'")}", "color": "#FFFFFF" }
-                    },
-                    "imageTextInfoRight": {
-                      "type": 2,
-                      "textInfo": { "title": "${rightSideText.replace("\"", "'")}", "color": "$hexAccent" }
-                    }
-                  },
-                  "smallIslandArea": {
-                    "picInfo": { "type": 1 }
-                  }
-                }
-              }
-            }
-        """.trimIndent()
 
         val extras = Bundle().apply {
             putBoolean("android.requestPromotedOngoing", true)
-            putString("miui.focus.param", focusJson)
         }
 
         val builder = Notification.Builder(context, CHANNEL_ID)
@@ -171,7 +150,7 @@ class HyperIslandNotifier(private val context: Context) {
                     .invoke(builder, true)
                 Notification.Builder::class.java
                     .getMethod("setShortCriticalText", CharSequence::class.java)
-                    .invoke(builder, singleRightText)
+                    .invoke(builder, miniPillChunk)
 
                 val progressStyleClass = Class.forName("android.app.Notification\$ProgressStyle")
                 val progressStyle = progressStyleClass.getDeclaredConstructor().newInstance()
