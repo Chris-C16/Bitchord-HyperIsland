@@ -289,9 +289,10 @@ class BitChordListenerService : NotificationListenerService() {
             else -> MIN_CHUNK_INTERVAL_MS
         }
 
-        if (isForegroundStarted && elapsedSinceLast < minInterval) {
-            return
+        if (!forceImmediate && isForegroundStarted && elapsedSinceLast < minInterval) {
+             return
         }
+
 
         lastRenderKey = renderKey
         lastNotifiedTrackKey = currentTrackKey
