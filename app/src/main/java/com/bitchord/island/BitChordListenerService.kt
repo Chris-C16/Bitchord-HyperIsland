@@ -22,8 +22,8 @@ import kotlinx.coroutines.*
 class BitChordListenerService : NotificationListenerService() {
 
     companion object {
-        private const val TICK_INTERVAL_MS = 240L
-        private const val MIN_NOTIFY_INTERVAL_MS = 650L
+        private const val TICK_INTERVAL_MS = 100L
+        private const val MIN_NOTIFY_INTERVAL_MS = 220L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -47,6 +47,7 @@ class BitChordListenerService : NotificationListenerService() {
 
     private var lastRenderKey = ""
     private var lastNotifiedTrackKey = ""
+    private var lastNotifiedIdx = Int.MIN_VALUE
     private var lastNotifiedPlaying = false
     private var lastNotifyRealtimeMs = 0L
     private var animStep = 0
@@ -218,13 +219,14 @@ class BitChordListenerService : NotificationListenerService() {
             LyricsPlaybackStore.lines.value = emptyList()
             LyricsPlaybackStore.syncOffsetMs.value = 0L
             lastRenderKey = ""
+            lastNotifiedIdx = Int.MIN_VALUE
 
             val playingNow = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
             syncLyrics(isPlaying = playingNow, forceImmediate = true)
 
             fetchJob?.cancel()
             fetchJob = scope.launch {
-                delay(220L)
+                delay(200L)
                 val loaded = LyricsRepository.fetchSyncedLyrics(
                     currentTitle,
                     currentArtist,
@@ -233,6 +235,7 @@ class BitChordListenerService : NotificationListenerService() {
                 currentLines = loaded
                 LyricsPlaybackStore.lines.value = loaded
                 lastRenderKey = ""
+                lastNotifiedIdx = Int.MIN_VALUE
                 syncPlaybackClock(activeController?.playbackState)
                 val stillPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
                 syncLyrics(isPlaying = stillPlaying, forceImmediate = true)
@@ -267,13 +270,14 @@ class BitChordListenerService : NotificationListenerService() {
         val nextStartMs = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].startMs else null
 
         val chunk = notifier.computePillChunk(currLine, nextStartMs, posMs, currentTitle, isPlaying)
-        val renderKey = "$currentTrackKey|$idx|${chunk.index}|$isPlaying"
+        val renderKey = "$currentTrackKey|$idx|${chunk.index}|${chunk.isInstrumental}|$isPlaying"
         if (renderKey == lastRenderKey) return
 
         val now = SystemClock.elapsedRealtime()
         val isCriticalTransition = forceImmediate ||
             !isForegroundStarted ||
             currentTrackKey != lastNotifiedTrackKey ||
+            idx != lastNotifiedIdx ||
             isPlaying != lastNotifiedPlaying
 
         if (!isCriticalTransition && now - lastNotifyRealtimeMs < MIN_NOTIFY_INTERVAL_MS) {
@@ -282,21 +286,28 @@ class BitChordListenerService : NotificationListenerService() {
 
         lastRenderKey = renderKey
         lastNotifiedTrackKey = currentTrackKey
+        lastNotifiedIdx = idx
         lastNotifiedPlaying = isPlaying
         lastNotifyRealtimeMs = now
-        if (isPlaying) animStep++
+        if (isPlaying && !chunk.isInstrumental) animStep++
 
-        val next1 = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].fullText else ""
-        val next2 = if (idx >= 0 && idx + 2 < currentLines.size) currentLines[idx + 2].fullText else ""
+        val prev = if (idx > 0) currentLines[idx - 1].fullText else ""
+        val next1 = if (idx >= 0 && idx + 1 < currentLines.size) {
+            currentLines[idx + 1].fullText
+        } else if (idx == -1 && currentLines.isNotEmpty()) {
+            currentLines[0].fullText
+        } else {
+            ""
+        }
 
         if (!isForegroundStarted) {
             val notif = notifier.buildNotification(
                 title = currentTitle,
                 artist = currentArtist,
+                prevLyric = prev,
                 currentLine = currLine,
                 nextLineStartMs = nextStartMs,
                 nextLyric1 = next1,
-                nextLyric2 = next2,
                 palette = currentPalette,
                 songPositionMs = posMs,
                 songDurationMs = currentDurationMs,
@@ -314,10 +325,10 @@ class BitChordListenerService : NotificationListenerService() {
                 notifier.update(
                     title = currentTitle,
                     artist = currentArtist,
+                    prevLyric = prev,
                     currentLine = currLine,
                     nextLineStartMs = nextStartMs,
                     nextLyric1 = next1,
-                    nextLyric2 = next2,
                     palette = currentPalette,
                     songPositionMs = posMs,
                     songDurationMs = currentDurationMs,
@@ -329,10 +340,10 @@ class BitChordListenerService : NotificationListenerService() {
             notifier.update(
                 title = currentTitle,
                 artist = currentArtist,
+                prevLyric = prev,
                 currentLine = currLine,
                 nextLineStartMs = nextStartMs,
                 nextLyric1 = next1,
-                nextLyric2 = next2,
                 palette = currentPalette,
                 songPositionMs = posMs,
                 songDurationMs = currentDurationMs,
