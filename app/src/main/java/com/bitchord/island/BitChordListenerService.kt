@@ -90,7 +90,7 @@ class BitChordListenerService : NotificationListenerService() {
             if (playing) {
                 handleMetadata(activeController?.metadata)
                 startTicker()
-                syncLyrics(isPlaying = true, forceImmediate = false)
+                syncLyrics(isPlaying = true, forceImmediate = true)
             } else {
                 stopTicker()
                 lastRenderKey = ""
