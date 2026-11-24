@@ -22,9 +22,9 @@ import kotlinx.coroutines.*
 class BitChordListenerService : NotificationListenerService() {
 
     companion object {
-        private const val TICK_INTERVAL_MS = 120L
-        private const val MIN_CRITICAL_INTERVAL_MS = 180L
-        private const val MIN_CHUNK_INTERVAL_MS = 320L
+        private const val TICK_INTERVAL_MS = 100L
+        private const val MIN_CRITICAL_INTERVAL_MS = 150L
+        private const val MIN_CHUNK_INTERVAL_MS = 280L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -87,13 +87,13 @@ class BitChordListenerService : NotificationListenerService() {
         override fun onPlaybackStateChanged(state: PlaybackState?) {
             syncPlaybackClock(state)
             val playing = state?.state == PlaybackState.STATE_PLAYING
+            lastRenderKey = ""
             if (playing) {
                 handleMetadata(activeController?.metadata)
                 startTicker()
                 syncLyrics(isPlaying = true, forceImmediate = true)
             } else {
                 stopTicker()
-                lastRenderKey = ""
                 syncLyrics(isPlaying = false, forceImmediate = true)
             }
         }
@@ -217,6 +217,9 @@ class BitChordListenerService : NotificationListenerService() {
                 }
                 currentPalette = extracted
                 LyricsPlaybackStore.palette.value = extracted
+                lastRenderKey = ""
+                val stillPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+                syncLyrics(isPlaying = stillPlaying, forceImmediate = true)
             }
         }
 
@@ -283,16 +286,11 @@ class BitChordListenerService : NotificationListenerService() {
             idx != lastNotifiedIdx ||
             isPlaying != lastNotifiedPlaying
 
-        val minInterval = when {
-            forceImmediate -> MIN_CRITICAL_INTERVAL_MS
-            isLineOrStateChange -> MIN_CRITICAL_INTERVAL_MS
-            else -> MIN_CHUNK_INTERVAL_MS
-        }
+        val minInterval = if (isLineOrStateChange) MIN_CRITICAL_INTERVAL_MS else MIN_CHUNK_INTERVAL_MS
 
         if (!forceImmediate && isForegroundStarted && elapsedSinceLast < minInterval) {
-             return
+            return
         }
-
 
         lastRenderKey = renderKey
         lastNotifiedTrackKey = currentTrackKey
@@ -316,6 +314,7 @@ class BitChordListenerService : NotificationListenerService() {
                 currentLine = currLine,
                 nextLineStartMs = nextStartMs,
                 nextLyric1 = next1,
+                cover = currentCover,
                 palette = currentPalette,
                 songPositionMs = posMs,
                 songDurationMs = currentDurationMs,
@@ -335,6 +334,7 @@ class BitChordListenerService : NotificationListenerService() {
                     currentLine = currLine,
                     nextLineStartMs = nextStartMs,
                     nextLyric1 = next1,
+                    cover = currentCover,
                     palette = currentPalette,
                     songPositionMs = posMs,
                     songDurationMs = currentDurationMs,
@@ -348,6 +348,7 @@ class BitChordListenerService : NotificationListenerService() {
                 currentLine = currLine,
                 nextLineStartMs = nextStartMs,
                 nextLyric1 = next1,
+                cover = currentCover,
                 palette = currentPalette,
                 songPositionMs = posMs,
                 songDurationMs = currentDurationMs,
