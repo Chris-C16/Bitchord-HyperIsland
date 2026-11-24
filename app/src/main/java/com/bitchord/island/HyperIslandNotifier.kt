@@ -38,20 +38,12 @@ class HyperIslandNotifier(private val context: Context) {
         const val NOTIFICATION_ID = 3601
         private const val MAX_PILL_VISUAL_WIDTH = 10.6f
         private const val INSTRUMENTAL_HOLD_MS = 1350L
-
-        private val WAVE_FRAMES = arrayOf(
-            floatArrayOf(0.32f, 0.88f, 0.52f, 0.96f),
-            floatArrayOf(0.76f, 0.38f, 0.96f, 0.48f),
-            floatArrayOf(0.96f, 0.64f, 0.34f, 0.84f),
-            floatArrayOf(0.46f, 0.96f, 0.72f, 0.36f)
-        )
     }
 
     private val manager = context.getSystemService(NotificationManager::class.java)
-    private val playingSmallIcons: Array<Icon>
+    private val playingSmallIcon: Icon
     private val pausedSmallIcon: Icon
     private val idleSmallIcon: Icon
-    private val badgeCache = HashMap<String, Bitmap>()
 
     init {
         val channel = NotificationChannel(
@@ -67,9 +59,7 @@ class HyperIslandNotifier(private val context: Context) {
         }
         manager.createNotificationChannel(channel)
 
-        playingSmallIcons = Array(WAVE_FRAMES.size) { frameIdx ->
-            Icon.createWithBitmap(renderSmallWaveBitmap(WAVE_FRAMES[frameIdx]))
-        }
+        playingSmallIcon = Icon.createWithBitmap(renderStaticWaveBitmap())
         pausedSmallIcon = Icon.createWithBitmap(renderSmallPauseBitmap())
         idleSmallIcon = Icon.createWithBitmap(renderSmallIdleBitmap())
     }
@@ -119,7 +109,6 @@ class HyperIslandNotifier(private val context: Context) {
             else -> estimatedVocalMs
         }
 
-        // Evita di spalmare un verso breve su una pausa strumentale lunga
         val vocalDuration = if (availableWindow > estimatedVocalMs + 1200L) {
             estimatedVocalMs
         } else {
@@ -128,7 +117,6 @@ class HyperIslandNotifier(private val context: Context) {
 
         val elapsed = (songPositionMs - currentLine.startMs).coerceAtLeast(0L)
 
-        // Se il verso è finito da un po' e c'è ancora una pausa strumentale prima del verso successivo
         if (isPlaying && availableWindow > vocalDuration + INSTRUMENTAL_HOLD_MS && elapsed > vocalDuration + INSTRUMENTAL_HOLD_MS) {
             return PillChunk(-1, "• • •", chunks.size, isInstrumental = true)
         }
@@ -216,13 +204,11 @@ class HyperIslandNotifier(private val context: Context) {
 
             if (endIdx <= startIdx) endIdx = (startIdx + 1).coerceAtMost(word.length)
 
-            // Evita di lasciare 1-2 lettere isolate alla fine
             val leftover = word.length - endIdx
             if (leftover in 1..2 && endIdx - startIdx > 3) {
                 endIdx -= (3 - leftover)
             }
 
-            // Allinea il taglio dopo una vocale vicina per una sillabazione più leggibile
             if (endIdx < word.length && endIdx - startIdx >= 3) {
                 if (word[endIdx - 1] !in vowels) {
                     if (endIdx - 2 > startIdx + 1 && word[endIdx - 2] in vowels) {
@@ -259,7 +245,7 @@ class HyperIslandNotifier(private val context: Context) {
         else -> 1.0f
     }
 
-    private fun ellipsizeForCard(line: String, maxChars: Int = 36): String {
+    private fun ellipsizeForCard(line: String, maxChars: Int = 42): String {
         val clean = line.replace(Regex("\\s+"), " ").trim()
         if (clean.length <= maxChars) return clean
         val cut = clean.lastIndexOf(' ', maxChars - 1).takeIf { it >= maxChars / 2 } ?: (maxChars - 1)
@@ -320,7 +306,6 @@ class HyperIslandNotifier(private val context: Context) {
 
     fun buildNotification(
         title: String,
-        artist: String,
         prevLyric: String,
         currentLine: LyricLine?,
         nextLineStartMs: Long?,
@@ -328,21 +313,18 @@ class HyperIslandNotifier(private val context: Context) {
         palette: CoverPalette,
         songPositionMs: Long,
         songDurationMs: Long,
-        isPlaying: Boolean,
-        animStep: Int
+        isPlaying: Boolean
     ): Notification {
         val chunk = computePillChunk(currentLine, nextLineStartMs, songPositionMs, title, isPlaying)
         val expandedBody = formatStyledExpandedLyrics(prevLyric, currentLine, nextLyric1, chunk)
         val accentColor = boostAccentBrightness(palette.accent.toArgb())
-        val frameIndex = ((animStep % WAVE_FRAMES.size) + WAVE_FRAMES.size) % WAVE_FRAMES.size
 
         val smallIcon = when {
             !isPlaying -> pausedSmallIcon
             chunk.isInstrumental -> idleSmallIcon
-            else -> playingSmallIcons[frameIndex]
+            else -> playingSmallIcon
         }
 
-        val expandedBadge = getExpandedBadge(frameIndex, isPlaying && !chunk.isInstrumental, accentColor)
         val progressPct = if (songDurationMs > 0L) {
             ((songPositionMs * 100L) / songDurationMs).toInt().coerceIn(0, 100)
         } else {
@@ -353,14 +335,10 @@ class HyperIslandNotifier(private val context: Context) {
             putBoolean("android.requestPromotedOngoing", true)
         }
 
-        val pillTitleStyled = SpannableStringBuilder(chunk.text).apply {
-            setSpan(TypefaceSpan("sans-serif-medium"), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        }
-
+        // String pura in setContentTitle: fondamentale perché HyperOS la legga nella pillola chiusa
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(smallIcon)
-            .setLargeIcon(expandedBadge)
-            .setContentTitle(pillTitleStyled)
+            .setContentTitle(chunk.text)
             .setContentText(expandedBody)
             .setColor(accentColor)
             .setColorized(false)
@@ -403,7 +381,6 @@ class HyperIslandNotifier(private val context: Context) {
 
     fun update(
         title: String,
-        artist: String,
         prevLyric: String,
         currentLine: LyricLine?,
         nextLineStartMs: Long?,
@@ -411,14 +388,12 @@ class HyperIslandNotifier(private val context: Context) {
         palette: CoverPalette,
         songPositionMs: Long,
         songDurationMs: Long,
-        isPlaying: Boolean,
-        animStep: Int
+        isPlaying: Boolean
     ) {
         manager.notify(
             NOTIFICATION_ID,
             buildNotification(
                 title,
-                artist,
                 prevLyric,
                 currentLine,
                 nextLineStartMs,
@@ -426,8 +401,7 @@ class HyperIslandNotifier(private val context: Context) {
                 palette,
                 songPositionMs,
                 songDurationMs,
-                isPlaying,
-                animStep
+                isPlaying
             )
         )
     }
@@ -442,65 +416,33 @@ class HyperIslandNotifier(private val context: Context) {
         return Color.HSVToColor(255, hsv)
     }
 
-    private fun getExpandedBadge(frameIndex: Int, isActiveWave: Boolean, accentColor: Int): Bitmap {
-        val key = "$frameIndex|$isActiveWave|$accentColor"
-        badgeCache[key]?.let { return it }
-
-        if (badgeCache.size > 24) {
-            badgeCache.clear()
-        }
-
-        val size = 128
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-
-        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(20, 20, 26)
-            style = Paint.Style.FILL
-        }
-        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(72, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
-            style = Paint.Style.STROKE
-            strokeWidth = 3f
-        }
-
-        val outerRect = RectF(4f, 4f, size - 4f, size - 4f)
-        canvas.drawRoundRect(outerRect, 34f, 34f, bgPaint)
-        canvas.drawRoundRect(outerRect, 34f, 34f, borderPaint)
-
-        val barPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = accentColor
-            style = Paint.Style.FILL
-        }
-
-        if (isActiveWave) {
-            drawBars(canvas, size.toFloat(), 0.24f, WAVE_FRAMES[frameIndex], barPaint)
-        } else {
-            val r = size * 0.065f
-            val cy = size / 2f
-            canvas.drawCircle(size * 0.30f, cy, r, barPaint)
-            canvas.drawCircle(size * 0.50f, cy, r * 1.15f, barPaint)
-            canvas.drawCircle(size * 0.70f, cy, r, barPaint)
-        }
-
-        badgeCache[key] = bmp
-        return bmp
-    }
-
-    private fun renderSmallWaveBitmap(heights: FloatArray): Bitmap {
-        val size = 72
+    private fun renderStaticWaveBitmap(): Bitmap {
+        val size = 48
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
             style = Paint.Style.FILL
         }
-        drawBars(canvas, size.toFloat(), 0.14f, heights, paint)
+        val heights = floatArrayOf(0.42f, 0.92f, 0.42f)
+        val pad = size * 0.16f
+        val usableW = size - pad * 2f
+        val usableH = size - pad * 2f
+        val gap = usableW * 0.16f
+        val barW = (usableW - gap * (heights.size - 1)) / heights.size
+        val centerY = size / 2f
+
+        for (i in heights.indices) {
+            val h = (usableH * heights[i]).coerceAtLeast(barW)
+            val left = pad + i * (barW + gap)
+            val top = centerY - h / 2f
+            canvas.drawRoundRect(RectF(left, top, left + barW, top + h), barW / 2f, barW / 2f, paint)
+        }
         return bmp
     }
 
     private fun renderSmallPauseBitmap(): Bitmap {
-        val size = 72
+        val size = 48
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -519,7 +461,7 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun renderSmallIdleBitmap(): Bitmap {
-        val size = 72
+        val size = 48
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -532,33 +474,5 @@ class HyperIslandNotifier(private val context: Context) {
         canvas.drawCircle(size * 0.50f, cy, r * 1.15f, paint)
         canvas.drawCircle(size * 0.76f, cy, r, paint)
         return bmp
-    }
-
-    private fun drawBars(
-        canvas: Canvas,
-        size: Float,
-        paddingRatio: Float,
-        heights: FloatArray,
-        paint: Paint
-    ) {
-        val pad = size * paddingRatio
-        val usableW = size - pad * 2f
-        val usableH = size - pad * 2f
-        val count = heights.size
-        val gap = usableW * 0.11f
-        val barW = (usableW - gap * (count - 1)) / count
-        val centerY = size / 2f
-
-        for (i in 0 until count) {
-            val h = (usableH * heights[i]).coerceAtLeast(barW)
-            val left = pad + i * (barW + gap)
-            val top = centerY - h / 2f
-            canvas.drawRoundRect(
-                RectF(left, top, left + barW, top + h),
-                barW / 2f,
-                barW / 2f,
-                paint
-            )
-        }
     }
 }
