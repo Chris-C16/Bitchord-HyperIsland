@@ -7,10 +7,13 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.Icon
 import android.os.Build
@@ -21,8 +24,12 @@ import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
+import android.view.View
+import android.widget.RemoteViews
 import androidx.compose.ui.graphics.toArgb
+import org.json.JSONObject
 import kotlin.math.ceil
+import kotlin.math.max
 
 class HyperIslandNotifier(private val context: Context) {
 
@@ -44,6 +51,11 @@ class HyperIslandNotifier(private val context: Context) {
     private val playingSmallIcon: Icon
     private val pausedSmallIcon: Icon
     private val idleSmallIcon: Icon
+
+    private var cachedCoverRef: Bitmap? = null
+    private var cachedDiscAccent: Int = 0
+    private var cachedDiscBitmap: Bitmap? = null
+    private var cachedDiscIcon: Icon? = null
 
     init {
         val channel = NotificationChannel(
@@ -95,7 +107,7 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         val chunks = buildBalancedChunks(full)
-        val estimatedVocalMs = (full.length * 85L + 420L).coerceIn(1100L, 4200L)
+        val estimatedVocalMs = (full.length * 65L + 350L).coerceIn(900L, 3000L)
         val gapToNext = if (nextLineStartMs != null && nextLineStartMs > currentLine!!.startMs) {
             nextLineStartMs - currentLine.startMs
         } else {
@@ -109,10 +121,10 @@ class HyperIslandNotifier(private val context: Context) {
             else -> estimatedVocalMs
         }
 
-        val vocalDuration = if (availableWindow > estimatedVocalMs + 1200L) {
+        val vocalDuration = if (availableWindow > estimatedVocalMs + 700L) {
             estimatedVocalMs
         } else {
-            availableWindow.coerceIn(700L, 5200L)
+            availableWindow.coerceIn(650L, 4200L)
         }
 
         val elapsed = (songPositionMs - currentLine.startMs).coerceAtLeast(0L)
@@ -245,17 +257,42 @@ class HyperIslandNotifier(private val context: Context) {
         else -> 1.0f
     }
 
-    private fun ellipsizeForCard(line: String, maxChars: Int = 42): String {
+    private fun ellipsizeForCard(line: String, maxChars: Int = 40): String {
         val clean = line.replace(Regex("\\s+"), " ").trim()
         if (clean.length <= maxChars) return clean
         val cut = clean.lastIndexOf(' ', maxChars - 1).takeIf { it >= maxChars / 2 } ?: (maxChars - 1)
         return clean.substring(0, cut).trimEnd() + "…"
     }
 
+    private fun resolveDisplayLines(
+        prevLyric: String,
+        currentLine: LyricLine?,
+        nextLyric1: String,
+        chunk: PillChunk,
+        title: String,
+        isPlaying: Boolean
+    ): Triple<String, String, String> {
+        val prev = ellipsizeForCard(prevLyric)
+        val curr = ellipsizeForCard(currentLine?.fullText.orEmpty())
+        val next = ellipsizeForCard(nextLyric1)
+
+        if (!isPlaying && curr.isBlank()) {
+            return Triple("", title.ifBlank { "In pausa" }, "Riproduzione in pausa")
+        }
+        if (curr.isBlank()) {
+            return Triple("", title.ifBlank { "In attesa del testo…" }, next)
+        }
+        if (chunk.isInstrumental) {
+            return Triple(curr, "• • •", next)
+        }
+        return Triple(prev, curr, next)
+    }
+
     private fun appendStyledLine(
         sb: SpannableStringBuilder,
         text: String,
-        isCurrent: Boolean
+        isCurrent: Boolean,
+        accentColor: Int
     ) {
         if (text.isBlank()) return
         if (sb.isNotEmpty()) sb.append("\n")
@@ -265,8 +302,8 @@ class HyperIslandNotifier(private val context: Context) {
         if (isCurrent) {
             sb.setSpan(TypefaceSpan("sans-serif-medium"), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             sb.setSpan(StyleSpan(Typeface.BOLD), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            sb.setSpan(ForegroundColorSpan(Color.WHITE), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            sb.setSpan(RelativeSizeSpan(1.06f), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.setSpan(ForegroundColorSpan(accentColor), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.setSpan(RelativeSizeSpan(1.08f), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         } else {
             sb.setSpan(TypefaceSpan("sans-serif"), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             sb.setSpan(ForegroundColorSpan(Color.argb(115, 255, 255, 255)), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
@@ -275,33 +312,123 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun formatStyledExpandedLyrics(
-        prevLyric: String,
-        currentLine: LyricLine?,
-        nextLyric1: String,
-        chunk: PillChunk
+        prev: String,
+        curr: String,
+        next: String,
+        accentColor: Int
     ): CharSequence {
         val sb = SpannableStringBuilder()
-        val prev = ellipsizeForCard(prevLyric)
-        val curr = ellipsizeForCard(currentLine?.fullText.orEmpty())
-        val next = ellipsizeForCard(nextLyric1)
-
-        if (curr.isBlank()) {
-            appendStyledLine(sb, "In attesa del testo…", isCurrent = true)
-            if (next.isNotBlank()) appendStyledLine(sb, next, isCurrent = false)
-            return sb
-        }
-
-        if (chunk.isInstrumental) {
-            appendStyledLine(sb, curr, isCurrent = false)
-            appendStyledLine(sb, "♪  • • •", isCurrent = true)
-            if (next.isNotBlank()) appendStyledLine(sb, next, isCurrent = false)
-            return sb
-        }
-
-        if (prev.isNotBlank()) appendStyledLine(sb, prev, isCurrent = false)
-        appendStyledLine(sb, curr, isCurrent = true)
-        if (next.isNotBlank()) appendStyledLine(sb, next, isCurrent = false)
+        if (prev.isNotBlank()) appendStyledLine(sb, prev, isCurrent = false, accentColor = accentColor)
+        appendStyledLine(sb, curr, isCurrent = true, accentColor = accentColor)
+        if (next.isNotBlank()) appendStyledLine(sb, next, isCurrent = false, accentColor = accentColor)
         return sb
+    }
+
+    private fun buildExpandedRemoteViews(
+        discBitmap: Bitmap,
+        prev: String,
+        curr: String,
+        next: String,
+        accentColor: Int
+    ): RemoteViews {
+        val rv = RemoteViews(context.packageName, R.layout.island_lyrics_expanded)
+        rv.setImageViewBitmap(R.id.iv_disc_cover, discBitmap)
+
+        if (prev.isNotBlank()) {
+            rv.setViewVisibility(R.id.tv_lyric_prev, View.VISIBLE)
+            rv.setTextViewText(R.id.tv_lyric_prev, prev)
+        } else {
+            rv.setViewVisibility(R.id.tv_lyric_prev, View.GONE)
+        }
+
+        rv.setTextViewText(R.id.tv_lyric_curr, curr)
+        rv.setTextColor(R.id.tv_lyric_curr, accentColor)
+
+        if (next.isNotBlank()) {
+            rv.setViewVisibility(R.id.tv_lyric_next, View.VISIBLE)
+            rv.setTextViewText(R.id.tv_lyric_next, next)
+        } else {
+            rv.setViewVisibility(R.id.tv_lyric_next, View.GONE)
+        }
+
+        return rv
+    }
+
+    private fun buildFocusParamJson(
+        pillText: String,
+        currLineText: String,
+        nextLineText: String,
+        accentHex: String
+    ): String {
+        val baseInfo = JSONObject().apply {
+            put("type", 2)
+            put("title", currLineText)
+            if (nextLineText.isNotBlank()) put("content", nextLineText)
+            put("colorTitle", accentHex)
+        }
+
+        val picInfo = JSONObject().apply {
+            put("type", 1)
+            put("pic", "miui.focus.pic_disc")
+        }
+
+        val bigIslandArea = JSONObject().apply {
+            put(
+                "imageTextInfoLeft",
+                JSONObject().apply {
+                    put("type", 1)
+                    put(
+                        "picInfo",
+                        JSONObject().apply {
+                            put("type", 1)
+                            put("pic", "miui.focus.pic_icon")
+                        }
+                    )
+                }
+            )
+            put(
+                "textInfo",
+                JSONObject().apply {
+                    put("title", pillText)
+                    put("narrowFont", true)
+                    put("showHighlightColor", false)
+                }
+            )
+        }
+
+        val smallIslandArea = JSONObject().apply {
+            put(
+                "picInfo",
+                JSONObject().apply {
+                    put("type", 1)
+                    put("pic", "miui.focus.pic_disc")
+                }
+            )
+        }
+
+        val paramIsland = JSONObject().apply {
+            put("islandProperty", 1)
+            put("highlightColor", accentHex)
+            put("bigIslandArea", bigIslandArea)
+            put("smallIslandArea", smallIslandArea)
+        }
+
+        val paramV2 = JSONObject().apply {
+            put("protocol", 1)
+            put("business", "bitchord_lyrics")
+            put("updatable", true)
+            put("islandFirstFloat", false)
+            put("enableFloat", false)
+            put("ticker", pillText)
+            put("tickerPic", "miui.focus.pic_icon")
+            put("baseInfo", baseInfo)
+            put("picInfo", picInfo)
+            put("param_island", paramIsland)
+        }
+
+        return JSONObject().apply {
+            put("param_v2", paramV2)
+        }.toString()
     }
 
     fun buildNotification(
@@ -310,14 +437,27 @@ class HyperIslandNotifier(private val context: Context) {
         currentLine: LyricLine?,
         nextLineStartMs: Long?,
         nextLyric1: String,
+        cover: Bitmap?,
         palette: CoverPalette,
         songPositionMs: Long,
         songDurationMs: Long,
         isPlaying: Boolean
     ): Notification {
         val chunk = computePillChunk(currentLine, nextLineStartMs, songPositionMs, title, isPlaying)
-        val expandedBody = formatStyledExpandedLyrics(prevLyric, currentLine, nextLyric1, chunk)
         val accentColor = boostAccentBrightness(palette.accent.toArgb())
+        val accentHex = String.format("#%06X", 0xFFFFFF and accentColor)
+
+        val (prevText, currText, nextText) = resolveDisplayLines(
+            prevLyric = prevLyric,
+            currentLine = currentLine,
+            nextLyric1 = nextLyric1,
+            chunk = chunk,
+            title = title,
+            isPlaying = isPlaying
+        )
+
+        val expandedBody = formatStyledExpandedLyrics(prevText, currText, nextText, accentColor)
+        val (discBitmap, discIcon) = getOrCreateVinylDisc(cover, accentColor)
 
         val smallIcon = when {
             !isPlaying -> pausedSmallIcon
@@ -331,13 +471,29 @@ class HyperIslandNotifier(private val context: Context) {
             0
         }
 
-        val extras = Bundle().apply {
-            putBoolean("android.requestPromotedOngoing", true)
+        val expandedRv = buildExpandedRemoteViews(discBitmap, prevText, currText, nextText, accentColor)
+        val focusJson = buildFocusParamJson(
+            pillText = chunk.text,
+            currLineText = currText,
+            nextLineText = nextText,
+            accentHex = accentHex
+        )
+
+        val focusPics = Bundle().apply {
+            putParcelable("miui.focus.pic_disc", discIcon)
+            putParcelable("miui.focus.pic_icon", smallIcon)
         }
 
-        // String pura in setContentTitle: fondamentale perché HyperOS la legga nella pillola chiusa
+        val extras = Bundle().apply {
+            putBoolean("android.requestPromotedOngoing", true)
+            putString("miui.focus.param", focusJson)
+            putBundle("miui.focus.pics", focusPics)
+            putParcelable("miui.focus.rv", expandedRv)
+        }
+
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(smallIcon)
+            .setLargeIcon(discBitmap)
             .setContentTitle(chunk.text)
             .setContentText(expandedBody)
             .setColor(accentColor)
@@ -385,6 +541,7 @@ class HyperIslandNotifier(private val context: Context) {
         currentLine: LyricLine?,
         nextLineStartMs: Long?,
         nextLyric1: String,
+        cover: Bitmap?,
         palette: CoverPalette,
         songPositionMs: Long,
         songDurationMs: Long,
@@ -393,15 +550,16 @@ class HyperIslandNotifier(private val context: Context) {
         manager.notify(
             NOTIFICATION_ID,
             buildNotification(
-                title,
-                prevLyric,
-                currentLine,
-                nextLineStartMs,
-                nextLyric1,
-                palette,
-                songPositionMs,
-                songDurationMs,
-                isPlaying
+                title = title,
+                prevLyric = prevLyric,
+                currentLine = currentLine,
+                nextLineStartMs = nextLineStartMs,
+                nextLyric1 = nextLyric1,
+                cover = cover,
+                palette = palette,
+                songPositionMs = songPositionMs,
+                songDurationMs = songDurationMs,
+                isPlaying = isPlaying
             )
         )
     }
@@ -411,9 +569,94 @@ class HyperIslandNotifier(private val context: Context) {
     private fun boostAccentBrightness(color: Int): Int {
         val hsv = FloatArray(3)
         Color.colorToHSV(color, hsv)
-        if (hsv[2] < 0.68f) hsv[2] = 0.88f
-        if (hsv[1] > 0.12f && hsv[1] < 0.45f) hsv[1] = 0.55f
+        if (hsv[1] < 0.14f) {
+            return Color.rgb(228, 236, 255)
+        }
+        hsv[2] = hsv[2].coerceAtLeast(0.92f)
+        hsv[1] = hsv[1].coerceIn(0.40f, 0.85f)
         return Color.HSVToColor(255, hsv)
+    }
+
+    private fun getOrCreateVinylDisc(cover: Bitmap?, accentColor: Int): Pair<Bitmap, Icon> {
+        val existingBmp = cachedDiscBitmap
+        val existingIcon = cachedDiscIcon
+        if (existingBmp != null && existingIcon != null && cachedCoverRef === cover && cachedDiscAccent == accentColor) {
+            return existingBmp to existingIcon
+        }
+
+        val discBmp = renderVinylDiscBitmap(cover, accentColor)
+        val discIcon = Icon.createWithBitmap(discBmp)
+        cachedCoverRef = cover
+        cachedDiscAccent = accentColor
+        cachedDiscBitmap = discBmp
+        cachedDiscIcon = discIcon
+        return discBmp to discIcon
+    }
+
+    private fun renderVinylDiscBitmap(cover: Bitmap?, accentColor: Int): Bitmap {
+        val size = 128
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val cx = size / 2f
+        val cy = size / 2f
+        val outerRadius = size / 2f - 2f
+
+        val basePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(22, 22, 28)
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(cx, cy, outerRadius, basePaint)
+
+        if (cover != null && !cover.isRecycled && cover.width > 0 && cover.height > 0) {
+            val scale = max(size.toFloat() / cover.width, size.toFloat() / cover.height)
+            val dx = (size - cover.width * scale) / 2f
+            val dy = (size - cover.height * scale) / 2f
+            val shader = BitmapShader(cover, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+            shader.setLocalMatrix(Matrix().apply {
+                setScale(scale, scale)
+                postTranslate(dx, dy)
+            })
+            val artPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.shader = shader
+            }
+            canvas.drawCircle(cx, cy, outerRadius - 3f, artPaint)
+        } else {
+            val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = accentColor
+                style = Paint.Style.FILL
+            }
+            canvas.drawCircle(cx, cy, outerRadius * 0.48f, labelPaint)
+        }
+
+        val groovePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(46, 255, 255, 255)
+            style = Paint.Style.STROKE
+            strokeWidth = 1.6f
+        }
+        canvas.drawCircle(cx, cy, outerRadius * 0.84f, groovePaint)
+        canvas.drawCircle(cx, cy, outerRadius * 0.68f, groovePaint)
+
+        val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(150, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+        }
+        canvas.drawCircle(cx, cy, outerRadius - 1.5f, rimPaint)
+
+        val centerRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(210, 20, 20, 24)
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(cx, cy, size * 0.125f, centerRingPaint)
+
+        val holeRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(180, 255, 255, 255)
+            style = Paint.Style.STROKE
+            strokeWidth = 2f
+        }
+        canvas.drawCircle(cx, cy, size * 0.125f, holeRimPaint)
+
+        return bmp
     }
 
     private fun renderStaticWaveBitmap(): Bitmap {
