@@ -22,9 +22,8 @@ import kotlinx.coroutines.*
 class BitChordListenerService : NotificationListenerService() {
 
     companion object {
-        private const val TICK_INTERVAL_MS = 100L
-        private const val MIN_CRITICAL_INTERVAL_MS = 150L
-        private const val MIN_CHUNK_INTERVAL_MS = 280L
+        private const val TICK_INTERVAL_MS = 120L
+        private const val MIN_LINE_INTERVAL_MS = 120L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -48,9 +47,6 @@ class BitChordListenerService : NotificationListenerService() {
     private var currentLines: List<LyricLine> = emptyList()
 
     private var lastRenderKey = ""
-    private var lastNotifiedTrackKey = ""
-    private var lastNotifiedIdx = Int.MIN_VALUE
-    private var lastNotifiedPlaying = false
     private var lastNotifyRealtimeMs = 0L
 
     private val carModeReceiver = object : BroadcastReceiver() {
@@ -229,7 +225,6 @@ class BitChordListenerService : NotificationListenerService() {
             LyricsPlaybackStore.lines.value = emptyList()
             LyricsPlaybackStore.syncOffsetMs.value = 0L
             lastRenderKey = ""
-            lastNotifiedIdx = Int.MIN_VALUE
 
             fetchJob?.cancel()
             fetchJob = scope.launch {
@@ -241,7 +236,6 @@ class BitChordListenerService : NotificationListenerService() {
                 currentLines = loaded
                 LyricsPlaybackStore.lines.value = loaded
                 lastRenderKey = ""
-                lastNotifiedIdx = Int.MIN_VALUE
                 syncPlaybackClock(activeController?.playbackState)
                 val stillPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
                 syncLyrics(isPlaying = stillPlaying, forceImmediate = true)
@@ -273,29 +267,16 @@ class BitChordListenerService : NotificationListenerService() {
         val posMs = LyricsPlaybackStore.currentPositionMs()
         val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
         val currLine = if (idx >= 0) currentLines[idx] else null
-        val nextStartMs = if (idx >= 0 && idx + 1 < currentLines.size) currentLines[idx + 1].startMs else null
 
-        val chunk = notifier.computePillChunk(currLine, nextStartMs, posMs, currentTitle, isPlaying)
-        val renderKey = "$currentTrackKey|$idx|${chunk.index}|${chunk.isInstrumental}|$isPlaying"
+        val renderKey = "$currentTrackKey|$idx|$isPlaying"
         if (renderKey == lastRenderKey) return
 
         val now = SystemClock.elapsedRealtime()
-        val elapsedSinceLast = now - lastNotifyRealtimeMs
-        val isLineOrStateChange = !isForegroundStarted ||
-            currentTrackKey != lastNotifiedTrackKey ||
-            idx != lastNotifiedIdx ||
-            isPlaying != lastNotifiedPlaying
-
-        val minInterval = if (isLineOrStateChange) MIN_CRITICAL_INTERVAL_MS else MIN_CHUNK_INTERVAL_MS
-
-        if (!forceImmediate && isForegroundStarted && elapsedSinceLast < minInterval) {
+        if (!forceImmediate && isForegroundStarted && now - lastNotifyRealtimeMs < MIN_LINE_INTERVAL_MS) {
             return
         }
 
         lastRenderKey = renderKey
-        lastNotifiedTrackKey = currentTrackKey
-        lastNotifiedIdx = idx
-        lastNotifiedPlaying = isPlaying
         lastNotifyRealtimeMs = now
 
         val prev = if (idx > 0) currentLines[idx - 1].fullText else ""
@@ -312,12 +293,9 @@ class BitChordListenerService : NotificationListenerService() {
                 title = currentTitle,
                 prevLyric = prev,
                 currentLine = currLine,
-                nextLineStartMs = nextStartMs,
                 nextLyric1 = next1,
                 cover = currentCover,
                 palette = currentPalette,
-                songPositionMs = posMs,
-                songDurationMs = currentDurationMs,
                 isPlaying = isPlaying
             )
             try {
@@ -332,12 +310,9 @@ class BitChordListenerService : NotificationListenerService() {
                     title = currentTitle,
                     prevLyric = prev,
                     currentLine = currLine,
-                    nextLineStartMs = nextStartMs,
                     nextLyric1 = next1,
                     cover = currentCover,
                     palette = currentPalette,
-                    songPositionMs = posMs,
-                    songDurationMs = currentDurationMs,
                     isPlaying = isPlaying
                 )
             }
@@ -346,12 +321,9 @@ class BitChordListenerService : NotificationListenerService() {
                 title = currentTitle,
                 prevLyric = prev,
                 currentLine = currLine,
-                nextLineStartMs = nextStartMs,
                 nextLyric1 = next1,
                 cover = currentCover,
                 palette = currentPalette,
-                songPositionMs = posMs,
-                songDurationMs = currentDurationMs,
                 isPlaying = isPlaying
             )
         }
