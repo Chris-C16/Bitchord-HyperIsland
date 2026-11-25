@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.os.SystemClock
+import android.util.Base64
 import androidx.compose.ui.graphics.toArgb
 import com.google.android.gms.wearable.DataClient
 import com.google.android.gms.wearable.MessageClient
@@ -22,6 +23,7 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
 
     companion object {
         const val PATH_TRACK_DATA = "/bitchord/track_data"
+        const val PATH_TRACK_DATA_MSG = "/bitchord/track_data_msg"
         const val PATH_PLAYBACK_STATE = "/bitchord/playback_state"
         const val PATH_CMD_PLAY_PAUSE = "/bitchord/cmd/play_pause"
         const val PATH_CMD_NEXT = "/bitchord/cmd/next"
@@ -83,6 +85,13 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
         )
         val bgBottomArgb = Color.rgb(10, 11, 16)
 
+        val artBytes = getCompressedCoverBytes(cover)
+        val artBase64 = if (artBytes.isNotEmpty()) {
+            Base64.encodeToString(artBytes, Base64.NO_WRAP)
+        } else {
+            ""
+        }
+
         val payload = JSONObject().apply {
             put("trackKey", trackKey)
             put("title", title)
@@ -92,16 +101,20 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
             put("bgTop", bgTopArgb)
             put("bgBottom", bgBottomArgb)
             put("lines", linesArray)
+            put("artB64", artBase64)
         }.toString()
 
-        val artBytes = getCompressedCoverBytes(cover)
-        if (trackKey == lastTrackKey && payload == lastTrackJson && artBytes.contentEquals(cachedArtBytes)) {
+        if (trackKey == lastTrackKey && payload == lastTrackJson) {
             return
         }
 
         lastTrackKey = trackKey
         lastTrackJson = payload
 
+        dispatchTrackPayload(payload, artBytes)
+    }
+
+    private fun dispatchTrackPayload(payload: String, artBytes: ByteArray) {
         try {
             val req = PutDataMapRequest.create(PATH_TRACK_DATA).apply {
                 dataMap.putString("payload", payload)
@@ -111,6 +124,8 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
             dataClient.putDataItem(req)
         } catch (_: Throwable) {
         }
+
+        sendMessageToAllNodes(PATH_TRACK_DATA_MSG, payload.toByteArray(Charsets.UTF_8))
     }
 
     fun publishPlayback(
@@ -162,7 +177,7 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
             return cachedArtBytes
         }
 
-        val size = 96
+        val size = 80
         val scaled = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(scaled)
         val minDim = min(cover.width, cover.height)
@@ -174,7 +189,7 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
         canvas.drawBitmap(cover, src, dst, paint)
 
         val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 76, out)
+        scaled.compress(Bitmap.CompressFormat.JPEG, 70, out)
         lastCoverRef = cover
         cachedArtBytes = out.toByteArray()
         return cachedArtBytes
@@ -192,15 +207,7 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
             PATH_CMD_REQUEST_SYNC -> {
                 lastPlaybackKey = ""
                 if (lastTrackJson.isNotEmpty()) {
-                    try {
-                        val req = PutDataMapRequest.create(PATH_TRACK_DATA).apply {
-                            dataMap.putString("payload", lastTrackJson)
-                            dataMap.putByteArray("art", cachedArtBytes)
-                            dataMap.putLong("ts", SystemClock.elapsedRealtime())
-                        }.asPutDataRequest().setUrgent()
-                        dataClient.putDataItem(req)
-                    } catch (_: Throwable) {
-                    }
+                    dispatchTrackPayload(lastTrackJson, cachedArtBytes)
                 }
                 publishPlayback(
                     trackKey = lastTrackKey,
