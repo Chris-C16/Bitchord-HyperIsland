@@ -11,7 +11,7 @@ android {
     defaultConfig {
         applicationId = "com.bitchord.island"
         minSdk = 33
-        targetSdk = 36
+        targetSdk = 34
         versionCode = 3
         versionName = "3.0"
     }
