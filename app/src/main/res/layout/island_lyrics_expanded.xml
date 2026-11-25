@@ -15,6 +15,7 @@
         android:layout_height="56dp"
         android:layout_marginEnd="14dp">
 
+        <!-- Disco statico nitido quando è in pausa -->
         <ImageView
             android:id="@+id/iv_disc_cover"
             android:layout_width="match_parent"
@@ -22,18 +23,32 @@
             android:contentDescription="@null"
             android:scaleType="centerCrop" />
 
-        <ProgressBar
-            android:id="@+id/pb_disc_spin"
-            android:layout_width="56dp"
-            android:layout_height="56dp"
-            android:indeterminate="true"
-            android:indeterminateDrawable="@drawable/vinyl_spin_overlay"
-            android:indeterminateOnly="true"
-            android:maxHeight="56dp"
-            android:maxWidth="56dp"
-            android:minHeight="56dp"
-            android:minWidth="56dp"
-            android:visibility="gone" />
+        <!-- Disco rotante a 360° (16 frame da 22,5° ogni 125 ms) quando è in play -->
+        <ViewFlipper
+            android:id="@+id/vf_disc_spin"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:autoStart="true"
+            android:flipInterval="125"
+            android:visibility="gone">
+
+            <ImageView android:id="@+id/iv_disc_f0" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f1" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f2" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f3" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f4" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f5" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f6" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f7" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f8" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f9" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f10" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f11" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f12" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f13" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f14" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+            <ImageView android:id="@+id/iv_disc_f15" android:layout_width="match_parent" android:layout_height="match_parent" android:contentDescription="@null" android:scaleType="fitCenter" />
+        </ViewFlipper>
     </FrameLayout>
 
     <LinearLayout
