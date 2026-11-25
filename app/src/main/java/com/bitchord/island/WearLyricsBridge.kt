@@ -3,6 +3,7 @@ package com.bitchord.island
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.os.SystemClock
@@ -74,14 +75,22 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
             )
         }
 
+        val accentArgb = palette.accent.toArgb()
+        val bgTopArgb = Color.rgb(
+            (Color.red(accentArgb) * 0.24f).toInt().coerceIn(18, 64),
+            (Color.green(accentArgb) * 0.24f).toInt().coerceIn(18, 64),
+            (Color.blue(accentArgb) * 0.28f).toInt().coerceIn(24, 76)
+        )
+        val bgBottomArgb = Color.rgb(10, 11, 16)
+
         val payload = JSONObject().apply {
             put("trackKey", trackKey)
             put("title", title)
             put("artist", artist)
             put("durationMs", durationMs)
-            put("accent", palette.accent.toArgb())
-            put("bgTop", palette.top.toArgb())
-            put("bgBottom", palette.bottom.toArgb())
+            put("accent", accentArgb)
+            put("bgTop", bgTopArgb)
+            put("bgBottom", bgBottomArgb)
             put("lines", linesArray)
         }.toString()
 
