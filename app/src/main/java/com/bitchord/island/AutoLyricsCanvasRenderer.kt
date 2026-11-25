@@ -15,13 +15,11 @@ import android.os.Looper
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
-import android.text.TextUtils
 import androidx.compose.ui.graphics.toArgb
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
-import kotlin.math.max
 import kotlin.math.min
 
 class AutoLyricsCanvasRenderer(
@@ -31,11 +29,10 @@ class AutoLyricsCanvasRenderer(
 
     companion object {
         private const val SIZE = 640
-        // Margine laterale calibrato per evitare tagli sui bordi e non sovrapporsi alle icone in alto
-        private const val HORIZONTAL_MARGIN = 54f
-        // Fascia verticale libera nella card Coolwalk: sotto i 3 puntini e sopra Titolo/Artista
-        private const val SAFE_TOP = 68f
-        private const val SAFE_BOTTOM = 348f
+        private const val HORIZONTAL_MARGIN = 44f
+        // Fascia libera nella metà superiore della card Coolwalk (sotto i 3 puntini, sopra Titolo/Artista)
+        private const val SAFE_TOP = 64f
+        private const val SAFE_BOTTOM = 352f
         private const val COMFORTAA_VAR_URL =
             "https://raw.githubusercontent.com/google/fonts/main/ofl/comfortaa/Comfortaa%5Bwght%5D.ttf"
         private const val COMFORTAA_FALLBACK_URL =
@@ -151,29 +148,18 @@ class AutoLyricsCanvasRenderer(
             val text: String,
             val textSize: Float,
             val color: Int,
-            val isCurrent: Boolean,
-            val maxLines: Int
+            val isCurrent: Boolean
         )
 
-        fun buildSpecs(
-            includeOuter: Boolean,
-            currSize: Float,
-            adjSize: Float,
-            outerSize: Float
-        ): List<LineSpec> {
+        // Solo 3 versi (precedente, attivo, successivo) senza alcun troncamento "..."
+        fun buildSpecs(currSize: Float, adjSize: Float, includeNeighbors: Boolean): List<LineSpec> {
             val list = mutableListOf<LineSpec>()
-            if (includeOuter && state.prev2.isNotBlank()) {
-                list.add(LineSpec(state.prev2, outerSize, Color.argb(110, 255, 255, 255), false, 1))
+            if (includeNeighbors && state.prev1.isNotBlank()) {
+                list.add(LineSpec(state.prev1, adjSize, Color.argb(190, 255, 255, 255), false))
             }
-            if (state.prev1.isNotBlank()) {
-                list.add(LineSpec(state.prev1, adjSize, Color.argb(185, 255, 255, 255), false, 1))
-            }
-            list.add(LineSpec(currText, currSize, accentColor, true, 2))
-            if (state.next1.isNotBlank()) {
-                list.add(LineSpec(state.next1, adjSize, Color.argb(185, 255, 255, 255), false, 1))
-            }
-            if (includeOuter && state.next2.isNotBlank()) {
-                list.add(LineSpec(state.next2, outerSize, Color.argb(110, 255, 255, 255), false, 1))
+            list.add(LineSpec(currText, currSize, Color.WHITE, true))
+            if (includeNeighbors && state.next1.isNotBlank()) {
+                list.add(LineSpec(state.next1, adjSize, Color.argb(190, 255, 255, 255), false))
             }
             return list
         }
@@ -186,27 +172,25 @@ class AutoLyricsCanvasRenderer(
                     typeface = if (spec.isCurrent) comfortaaBold else comfortaaRegular
                     if (spec.isCurrent) {
                         setShadowLayer(
-                            16f,
+                            14f,
                             0f,
                             2f,
                             Color.argb(
-                                170,
+                                210,
                                 Color.red(accentColor),
                                 Color.green(accentColor),
                                 Color.blue(accentColor)
                             )
                         )
                     } else {
-                        setShadowLayer(5f, 0f, 1f, Color.argb(180, 0, 0, 0))
+                        setShadowLayer(8f, 0f, 2f, Color.argb(220, 0, 0, 0))
                     }
                 }
                 val layout = StaticLayout.Builder
                     .obtain(spec.text, 0, spec.text.length, paint, usableWidth)
                     .setAlignment(Layout.Alignment.ALIGN_CENTER)
-                    .setMaxLines(spec.maxLines)
-                    .setEllipsize(TextUtils.TruncateAt.END)
                     .setIncludePad(false)
-                    .setLineSpacing(0f, 1.06f)
+                    .setLineSpacing(0f, 1.08f)
                     .build()
                 spec to layout
             }
@@ -216,21 +200,22 @@ class AutoLyricsCanvasRenderer(
             var total = 0f
             for (i in items.indices) {
                 total += items[i].second.height
-                if (i < items.lastIndex) {
-                    val gap = if (items[i].first.isCurrent || items[i + 1].first.isCurrent) 15f else 10f
-                    total += gap
-                }
+                if (i < items.lastIndex) total += 16f
             }
             return total
         }
 
         val safeHeight = SAFE_BOTTOM - SAFE_TOP
-        var items = makeLayouts(buildSpecs(includeOuter = true, currSize = 44f, adjSize = 28f, outerSize = 21f))
+        // Scala automaticamente la dimensione del testo se un verso è lungo, evitando sempre i "..."
+        var items = makeLayouts(buildSpecs(currSize = 38f, adjSize = 25f, includeNeighbors = true))
         if (totalHeight(items) > safeHeight) {
-            items = makeLayouts(buildSpecs(includeOuter = true, currSize = 38f, adjSize = 24f, outerSize = 19f))
+            items = makeLayouts(buildSpecs(currSize = 32f, adjSize = 21f, includeNeighbors = true))
         }
         if (totalHeight(items) > safeHeight) {
-            items = makeLayouts(buildSpecs(includeOuter = false, currSize = 42f, adjSize = 27f, outerSize = 20f))
+            items = makeLayouts(buildSpecs(currSize = 27f, adjSize = 18f, includeNeighbors = true))
+        }
+        if (totalHeight(items) > safeHeight) {
+            items = makeLayouts(buildSpecs(currSize = 32f, adjSize = 21f, includeNeighbors = false))
         }
 
         val blockHeight = totalHeight(items)
@@ -244,7 +229,7 @@ class AutoLyricsCanvasRenderer(
             canvas.restore()
             y += layout.height
             if (i < items.lastIndex) {
-                y += if (spec.isCurrent || items[i + 1].first.isCurrent) 15f else 10f
+                y += 16f
             }
         }
 
@@ -261,9 +246,9 @@ class AutoLyricsCanvasRenderer(
         val canvas = Canvas(bmp)
 
         val darkTop = Color.rgb(
-            (Color.red(accentColor) * 0.18f).toInt().coerceIn(14, 48),
-            (Color.green(accentColor) * 0.18f).toInt().coerceIn(14, 48),
-            (Color.blue(accentColor) * 0.22f).toInt().coerceIn(20, 58)
+            (Color.red(accentColor) * 0.22f).toInt().coerceIn(16, 56),
+            (Color.green(accentColor) * 0.22f).toInt().coerceIn(16, 56),
+            (Color.blue(accentColor) * 0.26f).toInt().coerceIn(22, 68)
         )
         val bgGradient = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             shader = LinearGradient(
@@ -271,21 +256,22 @@ class AutoLyricsCanvasRenderer(
                 0f,
                 0f,
                 SIZE.toFloat(),
-                intArrayOf(darkTop, Color.rgb(12, 13, 20), Color.rgb(7, 8, 12)),
+                intArrayOf(darkTop, Color.rgb(14, 15, 22), Color.rgb(8, 9, 14)),
                 floatArrayOf(0f, 0.56f, 1f),
                 Shader.TileMode.CLAMP
             )
         }
         canvas.drawRect(0f, 0f, SIZE.toFloat(), SIZE.toFloat(), bgGradient)
 
+        // Copertina originale NITIDA (senza blur) con sola velatura leggera per far risaltare i testi
         if (cover != null && !cover.isRecycled && cover.width > 0 && cover.height > 0) {
-            val small = createCenterCroppedSmall(cover, 44)
-            val blurred = fastBoxBlur(small, radius = 3, passes = 3)
-            small.recycle()
-
+            val minDim = min(cover.width, cover.height)
+            val left = (cover.width - minDim) / 2
+            val top = (cover.height - minDim) / 2
+            val srcRect = Rect(left, top, left + minDim, top + minDim)
+            val dstRect = RectF(0f, 0f, SIZE.toFloat(), SIZE.toFloat())
             val imgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-            canvas.drawBitmap(blurred, null, RectF(0f, 0f, SIZE.toFloat(), SIZE.toFloat()), imgPaint)
-            blurred.recycle()
+            canvas.drawBitmap(cover, srcRect, dstRect, imgPaint)
 
             val scrimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 shader = LinearGradient(
@@ -294,12 +280,12 @@ class AutoLyricsCanvasRenderer(
                     0f,
                     SIZE.toFloat(),
                     intArrayOf(
-                        Color.argb(150, 10, 11, 16),
-                        Color.argb(140, 10, 11, 16),
-                        Color.argb(205, 8, 9, 14),
-                        Color.argb(242, 6, 7, 11)
+                        Color.argb(125, 8, 9, 14),
+                        Color.argb(145, 8, 9, 14),
+                        Color.argb(195, 6, 7, 11),
+                        Color.argb(235, 5, 6, 10)
                     ),
-                    floatArrayOf(0f, 0.48f, 0.62f, 1f),
+                    floatArrayOf(0f, 0.46f, 0.62f, 1f),
                     Shader.TileMode.CLAMP
                 )
             }
@@ -310,71 +296,6 @@ class AutoLyricsCanvasRenderer(
         cachedAccent = accentColor
         cachedBackground = bmp
         return bmp
-    }
-
-    private fun createCenterCroppedSmall(src: Bitmap, targetSize: Int): Bitmap {
-        val out = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
-        val minDim = min(src.width, src.height)
-        val left = (src.width - minDim) / 2
-        val top = (src.height - minDim) / 2
-        val srcRect = Rect(left, top, left + minDim, top + minDim)
-        val dstRect = Rect(0, 0, targetSize, targetSize)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        canvas.drawBitmap(src, srcRect, dstRect, paint)
-        return out
-    }
-
-    private fun fastBoxBlur(src: Bitmap, radius: Int, passes: Int): Bitmap {
-        val w = src.width
-        val h = src.height
-        val current = IntArray(w * h)
-        val next = IntArray(w * h)
-        src.getPixels(current, 0, w, 0, 0, w, h)
-
-        repeat(passes) {
-            for (y in 0 until h) {
-                val rowOffset = y * w
-                for (x in 0 until w) {
-                    var r = 0
-                    var g = 0
-                    var b = 0
-                    var count = 0
-                    val xStart = max(0, x - radius)
-                    val xEnd = min(w - 1, x + radius)
-                    for (nx in xStart..xEnd) {
-                        val p = current[rowOffset + nx]
-                        r += (p shr 16) and 0xFF
-                        g += (p shr 8) and 0xFF
-                        b += p and 0xFF
-                        count++
-                    }
-                    next[rowOffset + x] = Color.rgb(r / count, g / count, b / count)
-                }
-            }
-            for (x in 0 until w) {
-                for (y in 0 until h) {
-                    var r = 0
-                    var g = 0
-                    var b = 0
-                    var count = 0
-                    val yStart = max(0, y - radius)
-                    val yEnd = min(h - 1, y + radius)
-                    for (ny in yStart..yEnd) {
-                        val p = next[ny * w + x]
-                        r += (p shr 16) and 0xFF
-                        g += (p shr 8) and 0xFF
-                        b += p and 0xFF
-                        count++
-                    }
-                    current[y * w + x] = Color.rgb(r / count, g / count, b / count)
-                }
-            }
-        }
-
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(current, 0, w, 0, 0, w, h)
-        return out
     }
 
     private fun boostAccentForCar(color: Int): Int {
