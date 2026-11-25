@@ -17,6 +17,7 @@ import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.Icon
 import android.os.Bundle
+import android.os.PowerManager
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -46,6 +47,7 @@ class HyperIslandNotifier(private val context: Context) {
     )
 
     private val manager = context.getSystemService(NotificationManager::class.java)
+    private val powerManager = context.getSystemService(PowerManager::class.java)
     private val playingSmallIcon: Icon
     private val pausedSmallIcon: Icon
     private val pillMeasurePaint = Paint().apply {
@@ -57,6 +59,14 @@ class HyperIslandNotifier(private val context: Context) {
     private var cachedDiscAccent: Int = 0
     private var cachedDiscBitmap: Bitmap? = null
     private var cachedDiscIcon: Icon? = null
+
+    // Cache JSON HyperIsland (evita di ricostruire 6 JSONObject ad ogni verso)
+    private var cachedFocusJsonKey: String = ""
+    private var cachedFocusJsonPair: Pair<String, String>? = null
+
+    // Deduplicazione + risparmio batteria a schermo spento
+    private var lastFullStateKey: String = ""
+    private var lastTrackStateKey: String = ""
 
     init {
         val channel = NotificationChannel(
@@ -242,10 +252,12 @@ class HyperIslandNotifier(private val context: Context) {
         prev: String,
         curr: String,
         next: String,
-        accentColor: Int
+        accentColor: Int,
+        isPlaying: Boolean
     ): RemoteViews {
         val rv = RemoteViews(context.packageName, R.layout.island_lyrics_expanded)
         rv.setImageViewBitmap(R.id.iv_disc_cover, discBitmap)
+        rv.setViewVisibility(R.id.pb_disc_spin, if (isPlaying) View.VISIBLE else View.GONE)
 
         if (prev.isNotBlank()) {
             rv.setViewVisibility(R.id.tv_lyric_prev, View.VISIBLE)
@@ -332,11 +344,17 @@ class HyperIslandNotifier(private val context: Context) {
         }
     }
 
-    private fun buildFocusParamJson(
+    private fun getOrBuildFocusParamJson(
         pillText: String,
         useNarrowFont: Boolean,
         accentHex: String
     ): Pair<String, String> {
+        val key = "$pillText|$useNarrowFont|$accentHex"
+        val existing = cachedFocusJsonPair
+        if (existing != null && cachedFocusJsonKey == key) {
+            return existing
+        }
+
         val islandJson = buildIslandJson(pillText, useNarrowFont, accentHex)
 
         val paramV2 = JSONObject().apply {
@@ -367,7 +385,10 @@ class HyperIslandNotifier(private val context: Context) {
             put("param_island", islandJson)
         }.toString()
 
-        return focusJson to customFocusJson
+        val pair = focusJson to customFocusJson
+        cachedFocusJsonKey = key
+        cachedFocusJsonPair = pair
+        return pair
     }
 
     fun buildNotification(
@@ -395,8 +416,15 @@ class HyperIslandNotifier(private val context: Context) {
         val (discBitmap, discIcon) = getOrCreateVinylDisc(cover, accentColor)
         val smallIcon = if (isPlaying) playingSmallIcon else pausedSmallIcon
 
-        val expandedRv = buildExpandedRemoteViews(discBitmap, prevText, currText, nextText, accentColor)
-        val (focusJson, customFocusJson) = buildFocusParamJson(
+        val expandedRv = buildExpandedRemoteViews(
+            discBitmap = discBitmap,
+            prev = prevText,
+            curr = currText,
+            next = nextText,
+            accentColor = accentColor,
+            isPlaying = isPlaying
+        )
+        val (focusJson, customFocusJson) = getOrBuildFocusParamJson(
             pillText = pillLabel.text,
             useNarrowFont = pillLabel.useNarrowFont,
             accentHex = accentHex
@@ -441,6 +469,30 @@ class HyperIslandNotifier(private val context: Context) {
         palette: CoverPalette,
         isPlaying: Boolean
     ) {
+        val pillLabel = buildStaticPillLabel(title, isPlaying)
+        val accentColor = boostAccentBrightness(palette.accent.toArgb())
+        val (prevText, currText, nextText) = resolveDisplayLines(
+            prevLyric = prevLyric,
+            currentLine = currentLine,
+            nextLyric1 = nextLyric1,
+            title = title,
+            isPlaying = isPlaying
+        )
+
+        val coverId = System.identityHashCode(cover)
+        val trackStateKey = "${pillLabel.text}|$isPlaying|$accentColor|$coverId"
+        val fullStateKey = "$trackStateKey|$prevText|$currText|$nextText"
+
+        // Evita notifiche duplicate sulla stessa riga
+        if (fullStateKey == lastFullStateKey) return
+
+        // A schermo spento aggiorna solo se cambia brano/stato play (per AOD), saltando i cambi verso
+        val isScreenOn = powerManager?.isInteractive ?: true
+        if (!isScreenOn && trackStateKey == lastTrackStateKey) return
+
+        lastTrackStateKey = trackStateKey
+        lastFullStateKey = fullStateKey
+
         manager.notify(
             NOTIFICATION_ID,
             buildNotification(
@@ -455,7 +507,11 @@ class HyperIslandNotifier(private val context: Context) {
         )
     }
 
-    fun cancel() = manager.cancel(NOTIFICATION_ID)
+    fun cancel() {
+        lastFullStateKey = ""
+        lastTrackStateKey = ""
+        manager.cancel(NOTIFICATION_ID)
+    }
 
     private fun boostAccentBrightness(color: Int): Int {
         val hsv = FloatArray(3)
@@ -485,7 +541,7 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun renderVinylDiscBitmap(cover: Bitmap?, accentColor: Int): Bitmap {
-        val size = 128
+        val size = 112
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val cx = size / 2f
@@ -522,7 +578,7 @@ class HyperIslandNotifier(private val context: Context) {
         val groovePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(46, 255, 255, 255)
             style = Paint.Style.STROKE
-            strokeWidth = 1.6f
+            strokeWidth = 1.5f
         }
         canvas.drawCircle(cx, cy, outerRadius * 0.84f, groovePaint)
         canvas.drawCircle(cx, cy, outerRadius * 0.68f, groovePaint)
@@ -530,7 +586,7 @@ class HyperIslandNotifier(private val context: Context) {
         val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(150, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
             style = Paint.Style.STROKE
-            strokeWidth = 3f
+            strokeWidth = 2.6f
         }
         canvas.drawCircle(cx, cy, outerRadius - 1.5f, rimPaint)
 
@@ -543,7 +599,7 @@ class HyperIslandNotifier(private val context: Context) {
         val holeRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(180, 255, 255, 255)
             style = Paint.Style.STROKE
-            strokeWidth = 2f
+            strokeWidth = 1.8f
         }
         canvas.drawCircle(cx, cy, size * 0.125f, holeRimPaint)
 
