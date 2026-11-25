@@ -297,13 +297,14 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         val extras = Bundle().apply {
+            putBoolean("android.requestPromotedOngoing", true)
             putString("miui.focus.param", focusJson)
             putBundle("miui.focus.pics", focusPics)
             putParcelable("miui.focus.rv", expandedRv)
             putParcelable("miui.focus.rvNight", expandedRv)
         }
 
-        return Notification.Builder(context, CHANNEL_ID)
+        val builder = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(smallIcon)
             .setLargeIcon(discBitmap)
             .setContentTitle(pillText)
@@ -317,7 +318,20 @@ class HyperIslandNotifier(private val context: Context) {
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setContentIntent(createLyricsPendingIntent())
             .addExtras(extras)
-            .build()
+
+        if (android.os.Build.VERSION.SDK_INT >= 36) {
+            try {
+                Notification.Builder::class.java
+                    .getMethod("setRequestPromotedOngoing", Boolean::class.javaPrimitiveType)
+                    .invoke(builder, true)
+                Notification.Builder::class.java
+                    .getMethod("setShortCriticalText", CharSequence::class.java)
+                    .invoke(builder, pillText)
+            } catch (_: Throwable) {
+            }
+        }
+
+        return builder.build()
     }
 
     fun update(
