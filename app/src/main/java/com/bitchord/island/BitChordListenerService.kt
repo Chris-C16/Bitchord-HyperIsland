@@ -54,6 +54,7 @@ class BitChordListenerService : NotificationListenerService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var notifier: HyperIslandNotifier
+    private lateinit var wearBridge: WearLyricsBridge
     private lateinit var sessionManager: MediaSessionManager
     private lateinit var uiModeManager: UiModeManager
 
@@ -121,6 +122,12 @@ class BitChordListenerService : NotificationListenerService() {
         override fun onPlaybackStateChanged(state: PlaybackState?) {
             syncPlaybackClock(state)
             val playing = state?.state == PlaybackState.STATE_PLAYING
+            wearBridge.publishPlayback(
+                trackKey = currentTrackKey,
+                isPlaying = playing,
+                positionMs = LyricsPlaybackStore.currentPositionMs(),
+                speed = LyricsPlaybackStore.speed.value
+            )
             lastRenderKey = ""
             if (playing) {
                 handleMetadata(activeController?.metadata)
@@ -137,6 +144,7 @@ class BitChordListenerService : NotificationListenerService() {
             activeController = null
             stopTicker()
             LyricsPlaybackStore.isPlaying.value = false
+            wearBridge.clearTrack()
             refreshActiveSessions()
         }
     }
@@ -145,6 +153,7 @@ class BitChordListenerService : NotificationListenerService() {
         super.onCreate()
         instance = this
         notifier = HyperIslandNotifier(this)
+        wearBridge = WearLyricsBridge(this)
         sessionManager = getSystemService(MediaSessionManager::class.java)
         uiModeManager = getSystemService(UiModeManager::class.java)
 
@@ -256,6 +265,12 @@ class BitChordListenerService : NotificationListenerService() {
             handleMetadata(target.metadata)
             syncPlaybackClock(target.playbackState)
             val playing = target.playbackState?.state == PlaybackState.STATE_PLAYING
+            wearBridge.publishPlayback(
+                trackKey = currentTrackKey,
+                isPlaying = playing,
+                positionMs = LyricsPlaybackStore.currentPositionMs(),
+                speed = LyricsPlaybackStore.speed.value
+            )
             if (playing) {
                 startTicker()
             } else {
@@ -266,6 +281,7 @@ class BitChordListenerService : NotificationListenerService() {
             stopTicker()
             LyricsPlaybackStore.isPlaying.value = false
             AutoLyricsBridge.clear()
+            wearBridge.clearTrack()
             hidePhoneNotificationOnly()
         }
     }
@@ -278,6 +294,19 @@ class BitChordListenerService : NotificationListenerService() {
         LyricsPlaybackStore.baseRealtimeMs.value =
             if (state.lastPositionUpdateTime > 0L) state.lastPositionUpdateTime else SystemClock.elapsedRealtime()
         LyricsPlaybackStore.speed.value = if (state.playbackSpeed > 0f) state.playbackSpeed else 1f
+    }
+
+    private fun pushTrackToWear() {
+        if (currentTitle.isBlank()) return
+        wearBridge.publishTrack(
+            trackKey = currentTrackKey,
+            title = currentTitle,
+            artist = currentArtist,
+            durationMs = currentDurationMs,
+            lines = currentLines,
+            cover = currentCover,
+            palette = currentPalette
+        )
     }
 
     private fun handleMetadata(metadata: MediaMetadata?) {
@@ -310,6 +339,7 @@ class BitChordListenerService : NotificationListenerService() {
                 }
                 currentPalette = extracted
                 LyricsPlaybackStore.palette.value = extracted
+                pushTrackToWear()
                 lastRenderKey = ""
                 val stillPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
                 syncLyrics(isPlaying = stillPlaying, forceImmediate = true)
@@ -322,6 +352,7 @@ class BitChordListenerService : NotificationListenerService() {
             LyricsPlaybackStore.lines.value = emptyList()
             LyricsPlaybackStore.syncOffsetMs.value = 0L
             lastRenderKey = ""
+            pushTrackToWear()
 
             fetchJob?.cancel()
             fetchJob = scope.launch {
@@ -332,9 +363,16 @@ class BitChordListenerService : NotificationListenerService() {
                 )
                 currentLines = loaded
                 LyricsPlaybackStore.lines.value = loaded
+                pushTrackToWear()
                 lastRenderKey = ""
                 syncPlaybackClock(activeController?.playbackState)
                 val stillPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+                wearBridge.publishPlayback(
+                    trackKey = currentTrackKey,
+                    isPlaying = stillPlaying,
+                    positionMs = LyricsPlaybackStore.currentPositionMs(),
+                    speed = LyricsPlaybackStore.speed.value
+                )
                 syncLyrics(isPlaying = stillPlaying, forceImmediate = true)
                 if (stillPlaying) startTicker()
             }
@@ -469,6 +507,7 @@ class BitChordListenerService : NotificationListenerService() {
             unregisterReceiver(screenOnReceiver)
         } catch (_: Exception) {
         }
+        wearBridge.release()
         AutoLyricsBridge.clear()
         hidePhoneNotificationOnly()
         scope.cancel()
