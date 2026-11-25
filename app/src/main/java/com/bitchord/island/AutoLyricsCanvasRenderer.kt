@@ -29,9 +29,10 @@ class AutoLyricsCanvasRenderer(
 
     companion object {
         private const val SIZE = 640
-        private const val HORIZONTAL_MARGIN = 44f
-        // Fascia libera nella metà superiore della card Coolwalk (sotto i 3 puntini, sopra Titolo/Artista)
-        private const val SAFE_TOP = 64f
+        // Margine ampio: compensa il centerCrop laterale della card verticale di Coolwalk
+        private const val HORIZONTAL_MARGIN = 112f
+        // Fascia libera nella metà superiore della card (sotto i 3 puntini, sopra Titolo/Artista)
+        private const val SAFE_TOP = 72f
         private const val SAFE_BOTTOM = 352f
         private const val COMFORTAA_VAR_URL =
             "https://raw.githubusercontent.com/google/fonts/main/ofl/comfortaa/Comfortaa%5Bwght%5D.ttf"
@@ -151,15 +152,14 @@ class AutoLyricsCanvasRenderer(
             val isCurrent: Boolean
         )
 
-        // Solo 3 versi (precedente, attivo, successivo) senza alcun troncamento "..."
         fun buildSpecs(currSize: Float, adjSize: Float, includeNeighbors: Boolean): List<LineSpec> {
             val list = mutableListOf<LineSpec>()
             if (includeNeighbors && state.prev1.isNotBlank()) {
-                list.add(LineSpec(state.prev1, adjSize, Color.argb(190, 255, 255, 255), false))
+                list.add(LineSpec(state.prev1, adjSize, Color.argb(185, 255, 255, 255), false))
             }
             list.add(LineSpec(currText, currSize, Color.WHITE, true))
             if (includeNeighbors && state.next1.isNotBlank()) {
-                list.add(LineSpec(state.next1, adjSize, Color.argb(190, 255, 255, 255), false))
+                list.add(LineSpec(state.next1, adjSize, Color.argb(185, 255, 255, 255), false))
             }
             return list
         }
@@ -172,7 +172,7 @@ class AutoLyricsCanvasRenderer(
                     typeface = if (spec.isCurrent) comfortaaBold else comfortaaRegular
                     if (spec.isCurrent) {
                         setShadowLayer(
-                            14f,
+                            12f,
                             0f,
                             2f,
                             Color.argb(
@@ -183,12 +183,13 @@ class AutoLyricsCanvasRenderer(
                             )
                         )
                     } else {
-                        setShadowLayer(8f, 0f, 2f, Color.argb(220, 0, 0, 0))
+                        setShadowLayer(6f, 0f, 2f, Color.argb(210, 0, 0, 0))
                     }
                 }
                 val layout = StaticLayout.Builder
                     .obtain(spec.text, 0, spec.text.length, paint, usableWidth)
                     .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                    .setBreakStrategy(Layout.BREAK_STRATEGY_BALANCED)
                     .setIncludePad(false)
                     .setLineSpacing(0f, 1.08f)
                     .build()
@@ -200,36 +201,51 @@ class AutoLyricsCanvasRenderer(
             var total = 0f
             for (i in items.indices) {
                 total += items[i].second.height
-                if (i < items.lastIndex) total += 16f
+                if (i < items.lastIndex) total += 14f
             }
             return total
         }
 
+        fun fitsCleanly(items: List<Pair<LineSpec, StaticLayout>>, maxHeight: Float): Boolean {
+            if (totalHeight(items) > maxHeight) return false
+            return items.all { (_, layout) ->
+                (0 until layout.lineCount).all { line ->
+                    layout.getLineWidth(line) <= usableWidth + 1f
+                }
+            }
+        }
+
         val safeHeight = SAFE_BOTTOM - SAFE_TOP
-        // Scala automaticamente la dimensione del testo se un verso è lungo, evitando sempre i "..."
-        var items = makeLayouts(buildSpecs(currSize = 38f, adjSize = 25f, includeNeighbors = true))
-        if (totalHeight(items) > safeHeight) {
-            items = makeLayouts(buildSpecs(currSize = 32f, adjSize = 21f, includeNeighbors = true))
-        }
-        if (totalHeight(items) > safeHeight) {
-            items = makeLayouts(buildSpecs(currSize = 27f, adjSize = 18f, includeNeighbors = true))
-        }
-        if (totalHeight(items) > safeHeight) {
-            items = makeLayouts(buildSpecs(currSize = 32f, adjSize = 21f, includeNeighbors = false))
+        val tiers = listOf(
+            Triple(32f, 20f, true),
+            Triple(28f, 18f, true),
+            Triple(24f, 16f, true),
+            Triple(21f, 14f, true),
+            Triple(26f, 17f, false),
+            Triple(21f, 15f, false)
+        )
+
+        var items = makeLayouts(buildSpecs(32f, 20f, includeNeighbors = true))
+        for ((currSize, adjSize, includeNeighbors) in tiers) {
+            val candidate = makeLayouts(buildSpecs(currSize, adjSize, includeNeighbors))
+            items = candidate
+            if (fitsCleanly(candidate, safeHeight)) {
+                break
+            }
         }
 
         val blockHeight = totalHeight(items)
         var y = SAFE_TOP + ((safeHeight - blockHeight) / 2f).coerceAtLeast(0f)
 
         for (i in items.indices) {
-            val (spec, layout) = items[i]
+            val (_, layout) = items[i]
             canvas.save()
             canvas.translate(HORIZONTAL_MARGIN, y)
             layout.draw(canvas)
             canvas.restore()
             y += layout.height
             if (i < items.lastIndex) {
-                y += 16f
+                y += 14f
             }
         }
 
@@ -263,7 +279,6 @@ class AutoLyricsCanvasRenderer(
         }
         canvas.drawRect(0f, 0f, SIZE.toFloat(), SIZE.toFloat(), bgGradient)
 
-        // Copertina originale NITIDA (senza blur) con sola velatura leggera per far risaltare i testi
         if (cover != null && !cover.isRecycled && cover.width > 0 && cover.height > 0) {
             val minDim = min(cover.width, cover.height)
             val left = (cover.width - minDim) / 2
@@ -280,9 +295,9 @@ class AutoLyricsCanvasRenderer(
                     0f,
                     SIZE.toFloat(),
                     intArrayOf(
-                        Color.argb(125, 8, 9, 14),
-                        Color.argb(145, 8, 9, 14),
-                        Color.argb(195, 6, 7, 11),
+                        Color.argb(110, 8, 9, 14),
+                        Color.argb(130, 8, 9, 14),
+                        Color.argb(190, 6, 7, 11),
                         Color.argb(235, 5, 6, 10)
                     ),
                     floatArrayOf(0f, 0.46f, 0.62f, 1f),
