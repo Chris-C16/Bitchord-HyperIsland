@@ -18,6 +18,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.Icon
 import android.os.Bundle
 import android.os.PowerManager
+import android.os.SystemClock
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -39,11 +40,29 @@ class HyperIslandNotifier(private val context: Context) {
         private const val NORMAL_MAX_WIDTH = 680f
         private const val NARROW_MAX_WIDTH = 880f
         private const val TRAILING_JUNK_CHARS = "([{-–—/:,&+.|•"
+
+        // Parametri rotazione 360° del vinile dentro RemoteViews
+        private const val SPIN_FRAME_COUNT = 16
+        private const val SPIN_FRAME_SIZE = 56
+        private const val SPIN_INTERVAL_MS = 125L
+
+        private val SPIN_FRAME_IDS = intArrayOf(
+            R.id.iv_disc_f0, R.id.iv_disc_f1, R.id.iv_disc_f2, R.id.iv_disc_f3,
+            R.id.iv_disc_f4, R.id.iv_disc_f5, R.id.iv_disc_f6, R.id.iv_disc_f7,
+            R.id.iv_disc_f8, R.id.iv_disc_f9, R.id.iv_disc_f10, R.id.iv_disc_f11,
+            R.id.iv_disc_f12, R.id.iv_disc_f13, R.id.iv_disc_f14, R.id.iv_disc_f15
+        )
     }
 
     private data class PillLabel(
         val text: String,
         val useNarrowFont: Boolean
+    )
+
+    private data class VinylAssets(
+        val baseDisc: Bitmap,
+        val icon: Icon,
+        val spinFrames: Array<Bitmap>
     )
 
     private val manager = context.getSystemService(NotificationManager::class.java)
@@ -57,8 +76,12 @@ class HyperIslandNotifier(private val context: Context) {
 
     private var cachedCoverRef: Bitmap? = null
     private var cachedDiscAccent: Int = 0
-    private var cachedDiscBitmap: Bitmap? = null
-    private var cachedDiscIcon: Icon? = null
+    private var cachedVinylAssets: VinylAssets? = null
+
+    private var lastSpinStep: Int = 0
+    private var cachedPausedStep: Int = -1
+    private var cachedPausedBase: Bitmap? = null
+    private var cachedPausedDisc: Bitmap? = null
 
     // Cache JSON HyperIsland (evita di ricostruire 6 JSONObject ad ogni verso)
     private var cachedFocusJsonKey: String = ""
@@ -248,7 +271,7 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun buildExpandedRemoteViews(
-        discBitmap: Bitmap,
+        vinyl: VinylAssets,
         prev: String,
         curr: String,
         next: String,
@@ -256,8 +279,22 @@ class HyperIslandNotifier(private val context: Context) {
         isPlaying: Boolean
     ): RemoteViews {
         val rv = RemoteViews(context.packageName, R.layout.island_lyrics_expanded)
-        rv.setImageViewBitmap(R.id.iv_disc_cover, discBitmap)
-        rv.setViewVisibility(R.id.pb_disc_spin, if (isPlaying) View.VISIBLE else View.GONE)
+
+        if (isPlaying) {
+            val startStep = ((SystemClock.elapsedRealtime() / SPIN_INTERVAL_MS) % SPIN_FRAME_COUNT).toInt()
+            lastSpinStep = startStep
+
+            rv.setViewVisibility(R.id.iv_disc_cover, View.GONE)
+            rv.setViewVisibility(R.id.vf_disc_spin, View.VISIBLE)
+            for (i in 0 until SPIN_FRAME_COUNT) {
+                val frame = vinyl.spinFrames[(startStep + i) % SPIN_FRAME_COUNT]
+                rv.setImageViewBitmap(SPIN_FRAME_IDS[i], frame)
+            }
+        } else {
+            rv.setViewVisibility(R.id.vf_disc_spin, View.GONE)
+            rv.setViewVisibility(R.id.iv_disc_cover, View.VISIBLE)
+            rv.setImageViewBitmap(R.id.iv_disc_cover, getPausedDiscBitmap(vinyl.baseDisc, lastSpinStep))
+        }
 
         if (prev.isNotBlank()) {
             rv.setViewVisibility(R.id.tv_lyric_prev, View.VISIBLE)
@@ -413,11 +450,11 @@ class HyperIslandNotifier(private val context: Context) {
         )
 
         val expandedBody = formatStyledExpandedLyrics(prevText, currText, nextText, accentColor)
-        val (discBitmap, discIcon) = getOrCreateVinylDisc(cover, accentColor)
+        val vinyl = getOrCreateVinylAssets(cover, accentColor)
         val smallIcon = if (isPlaying) playingSmallIcon else pausedSmallIcon
 
         val expandedRv = buildExpandedRemoteViews(
-            discBitmap = discBitmap,
+            vinyl = vinyl,
             prev = prevText,
             curr = currText,
             next = nextText,
@@ -431,7 +468,7 @@ class HyperIslandNotifier(private val context: Context) {
         )
 
         val focusPics = Bundle().apply {
-            putParcelable("miui.focus.pic_disc", discIcon)
+            putParcelable("miui.focus.pic_disc", vinyl.icon)
             putParcelable("miui.focus.pic_icon", smallIcon)
         }
 
@@ -445,7 +482,7 @@ class HyperIslandNotifier(private val context: Context) {
 
         return Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(smallIcon)
-            .setLargeIcon(discBitmap)
+            .setLargeIcon(vinyl.baseDisc)
             .setContentTitle(pillLabel.text)
             .setContentText(expandedBody)
             .setColor(accentColor)
@@ -524,20 +561,59 @@ class HyperIslandNotifier(private val context: Context) {
         return Color.HSVToColor(255, hsv)
     }
 
-    private fun getOrCreateVinylDisc(cover: Bitmap?, accentColor: Int): Pair<Bitmap, Icon> {
-        val existingBmp = cachedDiscBitmap
-        val existingIcon = cachedDiscIcon
-        if (existingBmp != null && existingIcon != null && cachedCoverRef === cover && cachedDiscAccent == accentColor) {
-            return existingBmp to existingIcon
+    private fun getOrCreateVinylAssets(cover: Bitmap?, accentColor: Int): VinylAssets {
+        val existing = cachedVinylAssets
+        if (existing != null && cachedCoverRef === cover && cachedDiscAccent == accentColor) {
+            return existing
         }
 
-        val discBmp = renderVinylDiscBitmap(cover, accentColor)
-        val discIcon = Icon.createWithBitmap(discBmp)
+        val baseDisc = renderVinylDiscBitmap(cover, accentColor)
+        val discIcon = Icon.createWithBitmap(baseDisc)
+        val stepDeg = 360f / SPIN_FRAME_COUNT
+        val frames = Array(SPIN_FRAME_COUNT) { index ->
+            renderRotatedDisc(baseDisc, SPIN_FRAME_SIZE, index * stepDeg)
+        }
+
+        val assets = VinylAssets(baseDisc = baseDisc, icon = discIcon, spinFrames = frames)
         cachedCoverRef = cover
         cachedDiscAccent = accentColor
-        cachedDiscBitmap = discBmp
-        cachedDiscIcon = discIcon
-        return discBmp to discIcon
+        cachedVinylAssets = assets
+        cachedPausedBase = null
+        cachedPausedDisc = null
+        cachedPausedStep = -1
+        return assets
+    }
+
+    private fun getPausedDiscBitmap(baseDisc: Bitmap, step: Int): Bitmap {
+        val normalizedStep = ((step % SPIN_FRAME_COUNT) + SPIN_FRAME_COUNT) % SPIN_FRAME_COUNT
+        val existing = cachedPausedDisc
+        if (existing != null && cachedPausedBase === baseDisc && cachedPausedStep == normalizedStep) {
+            return existing
+        }
+
+        val angle = normalizedStep * (360f / SPIN_FRAME_COUNT)
+        val rotated = if (normalizedStep == 0) {
+            baseDisc
+        } else {
+            renderRotatedDisc(baseDisc, baseDisc.width, angle)
+        }
+        cachedPausedBase = baseDisc
+        cachedPausedStep = normalizedStep
+        cachedPausedDisc = rotated
+        return rotated
+    }
+
+    private fun renderRotatedDisc(baseDisc: Bitmap, targetSize: Int, degrees: Float): Bitmap {
+        val out = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        val matrix = Matrix().apply {
+            val scale = targetSize.toFloat() / baseDisc.width.toFloat()
+            postScale(scale, scale)
+            postRotate(degrees, targetSize / 2f, targetSize / 2f)
+        }
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        canvas.drawBitmap(baseDisc, matrix, paint)
+        return out
     }
 
     private fun renderVinylDiscBitmap(cover: Bitmap?, accentColor: Int): Bitmap {
