@@ -31,9 +31,11 @@ class AutoLyricsCanvasRenderer(
 
     companion object {
         private const val SIZE = 640
-        private const val HORIZONTAL_MARGIN = 48f
+        // Margine laterale calibrato per evitare tagli sui bordi e non sovrapporsi alle icone in alto
+        private const val HORIZONTAL_MARGIN = 54f
+        // Fascia verticale libera nella card Coolwalk: sotto i 3 puntini e sopra Titolo/Artista
         private const val SAFE_TOP = 68f
-        private const val SAFE_BOTTOM = 414f
+        private const val SAFE_BOTTOM = 348f
         private const val COMFORTAA_VAR_URL =
             "https://raw.githubusercontent.com/google/fonts/main/ofl/comfortaa/Comfortaa%5Bwght%5D.ttf"
         private const val COMFORTAA_FALLBACK_URL =
@@ -110,7 +112,7 @@ class AutoLyricsCanvasRenderer(
     private fun applyFontFile(file: File): Boolean {
         return try {
             val regular = Typeface.Builder(file)
-                .setFontVariationSettings("'wght' 500")
+                .setFontVariationSettings("'wght' 600")
                 .build()
             val bold = Typeface.Builder(file)
                 .setFontVariationSettings("'wght' 700")
@@ -153,20 +155,25 @@ class AutoLyricsCanvasRenderer(
             val maxLines: Int
         )
 
-        fun buildSpecs(includeOuter: Boolean, currSize: Float): List<LineSpec> {
+        fun buildSpecs(
+            includeOuter: Boolean,
+            currSize: Float,
+            adjSize: Float,
+            outerSize: Float
+        ): List<LineSpec> {
             val list = mutableListOf<LineSpec>()
             if (includeOuter && state.prev2.isNotBlank()) {
-                list.add(LineSpec(state.prev2, 20f, Color.argb(88, 255, 255, 255), false, 1))
+                list.add(LineSpec(state.prev2, outerSize, Color.argb(110, 255, 255, 255), false, 1))
             }
             if (state.prev1.isNotBlank()) {
-                list.add(LineSpec(state.prev1, 24f, Color.argb(150, 255, 255, 255), false, 1))
+                list.add(LineSpec(state.prev1, adjSize, Color.argb(185, 255, 255, 255), false, 1))
             }
             list.add(LineSpec(currText, currSize, accentColor, true, 2))
             if (state.next1.isNotBlank()) {
-                list.add(LineSpec(state.next1, 24f, Color.argb(150, 255, 255, 255), false, 1))
+                list.add(LineSpec(state.next1, adjSize, Color.argb(185, 255, 255, 255), false, 1))
             }
             if (includeOuter && state.next2.isNotBlank()) {
-                list.add(LineSpec(state.next2, 20f, Color.argb(88, 255, 255, 255), false, 1))
+                list.add(LineSpec(state.next2, outerSize, Color.argb(110, 255, 255, 255), false, 1))
             }
             return list
         }
@@ -179,13 +186,18 @@ class AutoLyricsCanvasRenderer(
                     typeface = if (spec.isCurrent) comfortaaBold else comfortaaRegular
                     if (spec.isCurrent) {
                         setShadowLayer(
-                            14f,
+                            16f,
                             0f,
                             2f,
-                            Color.argb(135, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
+                            Color.argb(
+                                170,
+                                Color.red(accentColor),
+                                Color.green(accentColor),
+                                Color.blue(accentColor)
+                            )
                         )
                     } else {
-                        setShadowLayer(4f, 0f, 1f, Color.argb(140, 0, 0, 0))
+                        setShadowLayer(5f, 0f, 1f, Color.argb(180, 0, 0, 0))
                     }
                 }
                 val layout = StaticLayout.Builder
@@ -194,7 +206,7 @@ class AutoLyricsCanvasRenderer(
                     .setMaxLines(spec.maxLines)
                     .setEllipsize(TextUtils.TruncateAt.END)
                     .setIncludePad(false)
-                    .setLineSpacing(0f, 1.08f)
+                    .setLineSpacing(0f, 1.06f)
                     .build()
                 spec to layout
             }
@@ -205,7 +217,7 @@ class AutoLyricsCanvasRenderer(
             for (i in items.indices) {
                 total += items[i].second.height
                 if (i < items.lastIndex) {
-                    val gap = if (items[i].first.isCurrent || items[i + 1].first.isCurrent) 16f else 11f
+                    val gap = if (items[i].first.isCurrent || items[i + 1].first.isCurrent) 15f else 10f
                     total += gap
                 }
             }
@@ -213,12 +225,12 @@ class AutoLyricsCanvasRenderer(
         }
 
         val safeHeight = SAFE_BOTTOM - SAFE_TOP
-        var items = makeLayouts(buildSpecs(includeOuter = true, currSize = 33f))
+        var items = makeLayouts(buildSpecs(includeOuter = true, currSize = 44f, adjSize = 28f, outerSize = 21f))
         if (totalHeight(items) > safeHeight) {
-            items = makeLayouts(buildSpecs(includeOuter = true, currSize = 28.5f))
+            items = makeLayouts(buildSpecs(includeOuter = true, currSize = 38f, adjSize = 24f, outerSize = 19f))
         }
         if (totalHeight(items) > safeHeight) {
-            items = makeLayouts(buildSpecs(includeOuter = false, currSize = 30f))
+            items = makeLayouts(buildSpecs(includeOuter = false, currSize = 42f, adjSize = 27f, outerSize = 20f))
         }
 
         val blockHeight = totalHeight(items)
@@ -232,7 +244,7 @@ class AutoLyricsCanvasRenderer(
             canvas.restore()
             y += layout.height
             if (i < items.lastIndex) {
-                y += if (spec.isCurrent || items[i + 1].first.isCurrent) 16f else 11f
+                y += if (spec.isCurrent || items[i + 1].first.isCurrent) 15f else 10f
             }
         }
 
@@ -249,9 +261,9 @@ class AutoLyricsCanvasRenderer(
         val canvas = Canvas(bmp)
 
         val darkTop = Color.rgb(
-            (Color.red(accentColor) * 0.16f).toInt().coerceIn(12, 42),
-            (Color.green(accentColor) * 0.16f).toInt().coerceIn(12, 42),
-            (Color.blue(accentColor) * 0.20f).toInt().coerceIn(18, 52)
+            (Color.red(accentColor) * 0.18f).toInt().coerceIn(14, 48),
+            (Color.green(accentColor) * 0.18f).toInt().coerceIn(14, 48),
+            (Color.blue(accentColor) * 0.22f).toInt().coerceIn(20, 58)
         )
         val bgGradient = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             shader = LinearGradient(
@@ -260,7 +272,7 @@ class AutoLyricsCanvasRenderer(
                 0f,
                 SIZE.toFloat(),
                 intArrayOf(darkTop, Color.rgb(12, 13, 20), Color.rgb(7, 8, 12)),
-                floatArrayOf(0f, 0.58f, 1f),
+                floatArrayOf(0f, 0.56f, 1f),
                 Shader.TileMode.CLAMP
             )
         }
@@ -283,11 +295,11 @@ class AutoLyricsCanvasRenderer(
                     SIZE.toFloat(),
                     intArrayOf(
                         Color.argb(150, 10, 11, 16),
-                        Color.argb(138, 10, 11, 16),
-                        Color.argb(175, 8, 9, 14),
-                        Color.argb(232, 6, 7, 11)
+                        Color.argb(140, 10, 11, 16),
+                        Color.argb(205, 8, 9, 14),
+                        Color.argb(242, 6, 7, 11)
                     ),
-                    floatArrayOf(0f, 0.45f, 0.68f, 1f),
+                    floatArrayOf(0f, 0.48f, 0.62f, 1f),
                     Shader.TileMode.CLAMP
                 )
             }
