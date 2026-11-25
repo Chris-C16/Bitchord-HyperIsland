@@ -1,23 +1,6 @@
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <!-- Sfondo viola scuro arrotondato -->
-    <path
-        android:fillColor="#1E1836"
-        android:pathData="M24,6h60c9.94,0 18,8.06 18,18v60c0,9.94 -8.06,18 -18,18H24c-9.94,0 -18,-8.06 -18,-18V24C6,14.06 14.06,6 24,6z" />
-    <!-- Bordo luminoso sottile -->
-    <path
-        android:fillColor="#6C5CE7"
-        android:fillAlpha="0.35"
-        android:pathData="M28,16h52c6.63,0 12,5.37 12,12v52c0,6.63 -5.37,12 -12,12H28c-6.63,0 -12,-5.37 -12,-12V28C16,21.37 21.37,16 28,16z" />
-    <!-- Nota musicale centrale -->
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M56,28v29.1c-1.63,-0.94 -3.51,-1.52 -5.52,-1.52 -6.1,0 -11.04,4.94 -11.04,11.04S44.38,77.66 50.48,77.66s11.04,-4.94 11.04,-11.04V39.04h11.04V28H56z" />
-    <!-- Barre equalizzatore a sinistra -->
-    <path
-        android:fillColor="#A29BFE"
-        android:pathData="M30,44h4v20h-4zM22,50h4v10h-4z" />
-</vector>
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_app_icon_bg" />
+    <foreground android:drawable="@drawable/ic_app_icon_fg" />
+    <monochrome android:drawable="@drawable/ic_app_icon_mono" />
+</adaptive-icon>
