@@ -2,25 +2,45 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
+    android:background="@android:color/transparent"
     android:gravity="center_vertical"
     android:orientation="horizontal"
     android:paddingStart="14dp"
-    android:paddingTop="10dp"
-    android:paddingEnd="16dp"
-    android:paddingBottom="10dp">
+    android:paddingTop="12dp"
+    android:paddingEnd="14dp"
+    android:paddingBottom="12dp">
 
-    <ImageView
-        android:id="@+id/iv_disc_cover"
+    <FrameLayout
         android:layout_width="56dp"
         android:layout_height="56dp"
-        android:contentDescription="Copertina disco"
-        android:scaleType="fitCenter" />
+        android:layout_marginEnd="14dp">
+
+        <ImageView
+            android:id="@+id/iv_disc_cover"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="@null"
+            android:scaleType="centerCrop" />
+
+        <ProgressBar
+            android:id="@+id/pb_disc_spin"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:indeterminate="true"
+            android:indeterminateDrawable="@drawable/vinyl_spin_overlay"
+            android:indeterminateOnly="true"
+            android:maxHeight="56dp"
+            android:maxWidth="56dp"
+            android:minHeight="56dp"
+            android:minWidth="56dp"
+            android:visibility="gone" />
+    </FrameLayout>
 
     <LinearLayout
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_marginStart="14dp"
         android:layout_weight="1"
+        android:gravity="center_vertical"
         android:orientation="vertical">
 
         <TextView
@@ -29,9 +49,9 @@
             android:layout_height="wrap_content"
             android:ellipsize="end"
             android:fontFamily="sans-serif"
-            android:maxLines="2"
-            android:textColor="#75FFFFFF"
-            android:textSize="11.5sp" />
+            android:maxLines="1"
+            android:textColor="#7AFFFFFF"
+            android:textSize="12sp" />
 
         <TextView
             android:id="@+id/tv_lyric_curr"
@@ -41,10 +61,9 @@
             android:layout_marginBottom="2dp"
             android:ellipsize="end"
             android:fontFamily="sans-serif-medium"
-            android:lineSpacingMultiplier="1.05"
-            android:maxLines="3"
+            android:maxLines="2"
             android:textColor="#FFFFFFFF"
-            android:textSize="14.5sp"
+            android:textSize="15sp"
             android:textStyle="bold" />
 
         <TextView
@@ -53,10 +72,9 @@
             android:layout_height="wrap_content"
             android:ellipsize="end"
             android:fontFamily="sans-serif"
-            android:maxLines="2"
-            android:textColor="#75FFFFFF"
-            android:textSize="11.5sp" />
-
+            android:maxLines="1"
+            android:textColor="#7AFFFFFF"
+            android:textSize="12sp" />
     </LinearLayout>
 
 </LinearLayout>
