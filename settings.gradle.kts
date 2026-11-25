@@ -14,3 +14,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "BitChordIsland"
 include(":app")
+include(":wear")
