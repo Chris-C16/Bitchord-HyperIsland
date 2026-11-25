@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Riflesso di luce morbido che ruota sui solchi del vinile -->
+    <item>
+        <shape
+            android:shape="ring"
+            android:innerRadiusRatio="8"
+            android:thicknessRatio="3"
+            android:useLevel="false">
+            <gradient
+                android:type="sweep"
+                android:useLevel="false"
+                android:startColor="#00FFFFFF"
+                android:centerColor="#30FFFFFF"
+                android:endColor="#00FFFFFF" />
+        </shape>
+    </item>
+
+    <!-- Scia luminosa sottile sul bordo esterno del disco -->
+    <item>
+        <shape
+            android:shape="ring"
+            android:innerRadiusRatio="2.22"
+            android:thickness="2dp"
+            android:useLevel="false">
+            <gradient
+                android:type="sweep"
+                android:useLevel="false"
+                android:startColor="#00FFFFFF"
+                android:centerColor="#45FFFFFF"
+                android:endColor="#EBFFFFFF" />
+        </shape>
+    </item>
+</layer-list>
