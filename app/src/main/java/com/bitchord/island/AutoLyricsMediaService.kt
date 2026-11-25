@@ -1,12 +1,21 @@
 package com.bitchord.island
 
+import android.content.Intent
+import android.graphics.Bitmap
 import android.media.MediaDescription
 import android.media.MediaMetadata
 import android.media.browse.MediaBrowser
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
 import android.service.media.MediaBrowserService
+import androidx.compose.ui.graphics.toArgb
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 class AutoLyricsMediaService : MediaBrowserService() {
 
@@ -25,8 +34,29 @@ class AutoLyricsMediaService : MediaBrowserService() {
     private lateinit var mediaSession: MediaSession
     private lateinit var renderer: AutoLyricsCanvasRenderer
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val renderExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "AutoLyricsRenderThread").apply {
+            priority = Thread.NORM_PRIORITY - 1
+            isDaemon = true
+        }
+    }
+
+    private val renderGeneration = AtomicLong(0L)
+    private val fontVersion = AtomicInteger(0)
+
+    @Volatile
+    private var isClientBound = false
+
+    @Volatile
+    private var isDestroyed = false
+
+    private var lastVisualKey: String = ""
+    private var lastRenderedArt: Bitmap? = null
+    private var lastMetadataKey: String = ""
+
     private val stateListener: (AutoLyricsState?) -> Unit = { state ->
-        updateSession(state)
+        scheduleUpdate(state)
     }
 
     private val sessionCallback = object : MediaSession.Callback() {
@@ -34,14 +64,14 @@ class AutoLyricsMediaService : MediaBrowserService() {
             if (!LyricsPlaybackStore.isPlaying.value) {
                 LyricsPlaybackStore.onPlayPause?.invoke()
             }
-            updateSession(AutoLyricsBridge.currentState)
+            scheduleUpdate(AutoLyricsBridge.currentState)
         }
 
         override fun onPause() {
             if (LyricsPlaybackStore.isPlaying.value) {
                 LyricsPlaybackStore.onPlayPause?.invoke()
             }
-            updateSession(AutoLyricsBridge.currentState)
+            scheduleUpdate(AutoLyricsBridge.currentState)
         }
 
         override fun onSkipToNext() {
@@ -60,14 +90,15 @@ class AutoLyricsMediaService : MediaBrowserService() {
             if (!LyricsPlaybackStore.isPlaying.value) {
                 LyricsPlaybackStore.onPlayPause?.invoke()
             }
-            updateSession(AutoLyricsBridge.currentState)
+            scheduleUpdate(AutoLyricsBridge.currentState)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         renderer = AutoLyricsCanvasRenderer(this) {
-            updateSession(AutoLyricsBridge.currentState)
+            fontVersion.incrementAndGet()
+            scheduleUpdate(AutoLyricsBridge.currentState, forceMetadata = true)
         }
 
         mediaSession = MediaSession(this, "BitChordAutoLyrics").apply {
@@ -77,14 +108,32 @@ class AutoLyricsMediaService : MediaBrowserService() {
         sessionToken = mediaSession.sessionToken
 
         AutoLyricsBridge.registerListener(stateListener)
-
-        if (AutoLyricsBridge.currentState == null) {
-            publishIdleState()
-        }
     }
 
-    private fun publishIdleState() {
-        val idleState = AutoLyricsState(
+    override fun onBind(intent: Intent?): IBinder? {
+        isClientBound = true
+        scheduleUpdate(AutoLyricsBridge.currentState, forceMetadata = true)
+        return super.onBind(intent)
+    }
+
+    override fun onRebind(intent: Intent?) {
+        super.onRebind(intent)
+        isClientBound = true
+        scheduleUpdate(AutoLyricsBridge.currentState, forceMetadata = true)
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        isClientBound = false
+        renderGeneration.incrementAndGet()
+        lastRenderedArt = null
+        lastVisualKey = ""
+        lastMetadataKey = ""
+        renderer.clearCache()
+        return true
+    }
+
+    private fun idleState(): AutoLyricsState {
+        return AutoLyricsState(
             trackKey = "idle",
             lineIndex = -1,
             title = "BitChord Lyrics",
@@ -100,26 +149,83 @@ class AutoLyricsMediaService : MediaBrowserService() {
             cover = null,
             palette = CoverPalette()
         )
-        updateSession(idleState)
     }
 
-    private fun updateSession(state: AutoLyricsState?) {
-        if (state == null) {
-            publishIdleState()
+    private fun buildVisualKey(state: AutoLyricsState): String {
+        val blankPlayFlag = if (state.curr.isBlank()) state.isPlaying else true
+        val coverId = System.identityHashCode(state.cover)
+        val accent = state.palette.accent.toArgb()
+        return "${state.trackKey}|${state.lineIndex}|${state.prev1}|${state.curr}|${state.next1}|$blankPlayFlag|$coverId|$accent|${fontVersion.get()}"
+    }
+
+    private fun scheduleUpdate(rawState: AutoLyricsState?, forceMetadata: Boolean = false) {
+        if (isDestroyed || !isClientBound) return
+
+        val state = rawState ?: idleState()
+        val visualKey = buildVisualKey(state)
+        val metadataKey = "$visualKey|${state.title}|${state.artist}|${state.durationMs}"
+
+        // Aggiorna subito play/pausa e barra di avanzamento senza aspettare il render
+        val pbState = buildPlaybackState(state)
+        mainHandler.post {
+            if (!isDestroyed && isClientBound) {
+                mediaSession.isActive = true
+                mediaSession.setPlaybackState(pbState)
+            }
+        }
+
+        // Se testo, copertina e metadati sono identici, non ridisegna nulla
+        val cachedArt = lastRenderedArt
+        if (!forceMetadata && metadataKey == lastMetadataKey && cachedArt != null) {
             return
         }
 
-        val dynamicArt = renderer.render(state)
-        val metadata = MediaMetadata.Builder()
+        // Se solo titolo/durata cambiano ma l'immagine dei versi è già pronta, riusa il bitmap
+        if (!forceMetadata && visualKey == lastVisualKey && cachedArt != null) {
+            val metadata = buildMetadata(state, cachedArt)
+            lastMetadataKey = metadataKey
+            mainHandler.post {
+                if (!isDestroyed && isClientBound) {
+                    mediaSession.setMetadata(metadata)
+                }
+            }
+            return
+        }
+
+        val gen = renderGeneration.incrementAndGet()
+        if (renderExecutor.isShutdown) return
+
+        renderExecutor.execute {
+            if (isDestroyed || !isClientBound || gen != renderGeneration.get()) return@execute
+
+            val dynamicArt = renderer.render(state)
+            if (isDestroyed || !isClientBound || gen != renderGeneration.get()) return@execute
+
+            val metadata = buildMetadata(state, dynamicArt)
+            mainHandler.post {
+                if (isDestroyed || !isClientBound || gen != renderGeneration.get()) return@post
+                lastVisualKey = visualKey
+                lastMetadataKey = metadataKey
+                lastRenderedArt = dynamicArt
+                mediaSession.isActive = true
+                mediaSession.setMetadata(metadata)
+            }
+        }
+    }
+
+    private fun buildMetadata(state: AutoLyricsState, art: Bitmap): MediaMetadata {
+        return MediaMetadata.Builder()
             .putString(MediaMetadata.METADATA_KEY_MEDIA_ID, "${state.trackKey}|${state.lineIndex}")
             .putString(MediaMetadata.METADATA_KEY_TITLE, state.title.ifBlank { "BitChord Lyrics" })
             .putString(MediaMetadata.METADATA_KEY_ARTIST, state.artist.ifBlank { "BitChord" })
             .putLong(MediaMetadata.METADATA_KEY_DURATION, state.durationMs.coerceAtLeast(0L))
-            .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, dynamicArt)
-            .putBitmap(MediaMetadata.METADATA_KEY_ART, dynamicArt)
+            .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, art)
+            .putBitmap(MediaMetadata.METADATA_KEY_ART, art)
             .build()
+    }
 
-        val pbState = PlaybackState.Builder()
+    private fun buildPlaybackState(state: AutoLyricsState): PlaybackState {
+        return PlaybackState.Builder()
             .setActions(SUPPORTED_ACTIONS)
             .setState(
                 if (state.isPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
@@ -127,10 +233,6 @@ class AutoLyricsMediaService : MediaBrowserService() {
                 if (state.isPlaying) 1f else 0f
             )
             .build()
-
-        mediaSession.isActive = true
-        mediaSession.setMetadata(metadata)
-        mediaSession.setPlaybackState(pbState)
     }
 
     override fun onGetRoot(
@@ -138,6 +240,8 @@ class AutoLyricsMediaService : MediaBrowserService() {
         clientUid: Int,
         rootHints: Bundle?
     ): BrowserRoot {
+        isClientBound = true
+        scheduleUpdate(AutoLyricsBridge.currentState, forceMetadata = true)
         return BrowserRoot(ROOT_ID, null)
     }
 
@@ -161,7 +265,13 @@ class AutoLyricsMediaService : MediaBrowserService() {
     }
 
     override fun onDestroy() {
+        isDestroyed = true
+        isClientBound = false
+        renderGeneration.incrementAndGet()
         AutoLyricsBridge.unregisterListener(stateListener)
+        renderExecutor.shutdownNow()
+        renderer.clearCache()
+        lastRenderedArt = null
         mediaSession.isActive = false
         mediaSession.release()
         super.onDestroy()
