@@ -179,25 +179,7 @@ class HyperIslandNotifier(private val context: Context) {
         return rv
     }
 
-    private fun buildFocusParamJson(
-        pillText: String,
-        currLineText: String,
-        nextLineText: String,
-        accentHex: String
-    ): String {
-        val baseInfo = JSONObject().apply {
-            put("type", 2)
-            put("title", currLineText)
-            if (nextLineText.isNotBlank()) put("content", nextLineText)
-            put("colorTitle", accentHex)
-        }
-
-        val picInfo = JSONObject().apply {
-            put("type", 1)
-            put("pic", "miui.focus.pic_disc")
-        }
-
-        // Struttura corretta HyperOS 3: pic a sinistra + textInfo direttamente in bigIslandArea
+    private fun buildIslandJson(pillText: String, accentHex: String): JSONObject {
         val bigIslandArea = JSONObject().apply {
             put(
                 "imageTextInfoLeft",
@@ -207,7 +189,13 @@ class HyperIslandNotifier(private val context: Context) {
                         "picInfo",
                         JSONObject().apply {
                             put("type", 1)
-                            put("pic", "miui.focus.pic_disc")
+                            put("pic", "miui.focus.pic_icon")
+                        }
+                    )
+                    put(
+                        "textInfo",
+                        JSONObject().apply {
+                            put("title", "")
                         }
                     )
                 }
@@ -227,17 +215,33 @@ class HyperIslandNotifier(private val context: Context) {
                 "picInfo",
                 JSONObject().apply {
                     put("type", 1)
-                    put("pic", "miui.focus.pic_disc")
+                    put("pic", "miui.focus.pic_icon")
+                }
+            )
+            put(
+                "combinePicInfo",
+                JSONObject().apply {
+                    put(
+                        "picInfo",
+                        JSONObject().apply {
+                            put("type", 1)
+                            put("pic", "miui.focus.pic_icon")
+                        }
+                    )
                 }
             )
         }
 
-        val paramIsland = JSONObject().apply {
+        return JSONObject().apply {
             put("islandProperty", 1)
             put("highlightColor", accentHex)
             put("bigIslandArea", bigIslandArea)
             put("smallIslandArea", smallIslandArea)
         }
+    }
+
+    private fun buildFocusParamJson(pillText: String, accentHex: String): Pair<String, String> {
+        val islandJson = buildIslandJson(pillText, accentHex)
 
         val paramV2 = JSONObject().apply {
             put("protocol", 1)
@@ -246,16 +250,28 @@ class HyperIslandNotifier(private val context: Context) {
             put("islandFirstFloat", false)
             put("enableFloat", false)
             put("aodTitle", pillText)
+            put("aodPic", "miui.focus.pic_disc")
             put("ticker", pillText)
-            put("tickerPic", "miui.focus.pic_disc")
-            put("baseInfo", baseInfo)
-            put("picInfo", picInfo)
-            put("param_island", paramIsland)
+            put("tickerPic", "miui.focus.pic_icon")
+            put("param_island", islandJson)
         }
 
-        return JSONObject().apply {
+        val focusJson = JSONObject().apply {
             put("param_v2", paramV2)
         }.toString()
+
+        val customFocusJson = JSONObject().apply {
+            put("ticker", pillText)
+            put("tickerPic", "miui.focus.pic_icon")
+            put("aodTitle", pillText)
+            put("aodPic", "miui.focus.pic_disc")
+            put("updatable", true)
+            put("enableFloat", false)
+            put("islandFirstFloat", false)
+            put("param_island", islandJson)
+        }.toString()
+
+        return focusJson to customFocusJson
     }
 
     fun buildNotification(
@@ -284,12 +300,7 @@ class HyperIslandNotifier(private val context: Context) {
         val smallIcon = if (isPlaying) playingSmallIcon else pausedSmallIcon
 
         val expandedRv = buildExpandedRemoteViews(discBitmap, prevText, currText, nextText, accentColor)
-        val focusJson = buildFocusParamJson(
-            pillText = pillText,
-            currLineText = currText,
-            nextLineText = nextText,
-            accentHex = accentHex
-        )
+        val (focusJson, customFocusJson) = buildFocusParamJson(pillText, accentHex)
 
         val focusPics = Bundle().apply {
             putParcelable("miui.focus.pic_disc", discIcon)
@@ -297,14 +308,14 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         val extras = Bundle().apply {
-            putBoolean("android.requestPromotedOngoing", true)
             putString("miui.focus.param", focusJson)
+            putString("miui.focus.param.custom", customFocusJson)
             putBundle("miui.focus.pics", focusPics)
             putParcelable("miui.focus.rv", expandedRv)
             putParcelable("miui.focus.rvNight", expandedRv)
         }
 
-        val builder = Notification.Builder(context, CHANNEL_ID)
+        return Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(smallIcon)
             .setLargeIcon(discBitmap)
             .setContentTitle(pillText)
@@ -318,20 +329,7 @@ class HyperIslandNotifier(private val context: Context) {
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setContentIntent(createLyricsPendingIntent())
             .addExtras(extras)
-
-        if (android.os.Build.VERSION.SDK_INT >= 36) {
-            try {
-                Notification.Builder::class.java
-                    .getMethod("setRequestPromotedOngoing", Boolean::class.javaPrimitiveType)
-                    .invoke(builder, true)
-                Notification.Builder::class.java
-                    .getMethod("setShortCriticalText", CharSequence::class.java)
-                    .invoke(builder, pillText)
-            } catch (_: Throwable) {
-            }
-        }
-
-        return builder.build()
+            .build()
     }
 
     fun update(
