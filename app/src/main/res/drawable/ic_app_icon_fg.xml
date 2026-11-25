@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Barra 1: Verde menta -> Ciano -> Blu Google -->
+    <path android:pathData="M28.4,48.6 A4.6,4.6 0 0,1 37.6,48.6 L37.6,59.4 A4.6,4.6 0 0,1 28.4,59.4 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="37.6"
+                android:endY="64"
+                android:startX="28.4"
+                android:startY="44"
+                android:type="linear">
+                <item android:color="#FF34D399" android:offset="0.0" />
+                <item android:color="#FF22D3EE" android:offset="0.5" />
+                <item android:color="#FF4285F4" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Barra 2: Ciano -> Blu Google -> Indaco -->
+    <path android:pathData="M42.4,35.6 A4.6,4.6 0 0,1 51.6,35.6 L51.6,72.4 A4.6,4.6 0 0,1 42.4,72.4 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="51.6"
+                android:endY="77"
+                android:startX="42.4"
+                android:startY="31"
+                android:type="linear">
+                <item android:color="#FF38BDF8" android:offset="0.0" />
+                <item android:color="#FF4285F4" android:offset="0.48" />
+                <item android:color="#FF7C3AED" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Barra 3: Blu/Indaco -> Viola -> Magenta -->
+    <path android:pathData="M56.4,41.6 A4.6,4.6 0 0,1 65.6,41.6 L65.6,66.4 A4.6,4.6 0 0,1 56.4,66.4 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="65.6"
+                android:endY="71"
+                android:startX="56.4"
+                android:startY="37"
+                android:type="linear">
+                <item android:color="#FF6366F1" android:offset="0.0" />
+                <item android:color="#FFA855F7" android:offset="0.52" />
+                <item android:color="#FFEC4899" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Barra 4: Rosa -> Corallo -> Ambra -->
+    <path android:pathData="M70.4,50.6 A4.6,4.6 0 0,1 79.6,50.6 L79.6,57.4 A4.6,4.6 0 0,1 70.4,57.4 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="79.6"
+                android:endY="62"
+                android:startX="70.4"
+                android:startY="46"
+                android:type="linear">
+                <item android:color="#FFF472B6" android:offset="0.0" />
+                <item android:color="#FFFB7185" android:offset="0.52" />
+                <item android:color="#FFFBBF24" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>
