@@ -12,6 +12,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
@@ -69,6 +70,8 @@ class HyperIslandNotifier(private val context: Context) {
     private val powerManager = context.getSystemService(PowerManager::class.java)
     private val playingSmallIcon: Icon
     private val pausedSmallIcon: Icon
+    private val playButtonBitmap: Bitmap
+    private val pauseButtonBitmap: Bitmap
     private val pillMeasurePaint = Paint().apply {
         textSize = 100f
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
@@ -107,6 +110,8 @@ class HyperIslandNotifier(private val context: Context) {
 
         playingSmallIcon = Icon.createWithBitmap(renderStaticWaveBitmap())
         pausedSmallIcon = Icon.createWithBitmap(renderSmallPauseBitmap())
+        playButtonBitmap = renderPlayButtonBitmap()
+        pauseButtonBitmap = renderPauseButtonBitmap()
     }
 
     private fun createLyricsPendingIntent(): PendingIntent {
@@ -117,6 +122,18 @@ class HyperIslandNotifier(private val context: Context) {
             context,
             10,
             openLyricsIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun createPlayPausePendingIntent(): PendingIntent {
+        val toggleIntent = Intent(context, IslandPlaybackReceiver::class.java).apply {
+            action = IslandPlaybackReceiver.ACTION_TOGGLE_PLAYBACK
+        }
+        return PendingIntent.getBroadcast(
+            context,
+            11,
+            toggleIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
     }
@@ -312,6 +329,12 @@ class HyperIslandNotifier(private val context: Context) {
         } else {
             rv.setViewVisibility(R.id.tv_lyric_next, View.GONE)
         }
+
+        rv.setImageViewBitmap(
+            R.id.btn_play_pause,
+            if (isPlaying) pauseButtonBitmap else playButtonBitmap
+        )
+        rv.setOnClickPendingIntent(R.id.btn_play_pause, createPlayPausePendingIntent())
 
         return rv
     }
@@ -679,6 +702,48 @@ class HyperIslandNotifier(private val context: Context) {
         }
         canvas.drawCircle(cx, cy, size * 0.125f, holeRimPaint)
 
+        return bmp
+    }
+
+    private fun renderPlayButtonBitmap(): Bitmap {
+        val size = 64
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL_AND_STROKE
+            strokeWidth = 4.5f
+            strokeJoin = Paint.Join.ROUND
+            strokeCap = Paint.Cap.ROUND
+        }
+        // Leggermente spostato a destra per centratura ottica dentro il cerchio
+        val path = Path().apply {
+            moveTo(size * 0.34f, size * 0.22f)
+            lineTo(size * 0.76f, size * 0.50f)
+            lineTo(size * 0.34f, size * 0.78f)
+            close()
+        }
+        canvas.drawPath(path, paint)
+        return bmp
+    }
+
+    private fun renderPauseButtonBitmap(): Bitmap {
+        val size = 64
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        val barW = size * 0.17f
+        val barH = size * 0.56f
+        val gap = size * 0.18f
+        val cy = size / 2f
+        val leftX = size / 2f - gap / 2f - barW
+        val rightX = size / 2f + gap / 2f
+        val radius = barW / 2f
+        canvas.drawRoundRect(RectF(leftX, cy - barH / 2f, leftX + barW, cy + barH / 2f), radius, radius, paint)
+        canvas.drawRoundRect(RectF(rightX, cy - barH / 2f, rightX + barW, cy + barH / 2f), radius, radius, paint)
         return bmp
     }
 
