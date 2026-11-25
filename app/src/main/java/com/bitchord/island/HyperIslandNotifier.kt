@@ -204,7 +204,7 @@ class HyperIslandNotifier(private val context: Context) {
                 "textInfo",
                 JSONObject().apply {
                     put("title", pillText)
-                    put("narrowFont", true)
+                    put("narrowFont", false)
                     put("showHighlightColor", false)
                 }
             )
