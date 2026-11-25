@@ -10,8 +10,8 @@ android {
         applicationId = "com.bitchord.island"
         minSdk = 34
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "3.0"
     }
     buildTypes {
         release { isMinifyEnabled = false }
@@ -36,4 +36,5 @@ dependencies {
     implementation("androidx.palette:palette-ktx:1.0.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.android.gms:play-services-wearable:18.2.0")
 }
