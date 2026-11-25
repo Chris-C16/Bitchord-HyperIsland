@@ -50,5 +50,9 @@
             </intent-filter>
         </service>
 
+        <receiver
+            android:name=".IslandPlaybackReceiver"
+            android:exported="false" />
+
     </application>
 </manifest>
