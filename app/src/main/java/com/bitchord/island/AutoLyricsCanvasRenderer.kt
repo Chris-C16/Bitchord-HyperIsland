@@ -38,9 +38,27 @@ class AutoLyricsCanvasRenderer(
             "https://raw.githubusercontent.com/google/fonts/main/ofl/comfortaa/Comfortaa%5Bwght%5D.ttf"
         private const val COMFORTAA_FALLBACK_URL =
             "https://fonts.gstatic.com/s/comfortaa/v47/1Pt_g8LJRfWJmhDAuUsSQamb1W0lwk4S4Y_LPrQVIT9c2c8.ttf"
+
+        private val LAYOUT_TIERS = listOf(
+            Triple(32f, 20f, true),
+            Triple(28f, 18f, true),
+            Triple(24f, 16f, true),
+            Triple(21f, 14f, true),
+            Triple(26f, 17f, false),
+            Triple(21f, 15f, false)
+        )
     }
 
+    private data class LineSpec(
+        val text: String,
+        val textSize: Float,
+        val color: Int,
+        val isCurrent: Boolean
+    )
+
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val imgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val fullDstRect = RectF(0f, 0f, SIZE.toFloat(), SIZE.toFloat())
 
     @Volatile
     private var comfortaaRegular: Typeface = Typeface.create("sans-serif", Typeface.NORMAL)
@@ -134,10 +152,19 @@ class AutoLyricsCanvasRenderer(
         }
     }
 
+    @Synchronized
+    fun clearCache() {
+        cachedCoverRef = null
+        cachedAccent = 0
+        cachedBackground = null
+    }
+
+    @Synchronized
     fun render(state: AutoLyricsState): Bitmap {
         val accentColor = boostAccentForCar(state.palette.accent.toArgb())
         val bg = getOrCreateBackground(state.cover, accentColor)
-        val output = bg.copy(Bitmap.Config.ARGB_8888, true)
+        // RGB_565 dimezza RAM e peso sul Binder (~819 KB invece di ~1,64 MB)
+        val output = bg.copy(Bitmap.Config.RGB_565, true)
         val canvas = Canvas(output)
 
         val usableWidth = (SIZE - HORIZONTAL_MARGIN * 2f).toInt()
@@ -145,15 +172,18 @@ class AutoLyricsCanvasRenderer(
             if (!state.isPlaying) "In pausa" else "• • •"
         }
 
-        data class LineSpec(
-            val text: String,
-            val textSize: Float,
-            val color: Int,
-            val isCurrent: Boolean
+        val regularFont = comfortaaRegular
+        val boldFont = comfortaaBold
+        val accentShadow = Color.argb(
+            210,
+            Color.red(accentColor),
+            Color.green(accentColor),
+            Color.blue(accentColor)
         )
+        val darkShadow = Color.argb(210, 0, 0, 0)
 
         fun buildSpecs(currSize: Float, adjSize: Float, includeNeighbors: Boolean): List<LineSpec> {
-            val list = mutableListOf<LineSpec>()
+            val list = ArrayList<LineSpec>(3)
             if (includeNeighbors && state.prev1.isNotBlank()) {
                 list.add(LineSpec(state.prev1, adjSize, Color.argb(185, 255, 255, 255), false))
             }
@@ -164,87 +194,69 @@ class AutoLyricsCanvasRenderer(
             return list
         }
 
-        fun makeLayouts(specs: List<LineSpec>): List<Pair<LineSpec, StaticLayout>> {
+        fun makeLayouts(specs: List<LineSpec>): List<StaticLayout> {
             return specs.map { spec ->
                 val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
                     textSize = spec.textSize
                     color = spec.color
-                    typeface = if (spec.isCurrent) comfortaaBold else comfortaaRegular
+                    typeface = if (spec.isCurrent) boldFont else regularFont
                     if (spec.isCurrent) {
-                        setShadowLayer(
-                            12f,
-                            0f,
-                            2f,
-                            Color.argb(
-                                210,
-                                Color.red(accentColor),
-                                Color.green(accentColor),
-                                Color.blue(accentColor)
-                            )
-                        )
+                        setShadowLayer(12f, 0f, 2f, accentShadow)
                     } else {
-                        setShadowLayer(6f, 0f, 2f, Color.argb(210, 0, 0, 0))
+                        setShadowLayer(6f, 0f, 2f, darkShadow)
                     }
                 }
-                val layout = StaticLayout.Builder
+                StaticLayout.Builder
                     .obtain(spec.text, 0, spec.text.length, paint, usableWidth)
                     .setAlignment(Layout.Alignment.ALIGN_CENTER)
                     .setBreakStrategy(Layout.BREAK_STRATEGY_BALANCED)
                     .setIncludePad(false)
                     .setLineSpacing(0f, 1.08f)
                     .build()
-                spec to layout
             }
         }
 
-        fun totalHeight(items: List<Pair<LineSpec, StaticLayout>>): Float {
+        fun totalHeight(layouts: List<StaticLayout>): Float {
             var total = 0f
-            for (i in items.indices) {
-                total += items[i].second.height
-                if (i < items.lastIndex) total += 14f
+            for (i in layouts.indices) {
+                total += layouts[i].height
+                if (i < layouts.lastIndex) total += 14f
             }
             return total
         }
 
-        fun fitsCleanly(items: List<Pair<LineSpec, StaticLayout>>, maxHeight: Float): Boolean {
-            if (totalHeight(items) > maxHeight) return false
-            return items.all { (_, layout) ->
-                (0 until layout.lineCount).all { line ->
-                    layout.getLineWidth(line) <= usableWidth + 1f
+        fun fitsCleanly(layouts: List<StaticLayout>, maxHeight: Float): Boolean {
+            if (totalHeight(layouts) > maxHeight) return false
+            for (layout in layouts) {
+                for (line in 0 until layout.lineCount) {
+                    if (layout.getLineWidth(line) > usableWidth + 1f) return false
                 }
             }
+            return true
         }
 
         val safeHeight = SAFE_BOTTOM - SAFE_TOP
-        val tiers = listOf(
-            Triple(32f, 20f, true),
-            Triple(28f, 18f, true),
-            Triple(24f, 16f, true),
-            Triple(21f, 14f, true),
-            Triple(26f, 17f, false),
-            Triple(21f, 15f, false)
-        )
-
-        var items = makeLayouts(buildSpecs(32f, 20f, includeNeighbors = true))
-        for ((currSize, adjSize, includeNeighbors) in tiers) {
+        var chosenLayouts: List<StaticLayout>? = null
+        for ((currSize, adjSize, includeNeighbors) in LAYOUT_TIERS) {
             val candidate = makeLayouts(buildSpecs(currSize, adjSize, includeNeighbors))
-            items = candidate
+            chosenLayouts = candidate
             if (fitsCleanly(candidate, safeHeight)) {
                 break
             }
         }
 
-        val blockHeight = totalHeight(items)
+        val layouts = chosenLayouts ?: return output
+        val blockHeight = totalHeight(layouts)
         var y = SAFE_TOP + ((safeHeight - blockHeight) / 2f).coerceAtLeast(0f)
 
-        for (i in items.indices) {
-            val (_, layout) = items[i]
+        for (i in layouts.indices) {
+            val layout = layouts[i]
             canvas.save()
             canvas.translate(HORIZONTAL_MARGIN, y)
             layout.draw(canvas)
             canvas.restore()
             y += layout.height
-            if (i < items.lastIndex) {
+            if (i < layouts.lastIndex) {
                 y += 14f
             }
         }
@@ -258,7 +270,7 @@ class AutoLyricsCanvasRenderer(
             return existing
         }
 
-        val bmp = Bitmap.createBitmap(SIZE, SIZE, Bitmap.Config.ARGB_8888)
+        val bmp = Bitmap.createBitmap(SIZE, SIZE, Bitmap.Config.RGB_565)
         val canvas = Canvas(bmp)
 
         val darkTop = Color.rgb(
@@ -284,9 +296,7 @@ class AutoLyricsCanvasRenderer(
             val left = (cover.width - minDim) / 2
             val top = (cover.height - minDim) / 2
             val srcRect = Rect(left, top, left + minDim, top + minDim)
-            val dstRect = RectF(0f, 0f, SIZE.toFloat(), SIZE.toFloat())
-            val imgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-            canvas.drawBitmap(cover, srcRect, dstRect, imgPaint)
+            canvas.drawBitmap(cover, srcRect, fullDstRect, imgPaint)
 
             val scrimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 shader = LinearGradient(
