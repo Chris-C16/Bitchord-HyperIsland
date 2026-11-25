@@ -27,29 +27,19 @@ import android.view.View
 import android.widget.RemoteViews
 import androidx.compose.ui.graphics.toArgb
 import org.json.JSONObject
-import kotlin.math.ceil
 import kotlin.math.max
 
 class HyperIslandNotifier(private val context: Context) {
 
-    data class PillChunk(
-        val index: Int,
-        val text: String,
-        val totalChunks: Int,
-        val isInstrumental: Boolean = false
-    )
-
     companion object {
         const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
-        private const val MAX_PILL_VISUAL_WIDTH = 10.6f
-        private const val INSTRUMENTAL_HOLD_MS = 2400L
+        private const val MAX_STATIC_PILL_CHARS = 12
     }
 
     private val manager = context.getSystemService(NotificationManager::class.java)
     private val playingSmallIcon: Icon
     private val pausedSmallIcon: Icon
-    private val idleSmallIcon: Icon
 
     private var cachedCoverRef: Bitmap? = null
     private var cachedDiscAccent: Int = 0
@@ -72,7 +62,6 @@ class HyperIslandNotifier(private val context: Context) {
 
         playingSmallIcon = Icon.createWithBitmap(renderStaticWaveBitmap())
         pausedSmallIcon = Icon.createWithBitmap(renderSmallPauseBitmap())
-        idleSmallIcon = Icon.createWithBitmap(renderSmallIdleBitmap())
     }
 
     private fun createLyricsPendingIntent(): PendingIntent {
@@ -87,181 +76,21 @@ class HyperIslandNotifier(private val context: Context) {
         )
     }
 
-    fun computePillChunk(
-        currentLine: LyricLine?,
-        nextLineStartMs: Long?,
-        songPositionMs: Long,
-        fallbackTitle: String,
-        isPlaying: Boolean
-    ): PillChunk {
-        val full = currentLine?.fullText?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
-        if (full.isBlank()) {
-            val cleanTitle = fallbackTitle.replace(Regex("\\s+"), " ").trim()
-            val idleText = if (!isPlaying) {
-                "In pausa"
-            } else {
-                buildBalancedChunks(cleanTitle.ifEmpty { "• • •" }).first()
-            }
-            return PillChunk(0, idleText, 1, isInstrumental = true)
-        }
+    private fun cleanLine(text: String): String {
+        return text.replace(Regex("\\s+"), " ").trim()
+    }
 
-        val chunks = buildBalancedChunks(full)
-        val estimatedVocalMs = (full.length * 80L + 500L).coerceIn(1400L, 3800L)
-        val gapToNext = if (nextLineStartMs != null && nextLineStartMs > currentLine!!.startMs) {
-            nextLineStartMs - currentLine.startMs
+    private fun buildStaticPillText(title: String, isPlaying: Boolean): String {
+        if (!isPlaying) return "In pausa"
+        val clean = cleanLine(title)
+        if (clean.isEmpty()) return "Lyrics"
+        if (clean.length <= MAX_STATIC_PILL_CHARS) return clean
+        val spaceCut = clean.lastIndexOf(' ', MAX_STATIC_PILL_CHARS)
+        return if (spaceCut >= 5) {
+            clean.substring(0, spaceCut).trimEnd()
         } else {
-            0L
+            clean.substring(0, MAX_STATIC_PILL_CHARS - 1).trimEnd() + "…"
         }
-        val explicitDuration = currentLine!!.endMs - currentLine.startMs
-
-        val availableWindow = when {
-            gapToNext > 300L -> gapToNext
-            explicitDuration > 300L -> explicitDuration
-            else -> estimatedVocalMs
-        }
-
-        val hasTrueInstrumentalGap = availableWindow > estimatedVocalMs + INSTRUMENTAL_HOLD_MS
-        val vocalDuration = if (hasTrueInstrumentalGap) {
-            estimatedVocalMs
-        } else {
-            availableWindow.coerceIn(750L, 6500L)
-        }
-
-        val elapsed = (songPositionMs - currentLine.startMs).coerceAtLeast(0L)
-
-        if (isPlaying && hasTrueInstrumentalGap && elapsed > vocalDuration + 900L) {
-            return PillChunk(-1, "• • •", chunks.size, isInstrumental = true)
-        }
-
-        if (chunks.size <= 1) {
-            return PillChunk(0, chunks.first(), 1)
-        }
-
-        val ratio = (elapsed.toFloat() / vocalDuration).coerceIn(0f, 0.999f)
-        val chunkIdx = (ratio * chunks.size).toInt().coerceIn(0, chunks.lastIndex)
-        return PillChunk(chunkIdx, chunks[chunkIdx], chunks.size)
-    }
-
-    private fun buildBalancedChunks(text: String): List<String> {
-        val cleaned = text.replace(Regex("\\s+"), " ").trim()
-        if (cleaned.isEmpty()) return listOf("• • •")
-        if (visualWidth(cleaned) <= MAX_PILL_VISUAL_WIDTH) return listOf(cleaned)
-
-        val rawWords = cleaned.split(" ").filter { it.isNotBlank() }
-        val words = mutableListOf<String>()
-        for (w in rawWords) {
-            if (visualWidth(w) <= MAX_PILL_VISUAL_WIDTH) {
-                words.add(w)
-            } else {
-                words.addAll(splitLongWord(w))
-            }
-        }
-
-        val totalWidth = visualWidth(cleaned)
-        val targetCount = ceil(totalWidth / MAX_PILL_VISUAL_WIDTH).toInt().coerceAtLeast(2)
-        val softLimit = ((totalWidth / targetCount) * 1.12f).coerceIn(5.2f, MAX_PILL_VISUAL_WIDTH)
-
-        val result = mutableListOf<String>()
-        val current = StringBuilder()
-
-        for (w in words) {
-            if (current.isEmpty()) {
-                current.append(w)
-            } else {
-                val candidate = "$current $w"
-                val candWidth = visualWidth(candidate)
-                val isLastBucket = result.size >= targetCount - 1
-                if (!w.endsWith("-") && !current.endsWith("-") &&
-                    (candWidth <= softLimit || (isLastBucket && candWidth <= MAX_PILL_VISUAL_WIDTH))
-                ) {
-                    current.append(" ").append(w)
-                } else {
-                    result.add(current.toString())
-                    current.clear()
-                    current.append(w)
-                }
-            }
-        }
-        if (current.isNotEmpty()) result.add(current.toString())
-        return result.ifEmpty { listOf("• • •") }
-    }
-
-    private fun splitLongWord(word: String): List<String> {
-        val totalW = visualWidth(word)
-        val maxContentW = MAX_PILL_VISUAL_WIDTH - 1.1f
-        val partsCount = ceil(totalW / maxContentW).toInt().coerceAtLeast(2)
-        val targetW = totalW / partsCount
-
-        val parts = mutableListOf<String>()
-        var startIdx = 0
-        var remainingParts = partsCount
-        val vowels = "aeiouàèéìòóùáíúAEIOUÀÈÉÌÒÓÙÁÍÚ"
-
-        while (startIdx < word.length) {
-            if (remainingParts <= 1) {
-                val tail = word.substring(startIdx)
-                if (visualWidth(tail) <= MAX_PILL_VISUAL_WIDTH) {
-                    parts.add(tail)
-                    break
-                }
-            }
-
-            var endIdx = startIdx
-            var accW = 0f
-            while (endIdx < word.length && accW + charVisualWidth(word[endIdx]) <= maxContentW) {
-                accW += charVisualWidth(word[endIdx])
-                endIdx++
-                if (accW >= targetW && remainingParts > 1) break
-            }
-
-            if (endIdx <= startIdx) endIdx = (startIdx + 1).coerceAtMost(word.length)
-
-            val leftover = word.length - endIdx
-            if (leftover in 1..2 && endIdx - startIdx > 3) {
-                endIdx -= (3 - leftover)
-            }
-
-            if (endIdx < word.length && endIdx - startIdx >= 3) {
-                if (word[endIdx - 1] !in vowels) {
-                    if (endIdx - 2 > startIdx + 1 && word[endIdx - 2] in vowels) {
-                        endIdx -= 1
-                    } else if (endIdx < word.length - 2 && word[endIdx] in vowels) {
-                        if (visualWidth(word.substring(startIdx, endIdx + 1)) <= maxContentW) {
-                            endIdx += 1
-                        }
-                    }
-                }
-            }
-
-            val slice = word.substring(startIdx, endIdx)
-            val isLast = endIdx >= word.length
-            parts.add(if (isLast) slice else "$slice-")
-            startIdx = endIdx
-            remainingParts = (remainingParts - 1).coerceAtLeast(1)
-        }
-        return parts
-    }
-
-    private fun visualWidth(text: String): Float {
-        var total = 0f
-        for (ch in text) total += charVisualWidth(ch)
-        return total
-    }
-
-    private fun charVisualWidth(ch: Char): Float = when {
-        ch == ' ' -> 0.48f
-        ch in "ilI!|.,:;'`" -> 0.50f
-        ch in "tfjr()-/" -> 0.68f
-        ch in "mwMWOGQDHU" -> 1.32f
-        ch.isUpperCase() -> 1.15f
-        else -> 1.0f
-    }
-
-    private fun ellipsizeForCard(line: String, maxChars: Int = 40): String {
-        val clean = line.replace(Regex("\\s+"), " ").trim()
-        if (clean.length <= maxChars) return clean
-        val cut = clean.lastIndexOf(' ', maxChars - 1).takeIf { it >= maxChars / 2 } ?: (maxChars - 1)
-        return clean.substring(0, cut).trimEnd() + "…"
     }
 
     private fun resolveDisplayLines(
@@ -271,9 +100,9 @@ class HyperIslandNotifier(private val context: Context) {
         title: String,
         isPlaying: Boolean
     ): Triple<String, String, String> {
-        val prev = ellipsizeForCard(prevLyric)
-        val curr = ellipsizeForCard(currentLine?.fullText.orEmpty())
-        val next = ellipsizeForCard(nextLyric1)
+        val prev = cleanLine(prevLyric)
+        val curr = cleanLine(currentLine?.fullText.orEmpty())
+        val next = cleanLine(nextLyric1)
 
         if (!isPlaying && curr.isBlank()) {
             return Triple("", title.ifBlank { "In pausa" }, "Riproduzione in pausa")
@@ -368,6 +197,7 @@ class HyperIslandNotifier(private val context: Context) {
             put("pic", "miui.focus.pic_disc")
         }
 
+        // Struttura corretta HyperOS 3: pic a sinistra + textInfo direttamente in bigIslandArea
         val bigIslandArea = JSONObject().apply {
             put(
                 "imageTextInfoLeft",
@@ -377,23 +207,17 @@ class HyperIslandNotifier(private val context: Context) {
                         "picInfo",
                         JSONObject().apply {
                             put("type", 1)
-                            put("pic", "miui.focus.pic_icon")
+                            put("pic", "miui.focus.pic_disc")
                         }
                     )
                 }
             )
             put(
-                "imageTextInfoRight",
+                "textInfo",
                 JSONObject().apply {
-                    put("type", 2)
-                    put(
-                        "textInfo",
-                        JSONObject().apply {
-                            put("title", pillText)
-                            put("narrowFont", true)
-                            put("showHighlightColor", false)
-                        }
-                    )
+                    put("title", pillText)
+                    put("narrowFont", true)
+                    put("showHighlightColor", false)
                 }
             )
         }
@@ -423,7 +247,7 @@ class HyperIslandNotifier(private val context: Context) {
             put("enableFloat", false)
             put("aodTitle", pillText)
             put("ticker", pillText)
-            put("tickerPic", "miui.focus.pic_icon")
+            put("tickerPic", "miui.focus.pic_disc")
             put("baseInfo", baseInfo)
             put("picInfo", picInfo)
             put("param_island", paramIsland)
@@ -438,15 +262,12 @@ class HyperIslandNotifier(private val context: Context) {
         title: String,
         prevLyric: String,
         currentLine: LyricLine?,
-        nextLineStartMs: Long?,
         nextLyric1: String,
         cover: Bitmap?,
         palette: CoverPalette,
-        songPositionMs: Long,
-        songDurationMs: Long,
         isPlaying: Boolean
     ): Notification {
-        val chunk = computePillChunk(currentLine, nextLineStartMs, songPositionMs, title, isPlaying)
+        val pillText = buildStaticPillText(title, isPlaying)
         val accentColor = boostAccentBrightness(palette.accent.toArgb())
         val accentHex = String.format("#%06X", 0xFFFFFF and accentColor)
 
@@ -460,16 +281,11 @@ class HyperIslandNotifier(private val context: Context) {
 
         val expandedBody = formatStyledExpandedLyrics(prevText, currText, nextText, accentColor)
         val (discBitmap, discIcon) = getOrCreateVinylDisc(cover, accentColor)
-
-        val smallIcon = when {
-            !isPlaying -> pausedSmallIcon
-            chunk.isInstrumental -> idleSmallIcon
-            else -> playingSmallIcon
-        }
+        val smallIcon = if (isPlaying) playingSmallIcon else pausedSmallIcon
 
         val expandedRv = buildExpandedRemoteViews(discBitmap, prevText, currText, nextText, accentColor)
         val focusJson = buildFocusParamJson(
-            pillText = chunk.text,
+            pillText = pillText,
             currLineText = currText,
             nextLineText = nextText,
             accentHex = accentHex
@@ -490,7 +306,7 @@ class HyperIslandNotifier(private val context: Context) {
         return Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(smallIcon)
             .setLargeIcon(discBitmap)
-            .setContentTitle(chunk.text)
+            .setContentTitle(pillText)
             .setContentText(expandedBody)
             .setColor(accentColor)
             .setColorized(false)
@@ -508,12 +324,9 @@ class HyperIslandNotifier(private val context: Context) {
         title: String,
         prevLyric: String,
         currentLine: LyricLine?,
-        nextLineStartMs: Long?,
         nextLyric1: String,
         cover: Bitmap?,
         palette: CoverPalette,
-        songPositionMs: Long,
-        songDurationMs: Long,
         isPlaying: Boolean
     ) {
         manager.notify(
@@ -522,12 +335,9 @@ class HyperIslandNotifier(private val context: Context) {
                 title = title,
                 prevLyric = prevLyric,
                 currentLine = currentLine,
-                nextLineStartMs = nextLineStartMs,
                 nextLyric1 = nextLyric1,
                 cover = cover,
                 palette = palette,
-                songPositionMs = songPositionMs,
-                songDurationMs = songDurationMs,
                 isPlaying = isPlaying
             )
         )
@@ -669,22 +479,6 @@ class HyperIslandNotifier(private val context: Context) {
         val rightX = size / 2f + gap / 2f
         canvas.drawRoundRect(RectF(leftX, cy - barH / 2f, leftX + barW, cy + barH / 2f), barW / 2f, barW / 2f, paint)
         canvas.drawRoundRect(RectF(rightX, cy - barH / 2f, rightX + barW, cy + barH / 2f), barW / 2f, barW / 2f, paint)
-        return bmp
-    }
-
-    private fun renderSmallIdleBitmap(): Bitmap {
-        val size = 48
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.FILL
-        }
-        val r = size * 0.09f
-        val cy = size / 2f
-        canvas.drawCircle(size * 0.24f, cy, r, paint)
-        canvas.drawCircle(size * 0.50f, cy, r * 1.15f, paint)
-        canvas.drawCircle(size * 0.76f, cy, r, paint)
         return bmp
     }
 }
