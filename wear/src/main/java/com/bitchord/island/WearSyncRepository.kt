@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.SystemClock
+import android.util.Base64
 import com.google.android.gms.wearable.DataClient
 import com.google.android.gms.wearable.DataEvent
 import com.google.android.gms.wearable.DataEventBuffer
@@ -34,6 +35,7 @@ data class WearTrackState(
 object WearSyncRepository : DataClient.OnDataChangedListener, MessageClient.OnMessageReceivedListener {
 
     private const val PATH_TRACK_DATA = "/bitchord/track_data"
+    private const val PATH_TRACK_DATA_MSG = "/bitchord/track_data_msg"
     private const val PATH_PLAYBACK_STATE = "/bitchord/playback_state"
     private const val PATH_CMD_PLAY_PAUSE = "/bitchord/cmd/play_pause"
     private const val PATH_CMD_NEXT = "/bitchord/cmd/next"
@@ -137,25 +139,34 @@ object WearSyncRepository : DataClient.OnDataChangedListener, MessageClient.OnMe
     }
 
     override fun onMessageReceived(event: MessageEvent) {
-        if (event.path != PATH_PLAYBACK_STATE) return
         phoneConnected.value = true
-        try {
-            val json = JSONObject(String(event.data, Charsets.UTF_8))
-            val playing = json.optBoolean("isPlaying", false)
-            val posMs = json.optLong("positionMs", 0L)
-            val spd = json.optDouble("speed", 1.0).toFloat()
-            val sentAtWall = json.optLong("sentAtWallMs", 0L)
-            val transitDelayMs = if (sentAtWall > 0L) {
-                (System.currentTimeMillis() - sentAtWall).coerceIn(0L, 1500L)
-            } else {
-                0L
+        when (event.path) {
+            PATH_TRACK_DATA_MSG -> {
+                parseTrackData(
+                    payload = String(event.data, Charsets.UTF_8),
+                    artBytes = null
+                )
             }
+            PATH_PLAYBACK_STATE -> {
+                try {
+                    val json = JSONObject(String(event.data, Charsets.UTF_8))
+                    val playing = json.optBoolean("isPlaying", false)
+                    val posMs = json.optLong("positionMs", 0L)
+                    val spd = json.optDouble("speed", 1.0).toFloat()
+                    val sentAtWall = json.optLong("sentAtWallMs", 0L)
+                    val transitDelayMs = if (sentAtWall > 0L) {
+                        (System.currentTimeMillis() - sentAtWall).coerceIn(0L, 1500L)
+                    } else {
+                        0L
+                    }
 
-            isPlaying.value = playing
-            speed.value = if (spd > 0f) spd else 1f
-            basePositionMs.value = if (playing) posMs + transitDelayMs else posMs
-            baseRealtimeMs.value = SystemClock.elapsedRealtime()
-        } catch (_: Throwable) {
+                    isPlaying.value = playing
+                    speed.value = if (spd > 0f) spd else 1f
+                    basePositionMs.value = if (playing) posMs + transitDelayMs else posMs
+                    baseRealtimeMs.value = SystemClock.elapsedRealtime()
+                } catch (_: Throwable) {
+                }
+            }
         }
     }
 
@@ -176,8 +187,15 @@ object WearSyncRepository : DataClient.OnDataChangedListener, MessageClient.OnMe
                 }
             }
 
-            val coverBmp = if (artBytes != null && artBytes.isNotEmpty()) {
-                BitmapFactory.decodeByteArray(artBytes, 0, artBytes.size)
+            val resolvedBytes = if (artBytes != null && artBytes.isNotEmpty()) {
+                artBytes
+            } else {
+                val b64 = json.optString("artB64", "")
+                if (b64.isNotEmpty()) Base64.decode(b64, Base64.DEFAULT) else ByteArray(0)
+            }
+
+            val coverBmp = if (resolvedBytes.isNotEmpty()) {
+                BitmapFactory.decodeByteArray(resolvedBytes, 0, resolvedBytes.size)
             } else {
                 null
             }
