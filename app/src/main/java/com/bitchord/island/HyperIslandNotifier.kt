@@ -16,7 +16,6 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.Icon
-import android.os.Build
 import android.os.Bundle
 import android.text.SpannableStringBuilder
 import android.text.Spanned
@@ -44,7 +43,7 @@ class HyperIslandNotifier(private val context: Context) {
         const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
         private const val MAX_PILL_VISUAL_WIDTH = 10.6f
-        private const val INSTRUMENTAL_HOLD_MS = 450L
+        private const val INSTRUMENTAL_HOLD_MS = 2400L
     }
 
     private val manager = context.getSystemService(NotificationManager::class.java)
@@ -107,7 +106,7 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         val chunks = buildBalancedChunks(full)
-        val estimatedVocalMs = (full.length * 65L + 350L).coerceIn(900L, 3000L)
+        val estimatedVocalMs = (full.length * 80L + 500L).coerceIn(1400L, 3800L)
         val gapToNext = if (nextLineStartMs != null && nextLineStartMs > currentLine!!.startMs) {
             nextLineStartMs - currentLine.startMs
         } else {
@@ -121,15 +120,16 @@ class HyperIslandNotifier(private val context: Context) {
             else -> estimatedVocalMs
         }
 
-        val vocalDuration = if (availableWindow > estimatedVocalMs + 700L) {
+        val hasTrueInstrumentalGap = availableWindow > estimatedVocalMs + INSTRUMENTAL_HOLD_MS
+        val vocalDuration = if (hasTrueInstrumentalGap) {
             estimatedVocalMs
         } else {
-            availableWindow.coerceIn(650L, 4200L)
+            availableWindow.coerceIn(750L, 6500L)
         }
 
         val elapsed = (songPositionMs - currentLine.startMs).coerceAtLeast(0L)
 
-        if (isPlaying && availableWindow > vocalDuration + INSTRUMENTAL_HOLD_MS && elapsed > vocalDuration + INSTRUMENTAL_HOLD_MS) {
+        if (isPlaying && hasTrueInstrumentalGap && elapsed > vocalDuration + 900L) {
             return PillChunk(-1, "• • •", chunks.size, isInstrumental = true)
         }
 
@@ -268,7 +268,6 @@ class HyperIslandNotifier(private val context: Context) {
         prevLyric: String,
         currentLine: LyricLine?,
         nextLyric1: String,
-        chunk: PillChunk,
         title: String,
         isPlaying: Boolean
     ): Triple<String, String, String> {
@@ -281,9 +280,6 @@ class HyperIslandNotifier(private val context: Context) {
         }
         if (curr.isBlank()) {
             return Triple("", title.ifBlank { "In attesa del testo…" }, next)
-        }
-        if (chunk.isInstrumental) {
-            return Triple(curr, "• • •", next)
         }
         return Triple(prev, curr, next)
     }
@@ -387,11 +383,17 @@ class HyperIslandNotifier(private val context: Context) {
                 }
             )
             put(
-                "textInfo",
+                "imageTextInfoRight",
                 JSONObject().apply {
-                    put("title", pillText)
-                    put("narrowFont", true)
-                    put("showHighlightColor", false)
+                    put("type", 2)
+                    put(
+                        "textInfo",
+                        JSONObject().apply {
+                            put("title", pillText)
+                            put("narrowFont", true)
+                            put("showHighlightColor", false)
+                        }
+                    )
                 }
             )
         }
@@ -419,6 +421,7 @@ class HyperIslandNotifier(private val context: Context) {
             put("updatable", true)
             put("islandFirstFloat", false)
             put("enableFloat", false)
+            put("aodTitle", pillText)
             put("ticker", pillText)
             put("tickerPic", "miui.focus.pic_icon")
             put("baseInfo", baseInfo)
@@ -451,7 +454,6 @@ class HyperIslandNotifier(private val context: Context) {
             prevLyric = prevLyric,
             currentLine = currentLine,
             nextLyric1 = nextLyric1,
-            chunk = chunk,
             title = title,
             isPlaying = isPlaying
         )
@@ -463,12 +465,6 @@ class HyperIslandNotifier(private val context: Context) {
             !isPlaying -> pausedSmallIcon
             chunk.isInstrumental -> idleSmallIcon
             else -> playingSmallIcon
-        }
-
-        val progressPct = if (songDurationMs > 0L) {
-            ((songPositionMs * 100L) / songDurationMs).toInt().coerceIn(0, 100)
-        } else {
-            0
         }
 
         val expandedRv = buildExpandedRemoteViews(discBitmap, prevText, currText, nextText, accentColor)
@@ -485,13 +481,13 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         val extras = Bundle().apply {
-            putBoolean("android.requestPromotedOngoing", true)
             putString("miui.focus.param", focusJson)
             putBundle("miui.focus.pics", focusPics)
             putParcelable("miui.focus.rv", expandedRv)
+            putParcelable("miui.focus.rvNight", expandedRv)
         }
 
-        val builder = Notification.Builder(context, CHANNEL_ID)
+        return Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(smallIcon)
             .setLargeIcon(discBitmap)
             .setContentTitle(chunk.text)
@@ -501,38 +497,11 @@ class HyperIslandNotifier(private val context: Context) {
             .setShowWhen(false)
             .setOngoing(isPlaying)
             .setOnlyAlertOnce(true)
-            .setCategory(Notification.CATEGORY_PROGRESS)
+            .setCategory(Notification.CATEGORY_SERVICE)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setContentIntent(createLyricsPendingIntent())
             .addExtras(extras)
-
-        if (Build.VERSION.SDK_INT >= 36) {
-            try {
-                Notification.Builder::class.java
-                    .getMethod("setRequestPromotedOngoing", Boolean::class.javaPrimitiveType)
-                    .invoke(builder, true)
-                Notification.Builder::class.java
-                    .getMethod("setShortCriticalText", CharSequence::class.java)
-                    .invoke(builder, chunk.text)
-
-                val progressStyleClass = Class.forName("android.app.Notification\$ProgressStyle")
-                val progressStyle = progressStyleClass.getDeclaredConstructor().newInstance()
-                progressStyleClass.getMethod("setProgress", Int::class.javaPrimitiveType)
-                    .invoke(progressStyle, progressPct)
-                progressStyleClass.getMethod("setStyledByProgress", Boolean::class.javaPrimitiveType)
-                    .invoke(progressStyle, true)
-
-                Notification.Builder::class.java
-                    .getMethod("setStyle", Notification.Style::class.java)
-                    .invoke(builder, progressStyle)
-            } catch (_: Throwable) {
-                builder.setProgress(100, progressPct, false)
-            }
-        } else {
-            builder.setProgress(100, progressPct, false)
-        }
-
-        return builder.build()
+            .build()
     }
 
     fun update(
