@@ -52,14 +52,13 @@ class BitChordListenerService : NotificationListenerService() {
     private val carModeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (isCarModeActive()) {
-                suspendForCarMode()
-            } else {
-                lastRenderKey = ""
-                syncLyrics(
-                    isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING,
-                    forceImmediate = true
-                )
+                hidePhoneNotificationOnly()
             }
+            lastRenderKey = ""
+            syncLyrics(
+                isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING,
+                forceImmediate = true
+            )
         }
     }
 
@@ -124,7 +123,7 @@ class BitChordListenerService : NotificationListenerService() {
         return uiModeManager.currentModeType == Configuration.UI_MODE_TYPE_CAR
     }
 
-    private fun suspendForCarMode() {
+    private fun hidePhoneNotificationOnly() {
         notifier.cancel()
         if (isForegroundStarted) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -169,7 +168,8 @@ class BitChordListenerService : NotificationListenerService() {
         } else {
             stopTicker()
             LyricsPlaybackStore.isPlaying.value = false
-            suspendForCarMode()
+            AutoLyricsBridge.clear()
+            hidePhoneNotificationOnly()
         }
     }
 
@@ -259,11 +259,6 @@ class BitChordListenerService : NotificationListenerService() {
     private fun syncLyrics(isPlaying: Boolean, forceImmediate: Boolean) {
         if (currentTitle.isBlank()) return
 
-        if (isCarModeActive()) {
-            suspendForCarMode()
-            return
-        }
-
         val posMs = LyricsPlaybackStore.currentPositionMs()
         val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
         val currLine = if (idx >= 0) currentLines[idx] else null
@@ -279,19 +274,48 @@ class BitChordListenerService : NotificationListenerService() {
         lastRenderKey = renderKey
         lastNotifyRealtimeMs = now
 
-        val prev = if (idx > 0) currentLines[idx - 1].fullText else ""
-        val next1 = if (idx >= 0 && idx + 1 < currentLines.size) {
-            currentLines[idx + 1].fullText
-        } else if (idx == -1 && currentLines.isNotEmpty()) {
-            currentLines[0].fullText
-        } else {
-            ""
+        val prev2 = if (idx > 1) currentLines[idx - 2].fullText else ""
+        val prev1 = if (idx > 0) currentLines[idx - 1].fullText else ""
+        val currText = currLine?.fullText.orEmpty()
+        val next1 = when {
+            idx >= 0 && idx + 1 < currentLines.size -> currentLines[idx + 1].fullText
+            idx == -1 && currentLines.isNotEmpty() -> currentLines[0].fullText
+            else -> ""
+        }
+        val next2 = when {
+            idx >= 0 && idx + 2 < currentLines.size -> currentLines[idx + 2].fullText
+            idx == -1 && currentLines.size > 1 -> currentLines[1].fullText
+            else -> ""
+        }
+
+        AutoLyricsBridge.publish(
+            AutoLyricsState(
+                trackKey = currentTrackKey,
+                lineIndex = idx,
+                title = currentTitle,
+                artist = currentArtist,
+                durationMs = currentDurationMs,
+                positionMs = posMs,
+                isPlaying = isPlaying,
+                prev2 = prev2,
+                prev1 = prev1,
+                curr = currText,
+                next1 = next1,
+                next2 = next2,
+                cover = currentCover,
+                palette = currentPalette
+            )
+        )
+
+        if (isCarModeActive()) {
+            hidePhoneNotificationOnly()
+            return
         }
 
         if (!isForegroundStarted) {
             val notif = notifier.buildNotification(
                 title = currentTitle,
-                prevLyric = prev,
+                prevLyric = prev1,
                 currentLine = currLine,
                 nextLyric1 = next1,
                 cover = currentCover,
@@ -308,7 +332,7 @@ class BitChordListenerService : NotificationListenerService() {
             } catch (_: Exception) {
                 notifier.update(
                     title = currentTitle,
-                    prevLyric = prev,
+                    prevLyric = prev1,
                     currentLine = currLine,
                     nextLyric1 = next1,
                     cover = currentCover,
@@ -319,7 +343,7 @@ class BitChordListenerService : NotificationListenerService() {
         } else {
             notifier.update(
                 title = currentTitle,
-                prevLyric = prev,
+                prevLyric = prev1,
                 currentLine = currLine,
                 nextLyric1 = next1,
                 cover = currentCover,
@@ -342,7 +366,8 @@ class BitChordListenerService : NotificationListenerService() {
             unregisterReceiver(carModeReceiver)
         } catch (_: Exception) {
         }
-        suspendForCarMode()
+        AutoLyricsBridge.clear()
+        hidePhoneNotificationOnly()
         scope.cancel()
         super.onDestroy()
     }
