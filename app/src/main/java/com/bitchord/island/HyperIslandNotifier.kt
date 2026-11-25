@@ -34,12 +34,24 @@ class HyperIslandNotifier(private val context: Context) {
     companion object {
         const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
-        private const val MAX_STATIC_PILL_CHARS = 12
+        // Soglie in larghezza visiva reale (misurate con textSize = 100f)
+        private const val NORMAL_MAX_WIDTH = 680f
+        private const val NARROW_MAX_WIDTH = 880f
+        private const val TRAILING_JUNK_CHARS = "([{-–—/:,&+.|•"
     }
+
+    private data class PillLabel(
+        val text: String,
+        val useNarrowFont: Boolean
+    )
 
     private val manager = context.getSystemService(NotificationManager::class.java)
     private val playingSmallIcon: Icon
     private val pausedSmallIcon: Icon
+    private val pillMeasurePaint = Paint().apply {
+        textSize = 100f
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+    }
 
     private var cachedCoverRef: Bitmap? = null
     private var cachedDiscAccent: Int = 0
@@ -80,17 +92,93 @@ class HyperIslandNotifier(private val context: Context) {
         return text.replace(Regex("\\s+"), " ").trim()
     }
 
-    private fun buildStaticPillText(title: String, isPlaying: Boolean): String {
-        if (!isPlaying) return "In pausa"
-        val clean = cleanLine(title)
-        if (clean.isEmpty()) return "Lyrics"
-        if (clean.length <= MAX_STATIC_PILL_CHARS) return clean
-        val spaceCut = clean.lastIndexOf(' ', MAX_STATIC_PILL_CHARS)
-        return if (spaceCut >= 5) {
-            clean.substring(0, spaceCut).trimEnd()
-        } else {
-            clean.substring(0, MAX_STATIC_PILL_CHARS - 1).trimEnd() + "…"
+    private fun sanitizeTrailingJunk(text: String): String {
+        return text.trimEnd { it.isWhitespace() || it in TRAILING_JUNK_CHARS }
+    }
+
+    private fun simplifyTitleForPill(rawTitle: String): String {
+        val clean = cleanLine(rawTitle)
+            .replace(Regex("""^[🅴\s]+"""), "")
+            .replace(Regex("""^[\[\(]E[\]\)]\s*""", RegexOption.IGNORE_CASE), "")
+            .trim()
+        if (clean.isEmpty()) return ""
+
+        // Rimuove parti tra parentesi tonde/quadre (es. "(feat. ...)", "(Remix)") e parentesi rimaste aperte
+        val withoutParens = clean
+            .replace(Regex("""\s*[\(\[].*?[\)\]]"""), "")
+            .replace(Regex("""\s*[\(\[][^\)\]]*$"""), "")
+            .replace(Regex("""\s+(feat\.|ft\.|prod\.).*$""", RegexOption.IGNORE_CASE), "")
+            .trim()
+
+        var base = if (withoutParens.isNotEmpty()) withoutParens else clean
+
+        // Se supera ancora la larghezza normale, rimuove eventuali sottotitoli dopo " - "
+        if (pillMeasurePaint.measureText(base) > NORMAL_MAX_WIDTH) {
+            val beforeDash = base.substringBefore(" - ")
+                .substringBefore(" – ")
+                .substringBefore(" — ")
+                .trim()
+            if (beforeDash.isNotEmpty()) {
+                base = beforeDash
+            }
         }
+
+        val cleaned = sanitizeTrailingJunk(cleanLine(base))
+        return if (cleaned.isNotEmpty()) cleaned else clean
+    }
+
+    private fun truncateToVisualWidth(text: String, maxWidth: Float): String {
+        val ellipsis = "…"
+        val ellipsisWidth = pillMeasurePaint.measureText(ellipsis)
+        val targetWidth = (maxWidth - ellipsisWidth).coerceAtLeast(200f)
+
+        var end = text.length
+        while (end > 1 && pillMeasurePaint.measureText(text, 0, end) > targetWidth) {
+            end--
+        }
+        if (end < text.length && end > 1 && Character.isLowSurrogate(text[end])) {
+            end--
+        }
+
+        val rawSlice = text.substring(0, end)
+        val candidate = if (end < text.length && text[end].isWhitespace()) {
+            sanitizeTrailingJunk(rawSlice)
+        } else {
+            val lastSpace = rawSlice.lastIndexOf(' ')
+            val wordCandidate = if (lastSpace >= 3) {
+                sanitizeTrailingJunk(rawSlice.substring(0, lastSpace))
+            } else {
+                ""
+            }
+            if (wordCandidate.isNotEmpty() &&
+                pillMeasurePaint.measureText(wordCandidate) >= targetWidth * 0.52f
+            ) {
+                wordCandidate
+            } else {
+                sanitizeTrailingJunk(rawSlice)
+            }
+        }
+
+        return if (candidate.isNotEmpty()) "$candidate$ellipsis" else "Lyrics"
+    }
+
+    private fun buildStaticPillLabel(title: String, isPlaying: Boolean): PillLabel {
+        if (!isPlaying) return PillLabel("In pausa", useNarrowFont = false)
+        val base = simplifyTitleForPill(title)
+        if (base.isEmpty()) return PillLabel("Lyrics", useNarrowFont = false)
+
+        val width = pillMeasurePaint.measureText(base)
+        if (width <= NORMAL_MAX_WIDTH) {
+            return PillLabel(base, useNarrowFont = false)
+        }
+        if (width <= NARROW_MAX_WIDTH) {
+            return PillLabel(base, useNarrowFont = true)
+        }
+
+        return PillLabel(
+            text = truncateToVisualWidth(base, NARROW_MAX_WIDTH),
+            useNarrowFont = true
+        )
     }
 
     private fun resolveDisplayLines(
@@ -179,7 +267,11 @@ class HyperIslandNotifier(private val context: Context) {
         return rv
     }
 
-    private fun buildIslandJson(pillText: String, accentHex: String): JSONObject {
+    private fun buildIslandJson(
+        pillText: String,
+        useNarrowFont: Boolean,
+        accentHex: String
+    ): JSONObject {
         val bigIslandArea = JSONObject().apply {
             put(
                 "imageTextInfoLeft",
@@ -204,7 +296,7 @@ class HyperIslandNotifier(private val context: Context) {
                 "textInfo",
                 JSONObject().apply {
                     put("title", pillText)
-                    put("narrowFont", false)
+                    put("narrowFont", useNarrowFont)
                     put("showHighlightColor", false)
                 }
             )
@@ -240,8 +332,12 @@ class HyperIslandNotifier(private val context: Context) {
         }
     }
 
-    private fun buildFocusParamJson(pillText: String, accentHex: String): Pair<String, String> {
-        val islandJson = buildIslandJson(pillText, accentHex)
+    private fun buildFocusParamJson(
+        pillText: String,
+        useNarrowFont: Boolean,
+        accentHex: String
+    ): Pair<String, String> {
+        val islandJson = buildIslandJson(pillText, useNarrowFont, accentHex)
 
         val paramV2 = JSONObject().apply {
             put("protocol", 1)
@@ -283,7 +379,7 @@ class HyperIslandNotifier(private val context: Context) {
         palette: CoverPalette,
         isPlaying: Boolean
     ): Notification {
-        val pillText = buildStaticPillText(title, isPlaying)
+        val pillLabel = buildStaticPillLabel(title, isPlaying)
         val accentColor = boostAccentBrightness(palette.accent.toArgb())
         val accentHex = String.format("#%06X", 0xFFFFFF and accentColor)
 
@@ -300,7 +396,11 @@ class HyperIslandNotifier(private val context: Context) {
         val smallIcon = if (isPlaying) playingSmallIcon else pausedSmallIcon
 
         val expandedRv = buildExpandedRemoteViews(discBitmap, prevText, currText, nextText, accentColor)
-        val (focusJson, customFocusJson) = buildFocusParamJson(pillText, accentHex)
+        val (focusJson, customFocusJson) = buildFocusParamJson(
+            pillText = pillLabel.text,
+            useNarrowFont = pillLabel.useNarrowFont,
+            accentHex = accentHex
+        )
 
         val focusPics = Bundle().apply {
             putParcelable("miui.focus.pic_disc", discIcon)
@@ -318,7 +418,7 @@ class HyperIslandNotifier(private val context: Context) {
         return Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(smallIcon)
             .setLargeIcon(discBitmap)
-            .setContentTitle(pillText)
+            .setContentTitle(pillLabel.text)
             .setContentText(expandedBody)
             .setColor(accentColor)
             .setColorized(false)
