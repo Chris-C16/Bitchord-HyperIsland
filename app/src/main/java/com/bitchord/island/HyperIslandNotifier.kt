@@ -37,6 +37,7 @@ class HyperIslandNotifier(private val context: Context) {
     companion object {
         const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
+
         // Soglie in larghezza visiva reale (misurate con textSize = 100f)
         private const val NORMAL_MAX_WIDTH = 680f
         private const val NARROW_MAX_WIDTH = 880f
@@ -53,6 +54,14 @@ class HyperIslandNotifier(private val context: Context) {
             R.id.iv_disc_f8, R.id.iv_disc_f9, R.id.iv_disc_f10, R.id.iv_disc_f11,
             R.id.iv_disc_f12, R.id.iv_disc_f13, R.id.iv_disc_f14, R.id.iv_disc_f15
         )
+
+        // Regex pre-compilate una sola volta
+        private val REGEX_MULTI_SPACE = Regex("\\s+")
+        private val REGEX_LEADING_EXPLICIT_EMOJI = Regex("""^[🅴\s]+""")
+        private val REGEX_LEADING_EXPLICIT_TAG = Regex("""^[\[\(]E[\]\)]\s*""", RegexOption.IGNORE_CASE)
+        private val REGEX_PARENS = Regex("""\s*[\(\[].*?[\)\]]""")
+        private val REGEX_UNCLOSED_PAREN = Regex("""\s*[\(\[][^\)\]]*$""")
+        private val REGEX_FEAT = Regex("""\s+(feat\.|ft\.|prod\.).*$""", RegexOption.IGNORE_CASE)
     }
 
     private data class PillLabel(
@@ -68,14 +77,21 @@ class HyperIslandNotifier(private val context: Context) {
 
     private val manager = context.getSystemService(NotificationManager::class.java)
     private val powerManager = context.getSystemService(PowerManager::class.java)
+
     private val playingSmallIcon: Icon
     private val pausedSmallIcon: Icon
     private val playButtonBitmap: Bitmap
     private val pauseButtonBitmap: Bitmap
+    private val lyricsPendingIntent: PendingIntent
+    private val playPausePendingIntent: PendingIntent
+
     private val pillMeasurePaint = Paint().apply {
         textSize = 100f
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     }
+    private val bitmapFilterPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val rotateMatrix = Matrix()
+    private val hsvBuffer = FloatArray(3)
 
     private var cachedCoverRef: Bitmap? = null
     private var cachedDiscAccent: Int = 0
@@ -86,7 +102,12 @@ class HyperIslandNotifier(private val context: Context) {
     private var cachedPausedBase: Bitmap? = null
     private var cachedPausedDisc: Bitmap? = null
 
-    // Cache JSON HyperIsland (evita di ricostruire 6 JSONObject ad ogni verso)
+    // Cache label pillola (evita regex e measureText ad ogni cambio verso)
+    private var cachedPillTitle: String? = null
+    private var cachedPillPlaying: Boolean = false
+    private var cachedPillLabel: PillLabel? = null
+
+    // Cache JSON HyperIsland
     private var cachedFocusJsonKey: String = ""
     private var cachedFocusJsonPair: Pair<String, String>? = null
 
@@ -112,34 +133,29 @@ class HyperIslandNotifier(private val context: Context) {
         pausedSmallIcon = Icon.createWithBitmap(renderSmallPauseBitmap())
         playButtonBitmap = renderPlayButtonBitmap()
         pauseButtonBitmap = renderPauseButtonBitmap()
-    }
 
-    private fun createLyricsPendingIntent(): PendingIntent {
-        val openLyricsIntent = Intent(context, LyricsPlayerActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        return PendingIntent.getActivity(
+        lyricsPendingIntent = PendingIntent.getActivity(
             context,
             10,
-            openLyricsIntent,
+            Intent(context, LyricsPlayerActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-    }
 
-    private fun createPlayPausePendingIntent(): PendingIntent {
-        val toggleIntent = Intent(context, IslandPlaybackReceiver::class.java).apply {
-            action = IslandPlaybackReceiver.ACTION_TOGGLE_PLAYBACK
-        }
-        return PendingIntent.getBroadcast(
+        playPausePendingIntent = PendingIntent.getBroadcast(
             context,
             11,
-            toggleIntent,
+            Intent(context, IslandPlaybackReceiver::class.java).apply {
+                action = IslandPlaybackReceiver.ACTION_TOGGLE_PLAYBACK
+            },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
     }
 
     private fun cleanLine(text: String): String {
-        return text.replace(Regex("\\s+"), " ").trim()
+        if (text.isEmpty()) return ""
+        return text.replace(REGEX_MULTI_SPACE, " ").trim()
     }
 
     private fun sanitizeTrailingJunk(text: String): String {
@@ -148,21 +164,19 @@ class HyperIslandNotifier(private val context: Context) {
 
     private fun simplifyTitleForPill(rawTitle: String): String {
         val clean = cleanLine(rawTitle)
-            .replace(Regex("""^[🅴\s]+"""), "")
-            .replace(Regex("""^[\[\(]E[\]\)]\s*""", RegexOption.IGNORE_CASE), "")
+            .replace(REGEX_LEADING_EXPLICIT_EMOJI, "")
+            .replace(REGEX_LEADING_EXPLICIT_TAG, "")
             .trim()
         if (clean.isEmpty()) return ""
 
-        // Rimuove parti tra parentesi tonde/quadre (es. "(feat. ...)", "(Remix)") e parentesi rimaste aperte
         val withoutParens = clean
-            .replace(Regex("""\s*[\(\[].*?[\)\]]"""), "")
-            .replace(Regex("""\s*[\(\[][^\)\]]*$"""), "")
-            .replace(Regex("""\s+(feat\.|ft\.|prod\.).*$""", RegexOption.IGNORE_CASE), "")
+            .replace(REGEX_PARENS, "")
+            .replace(REGEX_UNCLOSED_PAREN, "")
+            .replace(REGEX_FEAT, "")
             .trim()
 
         var base = if (withoutParens.isNotEmpty()) withoutParens else clean
 
-        // Se supera ancora la larghezza normale, rimuove eventuali sottotitoli dopo " - "
         if (pillMeasurePaint.measureText(base) > NORMAL_MAX_WIDTH) {
             val beforeDash = base.substringBefore(" - ")
                 .substringBefore(" – ")
@@ -213,22 +227,34 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun buildStaticPillLabel(title: String, isPlaying: Boolean): PillLabel {
-        if (!isPlaying) return PillLabel("In pausa", useNarrowFont = false)
-        val base = simplifyTitleForPill(title)
-        if (base.isEmpty()) return PillLabel("Lyrics", useNarrowFont = false)
-
-        val width = pillMeasurePaint.measureText(base)
-        if (width <= NORMAL_MAX_WIDTH) {
-            return PillLabel(base, useNarrowFont = false)
-        }
-        if (width <= NARROW_MAX_WIDTH) {
-            return PillLabel(base, useNarrowFont = true)
+        val cached = cachedPillLabel
+        if (cached != null && cachedPillTitle == title && cachedPillPlaying == isPlaying) {
+            return cached
         }
 
-        return PillLabel(
-            text = truncateToVisualWidth(base, NARROW_MAX_WIDTH),
-            useNarrowFont = true
-        )
+        val label = if (!isPlaying) {
+            PillLabel("In pausa", useNarrowFont = false)
+        } else {
+            val base = simplifyTitleForPill(title)
+            if (base.isEmpty()) {
+                PillLabel("Lyrics", useNarrowFont = false)
+            } else {
+                val width = pillMeasurePaint.measureText(base)
+                when {
+                    width <= NORMAL_MAX_WIDTH -> PillLabel(base, useNarrowFont = false)
+                    width <= NARROW_MAX_WIDTH -> PillLabel(base, useNarrowFont = true)
+                    else -> PillLabel(
+                        text = truncateToVisualWidth(base, NARROW_MAX_WIDTH),
+                        useNarrowFont = true
+                    )
+                }
+            }
+        }
+
+        cachedPillTitle = title
+        cachedPillPlaying = isPlaying
+        cachedPillLabel = label
+        return label
     }
 
     private fun resolveDisplayLines(
@@ -334,7 +360,7 @@ class HyperIslandNotifier(private val context: Context) {
             R.id.btn_play_pause,
             if (isPlaying) pauseButtonBitmap else playButtonBitmap
         )
-        rv.setOnClickPendingIntent(R.id.btn_play_pause, createPlayPausePendingIntent())
+        rv.setOnClickPendingIntent(R.id.btn_play_pause, playPausePendingIntent)
 
         return rv
     }
@@ -451,27 +477,16 @@ class HyperIslandNotifier(private val context: Context) {
         return pair
     }
 
-    fun buildNotification(
-        title: String,
-        prevLyric: String,
-        currentLine: LyricLine?,
-        nextLyric1: String,
+    private fun buildNotificationInternal(
+        pillLabel: PillLabel,
+        accentColor: Int,
+        prevText: String,
+        currText: String,
+        nextText: String,
         cover: Bitmap?,
-        palette: CoverPalette,
         isPlaying: Boolean
     ): Notification {
-        val pillLabel = buildStaticPillLabel(title, isPlaying)
-        val accentColor = boostAccentBrightness(palette.accent.toArgb())
         val accentHex = String.format("#%06X", 0xFFFFFF and accentColor)
-
-        val (prevText, currText, nextText) = resolveDisplayLines(
-            prevLyric = prevLyric,
-            currentLine = currentLine,
-            nextLyric1 = nextLyric1,
-            title = title,
-            isPlaying = isPlaying
-        )
-
         val expandedBody = formatStyledExpandedLyrics(prevText, currText, nextText, accentColor)
         val vinyl = getOrCreateVinylAssets(cover, accentColor)
         val smallIcon = if (isPlaying) playingSmallIcon else pausedSmallIcon
@@ -515,9 +530,44 @@ class HyperIslandNotifier(private val context: Context) {
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .setContentIntent(createLyricsPendingIntent())
+            .setContentIntent(lyricsPendingIntent)
             .addExtras(extras)
             .build()
+    }
+
+    fun buildNotification(
+        title: String,
+        prevLyric: String,
+        currentLine: LyricLine?,
+        nextLyric1: String,
+        cover: Bitmap?,
+        palette: CoverPalette,
+        isPlaying: Boolean
+    ): Notification {
+        val pillLabel = buildStaticPillLabel(title, isPlaying)
+        val accentColor = boostAccentBrightness(palette.accent.toArgb())
+        val (prevText, currText, nextText) = resolveDisplayLines(
+            prevLyric = prevLyric,
+            currentLine = currentLine,
+            nextLyric1 = nextLyric1,
+            title = title,
+            isPlaying = isPlaying
+        )
+
+        val coverId = System.identityHashCode(cover)
+        val trackStateKey = "${pillLabel.text}|$isPlaying|$accentColor|$coverId"
+        lastTrackStateKey = trackStateKey
+        lastFullStateKey = "$trackStateKey|$prevText|$currText|$nextText"
+
+        return buildNotificationInternal(
+            pillLabel = pillLabel,
+            accentColor = accentColor,
+            prevText = prevText,
+            currText = currText,
+            nextText = nextText,
+            cover = cover,
+            isPlaying = isPlaying
+        )
     }
 
     fun update(
@@ -543,10 +593,8 @@ class HyperIslandNotifier(private val context: Context) {
         val trackStateKey = "${pillLabel.text}|$isPlaying|$accentColor|$coverId"
         val fullStateKey = "$trackStateKey|$prevText|$currText|$nextText"
 
-        // Evita notifiche duplicate sulla stessa riga
         if (fullStateKey == lastFullStateKey) return
 
-        // A schermo spento aggiorna solo se cambia brano/stato play (per AOD), saltando i cambi verso
         val isScreenOn = powerManager?.isInteractive ?: true
         if (!isScreenOn && trackStateKey == lastTrackStateKey) return
 
@@ -555,13 +603,13 @@ class HyperIslandNotifier(private val context: Context) {
 
         manager.notify(
             NOTIFICATION_ID,
-            buildNotification(
-                title = title,
-                prevLyric = prevLyric,
-                currentLine = currentLine,
-                nextLyric1 = nextLyric1,
+            buildNotificationInternal(
+                pillLabel = pillLabel,
+                accentColor = accentColor,
+                prevText = prevText,
+                currText = currText,
+                nextText = nextText,
                 cover = cover,
-                palette = palette,
                 isPlaying = isPlaying
             )
         )
@@ -574,14 +622,13 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun boostAccentBrightness(color: Int): Int {
-        val hsv = FloatArray(3)
-        Color.colorToHSV(color, hsv)
-        if (hsv[1] < 0.14f) {
+        Color.colorToHSV(color, hsvBuffer)
+        if (hsvBuffer[1] < 0.14f) {
             return Color.rgb(228, 236, 255)
         }
-        hsv[2] = hsv[2].coerceAtLeast(0.92f)
-        hsv[1] = hsv[1].coerceIn(0.40f, 0.85f)
-        return Color.HSVToColor(255, hsv)
+        hsvBuffer[2] = hsvBuffer[2].coerceAtLeast(0.92f)
+        hsvBuffer[1] = hsvBuffer[1].coerceIn(0.40f, 0.85f)
+        return Color.HSVToColor(255, hsvBuffer)
     }
 
     private fun getOrCreateVinylAssets(cover: Bitmap?, accentColor: Int): VinylAssets {
@@ -629,13 +676,11 @@ class HyperIslandNotifier(private val context: Context) {
     private fun renderRotatedDisc(baseDisc: Bitmap, targetSize: Int, degrees: Float): Bitmap {
         val out = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
-        val matrix = Matrix().apply {
-            val scale = targetSize.toFloat() / baseDisc.width.toFloat()
-            postScale(scale, scale)
-            postRotate(degrees, targetSize / 2f, targetSize / 2f)
-        }
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        canvas.drawBitmap(baseDisc, matrix, paint)
+        val scale = targetSize.toFloat() / baseDisc.width.toFloat()
+        rotateMatrix.reset()
+        rotateMatrix.postScale(scale, scale)
+        rotateMatrix.postRotate(degrees, targetSize / 2f, targetSize / 2f)
+        canvas.drawBitmap(baseDisc, rotateMatrix, bitmapFilterPaint)
         return out
     }
 
@@ -716,7 +761,6 @@ class HyperIslandNotifier(private val context: Context) {
             strokeJoin = Paint.Join.ROUND
             strokeCap = Paint.Cap.ROUND
         }
-        // Leggermente spostato a destra per centratura ottica dentro il cerchio
         val path = Path().apply {
             moveTo(size * 0.34f, size * 0.22f)
             lineTo(size * 0.76f, size * 0.50f)
@@ -786,8 +830,9 @@ class HyperIslandNotifier(private val context: Context) {
         val cy = size / 2f
         val leftX = size / 2f - gap / 2f - barW
         val rightX = size / 2f + gap / 2f
-        canvas.drawRoundRect(RectF(leftX, cy - barH / 2f, leftX + barW, cy + barH / 2f), barW / 2f, barW / 2f, paint)
-        canvas.drawRoundRect(RectF(rightX, cy - barH / 2f, rightX + barW, cy + barH / 2f), barW / 2f, barW / 2f, paint)
+        val radius = barW / 2f
+        canvas.drawRoundRect(RectF(leftX, cy - barH / 2f, leftX + barW, cy + barH / 2f), radius, radius, paint)
+        canvas.drawRoundRect(RectF(rightX, cy - barH / 2f, rightX + barW, cy + barH / 2f), radius, radius, paint)
         return bmp
     }
 }
