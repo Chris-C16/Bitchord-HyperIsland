@@ -23,8 +23,12 @@ import kotlinx.coroutines.*
 class BitChordListenerService : NotificationListenerService() {
 
     companion object {
-        private const val TICK_INTERVAL_MS = 120L
-        private const val MIN_LINE_INTERVAL_MS = 120L
+        private const val MIN_TICK_DELAY_MS = 40L
+        private const val MAX_TICK_DELAY_MS = 450L
+        private const val MIN_LINE_INTERVAL_MS = 100L
+        private const val BACKWARD_JITTER_GUARD_MS = 1400L
+        private const val FORWARD_JITTER_GUARD_MS = 220L
+        private const val LINE_HYSTERESIS_MS = 1500L
 
         @Volatile
         private var instance: BitChordListenerService? = null
@@ -70,11 +74,14 @@ class BitChordListenerService : NotificationListenerService() {
     private var currentArtist = ""
     private var currentDurationMs = 0L
     private var currentCover: Bitmap? = null
+    private var currentCoverSig = 0L
     private var currentPalette = CoverPalette()
     private var currentLines: List<LyricLine> = emptyList()
 
+    private var lastLineIndex = -1
     private var lastRenderKey = ""
     private var lastNotifyRealtimeMs = 0L
+    private var userSeekGraceUntilMs = 0L
 
     private val carModeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -97,6 +104,7 @@ class BitChordListenerService : NotificationListenerService() {
                 if (playing) {
                     lastRenderKey = ""
                     syncLyrics(isPlaying = true, forceImmediate = true)
+                    scheduleNextTick()
                 }
             }
         }
@@ -106,7 +114,7 @@ class BitChordListenerService : NotificationListenerService() {
         override fun run() {
             if (!isTicking) return
             syncLyrics(isPlaying = true, forceImmediate = false)
-            handler.postDelayed(this, TICK_INTERVAL_MS)
+            scheduleNextTick()
         }
     }
 
@@ -120,21 +128,25 @@ class BitChordListenerService : NotificationListenerService() {
         }
 
         override fun onPlaybackStateChanged(state: PlaybackState?) {
-            syncPlaybackClock(state)
+            val clockChanged = syncPlaybackClock(state, forceSync = false)
             val playing = state?.state == PlaybackState.STATE_PLAYING
-            wearBridge.publishPlayback(
-                trackKey = currentTrackKey,
-                isPlaying = playing,
-                positionMs = LyricsPlaybackStore.currentPositionMs(),
-                speed = LyricsPlaybackStore.speed.value
-            )
-            lastRenderKey = ""
+            if (clockChanged) {
+                wearBridge.publishPlayback(
+                    trackKey = currentTrackKey,
+                    isPlaying = playing,
+                    positionMs = LyricsPlaybackStore.currentPositionMs(),
+                    speed = LyricsPlaybackStore.speed.value
+                )
+            }
             if (playing) {
-                handleMetadata(activeController?.metadata)
+                if (currentTitle.isBlank()) {
+                    handleMetadata(activeController?.metadata)
+                }
                 startTicker()
-                syncLyrics(isPlaying = true, forceImmediate = true)
+                syncLyrics(isPlaying = true, forceImmediate = clockChanged)
             } else {
                 stopTicker()
+                lastRenderKey = ""
                 syncLyrics(isPlaying = false, forceImmediate = true)
             }
         }
@@ -184,7 +196,23 @@ class BitChordListenerService : NotificationListenerService() {
             activeController?.transportControls?.skipToPrevious()
         }
         LyricsPlaybackStore.onSeekTo = { posMs ->
-            activeController?.transportControls?.seekTo(posMs)
+            val targetPos = posMs.coerceAtLeast(0L)
+            userSeekGraceUntilMs = SystemClock.elapsedRealtime() + 1600L
+            LyricsPlaybackStore.basePositionMs.value = targetPos
+            LyricsPlaybackStore.baseRealtimeMs.value = SystemClock.elapsedRealtime()
+            lastLineIndex = -1
+            lastRenderKey = ""
+            activeController?.transportControls?.seekTo(targetPos)
+            val playing = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+            wearBridge.publishPlayback(
+                trackKey = currentTrackKey,
+                isPlaying = playing,
+                positionMs = targetPos,
+                speed = LyricsPlaybackStore.speed.value,
+                force = true
+            )
+            syncLyrics(isPlaying = playing, forceImmediate = true)
+            if (playing) scheduleNextTick()
         }
 
         refreshActiveSessions()
@@ -246,7 +274,7 @@ class BitChordListenerService : NotificationListenerService() {
         if (target?.sessionToken == activeController?.sessionToken) {
             if (target != null) {
                 handleMetadata(target.metadata)
-                syncPlaybackClock(target.playbackState)
+                syncPlaybackClock(target.playbackState, forceSync = false)
                 val playing = target.playbackState?.state == PlaybackState.STATE_PLAYING
                 if (playing) {
                     startTicker()
@@ -262,14 +290,16 @@ class BitChordListenerService : NotificationListenerService() {
 
         if (target != null) {
             lastRenderKey = ""
+            lastLineIndex = -1
             handleMetadata(target.metadata)
-            syncPlaybackClock(target.playbackState)
+            syncPlaybackClock(target.playbackState, forceSync = true)
             val playing = target.playbackState?.state == PlaybackState.STATE_PLAYING
             wearBridge.publishPlayback(
                 trackKey = currentTrackKey,
                 isPlaying = playing,
                 positionMs = LyricsPlaybackStore.currentPositionMs(),
-                speed = LyricsPlaybackStore.speed.value
+                speed = LyricsPlaybackStore.speed.value,
+                force = true
             )
             if (playing) {
                 startTicker()
@@ -286,14 +316,77 @@ class BitChordListenerService : NotificationListenerService() {
         }
     }
 
-    private fun syncPlaybackClock(state: PlaybackState?) {
-        state ?: return
+    private fun rawExtrapolatedPositionMs(now: Long): Long {
+        val basePos = LyricsPlaybackStore.basePositionMs.value
+        if (!LyricsPlaybackStore.isPlaying.value) return basePos
+        val elapsed = (now - LyricsPlaybackStore.baseRealtimeMs.value).coerceAtLeast(0L)
+        return basePos + (elapsed * LyricsPlaybackStore.speed.value).toLong()
+    }
+
+    /**
+     * Aggiorna il clock interno ignorando i micro-rimbalzi all'indietro del PlaybackState
+     * durante la riproduzione continua (causa principale del salto indietro di 1 riga).
+     * Restituisce true se lo stato è effettivamente cambiato in modo significativo.
+     */
+    private fun syncPlaybackClock(state: PlaybackState?, forceSync: Boolean): Boolean {
+        state ?: return false
+        val now = SystemClock.elapsedRealtime()
+        val wasPlaying = LyricsPlaybackStore.isPlaying.value
         val playing = state.state == PlaybackState.STATE_PLAYING
+        val incomingSpeed = if (state.playbackSpeed > 0f) state.playbackSpeed else 1f
+        val incomingRealtime = if (state.lastPositionUpdateTime in 1L..now) {
+            state.lastPositionUpdateTime
+        } else {
+            now
+        }
+        val incomingPosNow = if (playing) {
+            state.position + ((now - incomingRealtime) * incomingSpeed).toLong()
+        } else {
+            state.position
+        }.coerceAtLeast(0L)
+
+        val inUserSeekGrace = now <= userSeekGraceUntilMs
+
+        if (!forceSync && !inUserSeekGrace && wasPlaying && playing) {
+            val currentRawNow = rawExtrapolatedPositionMs(now)
+            val delta = incomingPosNow - currentRawNow
+            if (delta in -BACKWARD_JITTER_GUARD_MS..FORWARD_JITTER_GUARD_MS) {
+                if (LyricsPlaybackStore.speed.value != incomingSpeed) {
+                    LyricsPlaybackStore.basePositionMs.value = currentRawNow
+                    LyricsPlaybackStore.baseRealtimeMs.value = now
+                    LyricsPlaybackStore.speed.value = incomingSpeed
+                    return true
+                }
+                return false
+            }
+            if (delta < -BACKWARD_JITTER_GUARD_MS) {
+                lastLineIndex = -1
+            }
+        }
+
         LyricsPlaybackStore.isPlaying.value = playing
-        LyricsPlaybackStore.basePositionMs.value = state.position
-        LyricsPlaybackStore.baseRealtimeMs.value =
-            if (state.lastPositionUpdateTime > 0L) state.lastPositionUpdateTime else SystemClock.elapsedRealtime()
-        LyricsPlaybackStore.speed.value = if (state.playbackSpeed > 0f) state.playbackSpeed else 1f
+        LyricsPlaybackStore.basePositionMs.value = incomingPosNow
+        LyricsPlaybackStore.baseRealtimeMs.value = now
+        LyricsPlaybackStore.speed.value = incomingSpeed
+        return true
+    }
+
+    private fun quickCoverSignature(bmp: Bitmap): Long {
+        if (bmp.isRecycled || bmp.width <= 0 || bmp.height <= 0) return 0L
+        val w = bmp.width
+        val h = bmp.height
+        var hash = (w.toLong() shl 32) xor h.toLong()
+        val pts = arrayOf(
+            w / 2 to h / 2,
+            w / 4 to h / 4,
+            (w * 3) / 4 to h / 4,
+            w / 4 to (h * 3) / 4,
+            (w * 3) / 4 to (h * 3) / 4
+        )
+        for ((x, y) in pts) {
+            hash = hash * 31L + bmp.getPixel(x.coerceIn(0, w - 1), y.coerceIn(0, h - 1)).toLong()
+        }
+        return hash
     }
 
     private fun pushTrackToWear() {
@@ -314,11 +407,11 @@ class BitChordListenerService : NotificationListenerService() {
         val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty().trim()
         val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty().trim()
         val durationMs = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
-        val cover = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-            ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
 
         if (title.isBlank()) return
         val key = "$title|$artist"
+        val isNewTrack = key != currentTrackKey
+
         currentTitle = title
         currentArtist = artist
         if (durationMs > 0L) {
@@ -329,29 +422,40 @@ class BitChordListenerService : NotificationListenerService() {
         LyricsPlaybackStore.title.value = title
         LyricsPlaybackStore.artist.value = artist
 
-        if (cover != null && cover !== currentCover) {
-            currentCover = cover
-            LyricsPlaybackStore.cover.value = cover
-            paletteJob?.cancel()
-            paletteJob = scope.launch {
-                val extracted = withContext(Dispatchers.Default) {
-                    LyricsRepository.extractPalette(cover)
+        val cover = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+
+        if (cover != null && !cover.isRecycled) {
+            val sig = quickCoverSignature(cover)
+            if (isNewTrack || sig != currentCoverSig || currentCover == null) {
+                currentCover = cover
+                currentCoverSig = sig
+                LyricsPlaybackStore.cover.value = cover
+                paletteJob?.cancel()
+                paletteJob = scope.launch {
+                    val extracted = withContext(Dispatchers.Default) {
+                        LyricsRepository.extractPalette(cover)
+                    }
+                    currentPalette = extracted
+                    LyricsPlaybackStore.palette.value = extracted
+                    pushTrackToWear()
+                    lastRenderKey = ""
+                    val stillPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+                    syncLyrics(isPlaying = stillPlaying, forceImmediate = true)
                 }
-                currentPalette = extracted
-                LyricsPlaybackStore.palette.value = extracted
-                pushTrackToWear()
-                lastRenderKey = ""
-                val stillPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
-                syncLyrics(isPlaying = stillPlaying, forceImmediate = true)
             }
         }
 
-        if (key != currentTrackKey || (currentLines.isEmpty() && fetchJob?.isActive != true)) {
+        if (isNewTrack || (currentLines.isEmpty() && fetchJob?.isActive != true)) {
             currentTrackKey = key
             currentLines = emptyList()
+            lastLineIndex = -1
             LyricsPlaybackStore.lines.value = emptyList()
             LyricsPlaybackStore.syncOffsetMs.value = 0L
             lastRenderKey = ""
+            if (isNewTrack) {
+                syncPlaybackClock(activeController?.playbackState, forceSync = true)
+            }
             pushTrackToWear()
 
             fetchJob?.cancel()
@@ -362,16 +466,18 @@ class BitChordListenerService : NotificationListenerService() {
                     currentDurationMs / 1000L
                 )
                 currentLines = loaded
+                lastLineIndex = -1
                 LyricsPlaybackStore.lines.value = loaded
                 pushTrackToWear()
                 lastRenderKey = ""
-                syncPlaybackClock(activeController?.playbackState)
+                syncPlaybackClock(activeController?.playbackState, forceSync = true)
                 val stillPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
                 wearBridge.publishPlayback(
                     trackKey = currentTrackKey,
                     isPlaying = stillPlaying,
                     positionMs = LyricsPlaybackStore.currentPositionMs(),
-                    speed = LyricsPlaybackStore.speed.value
+                    speed = LyricsPlaybackStore.speed.value,
+                    force = true
                 )
                 syncLyrics(isPlaying = stillPlaying, forceImmediate = true)
                 if (stillPlaying) startTicker()
@@ -380,10 +486,8 @@ class BitChordListenerService : NotificationListenerService() {
     }
 
     private fun startTicker() {
-        if (isTicking) return
         isTicking = true
-        handler.removeCallbacks(tickRunnable)
-        handler.post(tickRunnable)
+        scheduleNextTick()
     }
 
     private fun stopTicker() {
@@ -391,21 +495,67 @@ class BitChordListenerService : NotificationListenerService() {
         handler.removeCallbacks(tickRunnable)
     }
 
+    private fun scheduleNextTick() {
+        handler.removeCallbacks(tickRunnable)
+        if (!isTicking) return
+        val posMs = LyricsPlaybackStore.currentPositionMs()
+        val nextIdx = findLineIndex(currentLines, posMs) + 1
+        val delayMs = if (nextIdx in currentLines.indices) {
+            val speed = LyricsPlaybackStore.speed.value.coerceAtLeast(0.25f)
+            val remainingMs = ((currentLines[nextIdx].startMs - posMs) / speed).toLong()
+            remainingMs.coerceIn(MIN_TICK_DELAY_MS, MAX_TICK_DELAY_MS)
+        } else {
+            MAX_TICK_DELAY_MS
+        }
+        handler.postDelayed(tickRunnable, delayMs)
+    }
+
+    private fun findLineIndex(lines: List<LyricLine>, posMs: Long): Int {
+        var low = 0
+        var high = lines.lastIndex
+        var ans = -1
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (lines[mid].startMs <= posMs) {
+                ans = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return ans
+    }
+
     private fun syncLyrics(isPlaying: Boolean, forceImmediate: Boolean) {
         if (currentTitle.isBlank()) return
 
+        val now = SystemClock.elapsedRealtime()
         val posMs = LyricsPlaybackStore.currentPositionMs()
-        val idx = if (currentLines.isEmpty()) -1 else currentLines.indexOfLast { posMs >= it.startMs }
-        val currLine = if (idx >= 0) currentLines[idx] else null
+        var idx = if (currentLines.isEmpty()) -1 else findLineIndex(currentLines, posMs)
+
+        // Isteresi: evita di tornare indietro di 1 riga per micro-ritardi di clock
+        if (
+            isPlaying &&
+            now > userSeekGraceUntilMs &&
+            lastLineIndex in currentLines.indices &&
+            idx < lastLineIndex
+        ) {
+            val lagBelowCurrentLine = currentLines[lastLineIndex].startMs - posMs
+            if (lagBelowCurrentLine in 0L..LINE_HYSTERESIS_MS) {
+                idx = lastLineIndex
+            }
+        }
+
+        val currLine = if (idx in currentLines.indices) currentLines[idx] else null
 
         val renderKey = "$currentTrackKey|$idx|$isPlaying"
         if (renderKey == lastRenderKey) return
 
-        val now = SystemClock.elapsedRealtime()
         if (!forceImmediate && isForegroundStarted && now - lastNotifyRealtimeMs < MIN_LINE_INTERVAL_MS) {
             return
         }
 
+        lastLineIndex = idx
         lastRenderKey = renderKey
         lastNotifyRealtimeMs = now
 
