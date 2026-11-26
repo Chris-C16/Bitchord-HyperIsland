@@ -1,44 +1,77 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Base scura profonda -->
-    <path
-        android:fillColor="#0E0D1B"
-        android:pathData="M0,0h108v108h-108z" />
+    <!-- Sfondo scuro profondo con gradiente obliquo -->
+    <path android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="10"
+                android:startY="6"
+                android:endX="98"
+                android:endY="102">
+                <item android:color="#FF1C163A" android:offset="0.0" />
+                <item android:color="#FF0E0C1D" android:offset="0.52" />
+                <item android:color="#FF07070E" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
 
-    <!-- Alone morbido centrale -->
-    <path
-        android:fillColor="#287C3AED"
-        android:pathData="M54,18a36,36 0 1,0 0,72a36,36 0 1,0 0,-72z" />
+    <!-- Bagliore morbido dietro la bolla -->
+    <path android:pathData="M54,18a36,36 0 1,0 0,72a36,36 0 1,0 0,-72z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="54"
+                android:centerY="52"
+                android:gradientRadius="36">
+                <item android:color="#55E11D48" android:offset="0.0" />
+                <item android:color="#266366F1" android:offset="0.55" />
+                <item android:color="#0007070E" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
 
-    <!-- Piastra Liquid Glass centrale -->
-    <path
-        android:fillColor="#22FFFFFF"
-        android:pathData="M30,22h48a8,8 0 0,1 8,8v48a8,8 0 0,1 -8,8h-48a8,8 0 0,1 -8,-8v-48a8,8 0 0,1 8,-8z" />
+    <!-- Bolla testi luminosa (stile Apple Music Lyrics) -->
+    <path android:pathData="M26,42 A14,14 0 0,1 40,28 L68,28 A14,14 0 0,1 82,42 L82,59 A14,14 0 0,1 68,73 L42,73 C37.5,77.5 32.5,79.5 29,78.5 C31,75.5 31.2,72 30.1,68.9 A14,14 0 0,1 26,59 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="26"
+                android:startY="28"
+                android:endX="82"
+                android:endY="76">
+                <item android:color="#FFFF4D7D" android:offset="0.0" />
+                <item android:color="#FFC026D3" android:offset="0.52" />
+                <item android:color="#FF6366F1" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Riflesso speculare sottile sul bordo superiore della bolla -->
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#55FFFFFF"
+        android:strokeColor="#66FFFFFF"
         android:strokeWidth="1.2"
-        android:pathData="M30,22.6h48a7.4,7.4 0 0,1 7.4,7.4v48a7.4,7.4 0 0,1 -7.4,7.4h-48a7.4,7.4 0 0,1 -7.4,-7.4v-48a7.4,7.4 0 0,1 7.4,-7.4z" />
+        android:pathData="M26.6,42 A13.4,13.4 0 0,1 40,28.6 L68,28.6 A13.4,13.4 0 0,1 81.4,42 L81.4,59 A13.4,13.4 0 0,1 68,72.4 L42,72.4 C37.8,76.6 33.2,78.5 30,77.8 C31.7,75 31.8,71.9 30.7,68.7 A13.4,13.4 0 0,1 26.6,59 Z" />
 
-    <!-- 5 barre onda sonora Liquid Glass -->
+    <!-- Riga 1 (verso precedente, semitrasparente) -->
     <path
-        android:fillColor="#38BDF8"
-        android:pathData="M31,47a3,3 0 0,1 6,0v14a3,3 0 0,1 -6,0z" />
+        android:fillColor="#8CFFFFFF"
+        android:pathData="M39.5,39 h19 a2.5,2.5 0 0,1 0,5 h-19 a2.5,2.5 0 0,1 0,-5 z" />
+
+    <!-- Riga 2 (verso attivo, bianco pieno) -->
     <path
-        android:fillColor="#818CF8"
-        android:pathData="M41,38a3,3 0 0,1 6,0v32a3,3 0 0,1 -6,0z" />
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M40,48 h28 a3,3 0 0,1 0,6 h-28 a3,3 0 0,1 0,-6 z" />
+
+    <!-- Riga 3 (verso successivo, semitrasparente) -->
     <path
-        android:fillColor="#F472B6"
-        android:pathData="M51,32a3,3 0 0,1 6,0v44a3,3 0 0,1 -6,0z" />
-    <path
-        android:fillColor="#A78BFA"
-        android:pathData="M61,39a3,3 0 0,1 6,0v30a3,3 0 0,1 -6,0z" />
-    <path
-        android:fillColor="#22D3EE"
-        android:pathData="M71,47a3,3 0 0,1 6,0v14a3,3 0 0,1 -6,0z" />
+        android:fillColor="#73FFFFFF"
+        android:pathData="M39.5,58 h13 a2.5,2.5 0 0,1 0,5 h-13 a2.5,2.5 0 0,1 0,-5 z" />
 </vector>
