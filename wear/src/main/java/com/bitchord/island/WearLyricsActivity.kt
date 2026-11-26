@@ -1,12 +1,12 @@
 package com.bitchord.island
 
+import android.graphics.Bitmap
 import android.graphics.Typeface
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -42,12 +42,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -94,6 +95,22 @@ class WearLyricsActivity : ComponentActivity() {
         super.onResume()
         WearSyncRepository.requestSyncFromPhone()
     }
+}
+
+private fun findWearLineIndex(lines: List<WearLyricLine>, posMs: Long): Int {
+    var low = 0
+    var high = lines.lastIndex
+    var ans = -1
+    while (low <= high) {
+        val mid = (low + high) ushr 1
+        if (lines[mid].startMs <= posMs) {
+            ans = mid
+            low = mid + 1
+        } else {
+            high = mid - 1
+        }
+    }
+    return ans
 }
 
 @Composable
@@ -151,27 +168,57 @@ private fun WearLyricsScreen() {
     val phoneConnected by WearSyncRepository.phoneConnected.collectAsState()
     val comfortaa = rememberComfortaaFamily()
 
-    var activeIndex by remember { mutableIntStateOf(-1) }
+    var activeIndex by remember(trackState.trackKey) { mutableIntStateOf(-1) }
     var showControls by remember { mutableStateOf(false) }
 
-    // Orologio locale a 60 FPS fluidi quando il brano è in riproduzione
+    // Sfondo sfocato a costo GPU quasi zero: pre-ridimensiona una volta la cover a 18x18
+    val softCover = remember(trackState.cover) {
+        val bmp = trackState.cover
+        if (bmp != null && !bmp.isRecycled && bmp.width > 0 && bmp.height > 0) {
+            try {
+                Bitmap.createScaledBitmap(bmp, 18, 18, true).asImageBitmap()
+            } catch (_: Throwable) {
+                null
+            }
+        } else {
+            null
+        }
+    }
+
+    // Orologio locale con risveglio dinamico sul prossimo verso + isteresi anti-rimbalzo
     LaunchedEffect(trackState.trackKey, trackState.lines, isPlaying) {
-        if (trackState.lines.isEmpty()) {
+        val lines = trackState.lines
+        if (lines.isEmpty()) {
             activeIndex = -1
             return@LaunchedEffect
         }
         while (true) {
             val pos = WearSyncRepository.currentPositionMs()
-            val idx = trackState.lines.indexOfLast { pos >= it.startMs }
+            var idx = findWearLineIndex(lines, pos)
+
+            if (isPlaying && activeIndex in lines.indices && idx < activeIndex) {
+                val lagMs = lines[activeIndex].startMs - pos
+                if (lagMs in 0L..1500L) {
+                    idx = activeIndex
+                }
+            }
+
             if (idx != activeIndex) {
                 activeIndex = idx
             }
             if (!isPlaying) break
-            delay(80L)
+
+            val nextIdx = idx + 1
+            val waitMs = if (nextIdx in lines.indices) {
+                val spd = WearSyncRepository.speed.value.coerceAtLeast(0.25f)
+                ((lines[nextIdx].startMs - pos) / spd).toLong().coerceIn(40L, 350L)
+            } else {
+                350L
+            }
+            delay(waitMs)
         }
     }
 
-    // Nasconde automaticamente l'overlay dei controlli dopo 3,5 secondi
     LaunchedEffect(showControls) {
         if (showControls) {
             delay(3500L)
@@ -189,6 +236,14 @@ private fun WearLyricsScreen() {
     val bgTop = Color(trackState.bgTopColor)
     val bgBottom = Color(trackState.bgBottomColor)
     val accent = Color(trackState.accentColor)
+    val edgeFadeBrush = remember {
+        Brush.verticalGradient(
+            0.0f to Color.Transparent,
+            0.18f to Color.Black,
+            0.82f to Color.Black,
+            1.0f to Color.Transparent
+        )
+    }
 
     Scaffold(
         timeText = {
@@ -206,35 +261,31 @@ private fun WearLyricsScreen() {
                     showControls = !showControls
                 }
         ) {
-            // Sfondo copertina fortemente sfocato stile Apple Music / BitChord
-            val coverBmp = trackState.cover
-            if (coverBmp != null && !coverBmp.isRecycled) {
+            if (softCover != null) {
                 Image(
-                    bitmap = coverBmp.asImageBitmap(),
+                    bitmap = softCover,
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
+                    filterQuality = FilterQuality.High,
                     modifier = Modifier
                         .fillMaxSize()
-                        .blur(34.dp)
-                        .alpha(0.68f)
+                        .alpha(0.72f)
                 )
             }
 
-            // Vignettatura scura per leggere bene su schermo tondo AMOLED
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(
                         Brush.radialGradient(
                             colors = listOf(
-                                Color.Black.copy(alpha = 0.25f),
+                                Color.Black.copy(alpha = 0.24f),
                                 Color.Black.copy(alpha = 0.72f)
                             )
                         )
                     )
             )
 
-            // Contenuto principale: attesa brano / testo non sincronizzato / versi live
             if (trackState.title.isBlank()) {
                 Column(
                     modifier = Modifier
@@ -302,7 +353,6 @@ private fun WearLyricsScreen() {
                     )
                 }
             } else {
-                // Lista versi con sfocatura di profondità sui versi lontani + dissolvenza ai bordi
                 ScalingLazyColumn(
                     state = listState,
                     contentPadding = PaddingValues(
@@ -315,6 +365,10 @@ private fun WearLyricsScreen() {
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                        .drawWithContent {
+                            drawContent()
+                            drawRect(brush = edgeFadeBrush, blendMode = BlendMode.DstIn)
+                        }
                 ) {
                     itemsIndexed(
                         items = trackState.lines,
@@ -327,31 +381,21 @@ private fun WearLyricsScreen() {
                         }
                         val isCurrent = distance == 0
 
-                        val targetBlur = when (distance) {
-                            0 -> 0.dp
-                            1 -> 1.1.dp
-                            else -> 2.4.dp
-                        }
                         val targetAlpha = when (distance) {
                             0 -> 1f
-                            1 -> 0.56f
-                            else -> 0.30f
+                            1 -> 0.54f
+                            else -> 0.26f
                         }
-                        val targetScale = if (isCurrent) 1.04f else 0.96f
+                        val targetScale = if (isCurrent) 1.05f else 0.94f
 
-                        val blurDp by animateDpAsState(
-                            targetValue = targetBlur,
-                            animationSpec = tween(260, easing = FastOutSlowInEasing),
-                            label = "lyricBlur"
-                        )
                         val alpha by animateFloatAsState(
                             targetValue = targetAlpha,
-                            animationSpec = tween(260, easing = FastOutSlowInEasing),
+                            animationSpec = tween(220, easing = FastOutSlowInEasing),
                             label = "lyricAlpha"
                         )
                         val scale by animateFloatAsState(
                             targetValue = targetScale,
-                            animationSpec = tween(260, easing = FastOutSlowInEasing),
+                            animationSpec = tween(220, easing = FastOutSlowInEasing),
                             label = "lyricScale"
                         )
 
@@ -370,7 +414,6 @@ private fun WearLyricsScreen() {
                                     scaleX = scale
                                     scaleY = scale
                                 }
-                                .then(if (blurDp > 0.dp) Modifier.blur(blurDp) else Modifier)
                                 .clickable {
                                     WearSyncRepository.sendSeekTo(line.startMs)
                                     activeIndex = index
@@ -380,20 +423,6 @@ private fun WearLyricsScreen() {
                     }
                 }
 
-                // Dissolvenza morbida in alto e in basso stile Apple Music
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    drawRect(
-                        brush = Brush.verticalGradient(
-                            0.0f to Color.Black.copy(alpha = 0.78f),
-                            0.18f to Color.Transparent,
-                            0.82f to Color.Transparent,
-                            1.0f to Color.Black.copy(alpha = 0.82f)
-                        ),
-                        blendMode = BlendMode.DstOut
-                    )
-                }
-
-                // Pillola titolo/artista in alto sotto l'ora
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -413,7 +442,6 @@ private fun WearLyricsScreen() {
                 }
             }
 
-            // Controlli Play / Pausa / Avanti / Indietro in stile glass al tap sullo schermo
             AnimatedVisibility(
                 visible = showControls && trackState.title.isNotBlank(),
                 enter = fadeIn(tween(180)),
