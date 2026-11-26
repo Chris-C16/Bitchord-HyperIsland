@@ -69,10 +69,8 @@ class BitChordListenerService : NotificationListenerService() {
         }
 
         private fun launchOrResumePreferredApp(context: Context) {
-            val preferred = AppPreferences.preferredPlayer.value
-            val pkg = AppPreferences.getRememberedPackageFor(context, preferred) ?: return
+            val pkg = AppPreferences.getLaunchTargetPackage(context) ?: return
             try {
-                // Prova prima un media button mirato esclusivamente al package scelto
                 val now = SystemClock.uptimeMillis()
                 val down = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
                     setPackage(pkg)
@@ -174,6 +172,11 @@ class BitChordListenerService : NotificationListenerService() {
         override fun onPlaybackStateChanged(state: PlaybackState?) {
             val clockChanged = syncPlaybackClock(state, forceSync = false)
             val playing = state?.state == PlaybackState.STATE_PLAYING
+            if (playing) {
+                activeController?.packageName?.let {
+                    AppPreferences.rememberLastActivePackage(this@BitChordListenerService, it)
+                }
+            }
             if (clockChanged) {
                 wearBridge.publishPlayback(
                     trackKey = currentTrackKey,
@@ -259,16 +262,15 @@ class BitChordListenerService : NotificationListenerService() {
     private fun handlePlayPauseCommand() {
         refreshActiveSessions()
         val ctrl = activeController
-        val preferred = AppPreferences.preferredPlayer.value
+        val targetPkg = AppPreferences.getLaunchTargetPackage(this)
 
-        if (ctrl != null && (preferred == PreferredPlayer.AUTO || preferred.matches(ctrl.packageName))) {
+        if (ctrl != null && (targetPkg == null || ctrl.packageName == targetPkg || ctrl.playbackState?.state == PlaybackState.STATE_PLAYING)) {
             if (ctrl.playbackState?.state == PlaybackState.STATE_PLAYING) {
                 ctrl.transportControls?.pause()
             } else {
                 ctrl.transportControls?.play()
             }
         } else {
-            // La sessione del player scelto era scaduta: risveglia solo il player scelto (mai altri!)
             launchOrResumePreferredApp(this)
         }
     }
@@ -319,18 +321,24 @@ class BitChordListenerService : NotificationListenerService() {
     private fun attachToPreferredSession(controllers: List<MediaController>?) {
         val candidates = controllers?.filter { it.packageName != packageName }.orEmpty()
         val preferred = AppPreferences.preferredPlayer.value
+        val lastPkg = AppPreferences.lastActiveMusicPackage.value
+
+        val playingCandidates = candidates.filter { it.playbackState?.state == PlaybackState.STATE_PLAYING }
 
         val target = if (preferred == PreferredPlayer.AUTO) {
-            candidates.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
-                ?: candidates.firstOrNull()
+            playingCandidates.firstOrNull { it.packageName == lastPkg }
+                ?: playingCandidates.firstOrNull()
+                ?: candidates.firstOrNull { lastPkg.isNotBlank() && it.packageName == lastPkg }
+                ?: if (lastPkg.isBlank()) candidates.firstOrNull() else null
         } else {
             val matching = candidates.filter { preferred.matches(it.packageName) }
             matching.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
                 ?: matching.firstOrNull()
+                ?: playingCandidates.firstOrNull()
         }
 
-        if (target != null && preferred != PreferredPlayer.AUTO) {
-            AppPreferences.rememberPackageFor(this, preferred, target.packageName)
+        if (target != null && target.playbackState?.state == PlaybackState.STATE_PLAYING) {
+            AppPreferences.rememberLastActivePackage(this, target.packageName)
         }
 
         LyricsPlaybackStore.activePlayerPackage.value = target?.packageName.orEmpty()
@@ -672,6 +680,15 @@ class BitChordListenerService : NotificationListenerService() {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
                 )
                 isForegroundStarted = true
+                notifier.markForegroundPosted(
+                    title = currentTitle,
+                    prevLyric = prev1,
+                    currentLine = currLine,
+                    nextLyric1 = next1,
+                    cover = currentCover,
+                    palette = currentPalette,
+                    isPlaying = isPlaying
+                )
             } catch (_: Exception) {
                 notifier.update(
                     title = currentTitle,
