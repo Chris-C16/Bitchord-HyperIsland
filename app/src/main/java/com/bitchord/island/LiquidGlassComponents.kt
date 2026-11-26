@@ -255,15 +255,14 @@ fun rememberDynamicFont(): FontFamily {
     val family by produceState<FontFamily>(initialValue = FontFamily.SansSerif) {
         val loaded = withContext(Dispatchers.IO) {
             try {
-                // Supporto automatico se carichi sf_pro.ttf in res/font/
                 val localSfProId = context.resources.getIdentifier("sf_pro", "font", context.packageName)
                 if (localSfProId != 0) {
                     return@withContext FontFamily(
-                        Font(localSfProId, FontWeight.Normal, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(400))),
-                        Font(localSfProId, FontWeight.Medium, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(500))),
-                        Font(localSfProId, FontWeight.SemiBold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(600))),
-                        Font(localSfProId, FontWeight.Bold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(700))),
-                        Font(localSfProId, FontWeight.ExtraBold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(800)))
+                        Font(localSfProId, weight = FontWeight.Normal, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(400))),
+                        Font(localSfProId, weight = FontWeight.Medium, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(500))),
+                        Font(localSfProId, weight = FontWeight.SemiBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(600))),
+                        Font(localSfProId, weight = FontWeight.Bold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(700))),
+                        Font(localSfProId, weight = FontWeight.ExtraBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(800)))
                     )
                 }
 
@@ -298,11 +297,11 @@ fun rememberDynamicFont(): FontFamily {
                 }
                 if (file.exists() && file.length() > 40_000L) {
                     FontFamily(
-                        Font(file, FontWeight.Normal, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(400))),
-                        Font(file, FontWeight.Medium, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(500))),
-                        Font(file, FontWeight.SemiBold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(600))),
-                        Font(file, FontWeight.Bold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(700))),
-                        Font(file, FontWeight.ExtraBold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(800)))
+                        Font(file, weight = FontWeight.Normal, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(400))),
+                        Font(file, weight = FontWeight.Medium, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(500))),
+                        Font(file, weight = FontWeight.SemiBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(600))),
+                        Font(file, weight = FontWeight.Bold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(700))),
+                        Font(file, weight = FontWeight.ExtraBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(800)))
                     )
                 } else {
                     null
