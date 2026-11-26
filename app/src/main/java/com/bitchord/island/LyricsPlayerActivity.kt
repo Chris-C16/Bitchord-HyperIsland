@@ -1,6 +1,10 @@
 package com.bitchord.island
 
 import android.os.Bundle
+import android.graphics.Color as AndroidColor
+import android.graphics.drawable.ColorDrawable
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.core.animateFloatAsState
@@ -33,7 +37,13 @@ import kotlinx.coroutines.delay
 
 class LyricsPlayerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+        )
         super.onCreate(savedInstanceState)
+        window.setBackgroundDrawable(ColorDrawable(0xFF0A090F.toInt()))
+
         setContent {
             MaterialTheme {
                 LyricsPlayerScreen(onClose = { finish() })
