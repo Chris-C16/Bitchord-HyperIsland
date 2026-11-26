@@ -6,6 +6,8 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Base64
 import androidx.compose.ui.graphics.toArgb
@@ -14,6 +16,12 @@ import com.google.android.gms.wearable.MessageClient
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -35,12 +43,16 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
     private val appContext = context.applicationContext
     private val dataClient: DataClient = Wearable.getDataClient(appContext)
     private val messageClient: MessageClient = Wearable.getMessageClient(appContext)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private var lastTrackKey: String = ""
-    private var lastTrackJson: String = ""
-    private var lastCoverRef: Bitmap? = null
-    private var cachedArtBytes: ByteArray = ByteArray(0)
-    private var lastPlaybackKey: String = ""
+    private var publishTrackJob: Job? = null
+
+    @Volatile private var lastTrackKey: String = ""
+    @Volatile private var lastTrackJson: String = ""
+    @Volatile private var lastCoverRef: Bitmap? = null
+    @Volatile private var cachedArtBytes: ByteArray = ByteArray(0)
+    @Volatile private var lastPlaybackKey: String = ""
 
     init {
         try {
@@ -50,6 +62,8 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
     }
 
     fun release() {
+        publishTrackJob?.cancel()
+        scope.cancel()
         try {
             messageClient.removeListener(this)
         } catch (_: Throwable) {
@@ -66,52 +80,56 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
         palette: CoverPalette
     ) {
         if (title.isBlank()) return
-
-        val linesArray = JSONArray()
-        for (line in lines) {
-            linesArray.put(
-                JSONObject().apply {
-                    put("t", line.startMs)
-                    put("s", line.fullText)
-                }
-            )
-        }
-
+        val linesSnapshot = lines.toList()
         val accentArgb = palette.accent.toArgb()
-        val bgTopArgb = Color.rgb(
-            (Color.red(accentArgb) * 0.24f).toInt().coerceIn(18, 64),
-            (Color.green(accentArgb) * 0.24f).toInt().coerceIn(18, 64),
-            (Color.blue(accentArgb) * 0.28f).toInt().coerceIn(24, 76)
-        )
-        val bgBottomArgb = Color.rgb(10, 11, 16)
 
-        val artBytes = getCompressedCoverBytes(cover)
-        val artBase64 = if (artBytes.isNotEmpty()) {
-            Base64.encodeToString(artBytes, Base64.NO_WRAP)
-        } else {
-            ""
+        publishTrackJob?.cancel()
+        publishTrackJob = scope.launch {
+            val linesArray = JSONArray()
+            for (line in linesSnapshot) {
+                linesArray.put(
+                    JSONObject().apply {
+                        put("t", line.startMs)
+                        put("s", line.fullText)
+                    }
+                )
+            }
+
+            val bgTopArgb = Color.rgb(
+                (Color.red(accentArgb) * 0.24f).toInt().coerceIn(18, 64),
+                (Color.green(accentArgb) * 0.24f).toInt().coerceIn(18, 64),
+                (Color.blue(accentArgb) * 0.28f).toInt().coerceIn(24, 76)
+            )
+            val bgBottomArgb = Color.rgb(10, 11, 16)
+
+            val artBytes = getCompressedCoverBytes(cover)
+            val artBase64 = if (artBytes.isNotEmpty()) {
+                Base64.encodeToString(artBytes, Base64.NO_WRAP)
+            } else {
+                ""
+            }
+
+            val payload = JSONObject().apply {
+                put("trackKey", trackKey)
+                put("title", title)
+                put("artist", artist)
+                put("durationMs", durationMs)
+                put("accent", accentArgb)
+                put("bgTop", bgTopArgb)
+                put("bgBottom", bgBottomArgb)
+                put("lines", linesArray)
+                put("artB64", artBase64)
+            }.toString()
+
+            if (trackKey == lastTrackKey && payload == lastTrackJson) {
+                return@launch
+            }
+
+            lastTrackKey = trackKey
+            lastTrackJson = payload
+
+            dispatchTrackPayload(payload, artBytes)
         }
-
-        val payload = JSONObject().apply {
-            put("trackKey", trackKey)
-            put("title", title)
-            put("artist", artist)
-            put("durationMs", durationMs)
-            put("accent", accentArgb)
-            put("bgTop", bgTopArgb)
-            put("bgBottom", bgBottomArgb)
-            put("lines", linesArray)
-            put("artB64", artBase64)
-        }.toString()
-
-        if (trackKey == lastTrackKey && payload == lastTrackJson) {
-            return
-        }
-
-        lastTrackKey = trackKey
-        lastTrackJson = payload
-
-        dispatchTrackPayload(payload, artBytes)
     }
 
     private fun dispatchTrackPayload(payload: String, artBytes: ByteArray) {
@@ -132,10 +150,11 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
         trackKey: String,
         isPlaying: Boolean,
         positionMs: Long,
-        speed: Float
+        speed: Float,
+        force: Boolean = false
     ) {
-        val stateKey = "$trackKey|$isPlaying|${positionMs / 250L}|$speed"
-        if (stateKey == lastPlaybackKey) return
+        val stateKey = "$trackKey|$isPlaying|${positionMs / 400L}|$speed"
+        if (!force && stateKey == lastPlaybackKey) return
         lastPlaybackKey = stateKey
 
         val bytes = JSONObject().apply {
@@ -143,7 +162,6 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
             put("isPlaying", isPlaying)
             put("positionMs", positionMs.coerceAtLeast(0L))
             put("speed", if (speed > 0f) speed.toDouble() else 1.0)
-            put("sentAtWallMs", System.currentTimeMillis())
         }.toString().toByteArray(Charsets.UTF_8)
 
         sendMessageToAllNodes(PATH_PLAYBACK_STATE, bytes)
@@ -153,7 +171,7 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
         lastTrackKey = ""
         lastTrackJson = ""
         lastPlaybackKey = ""
-        publishPlayback(trackKey = "", isPlaying = false, positionMs = 0L, speed = 1f)
+        publishPlayback(trackKey = "", isPlaying = false, positionMs = 0L, speed = 1f, force = true)
     }
 
     private fun sendMessageToAllNodes(path: String, data: ByteArray) {
@@ -179,42 +197,54 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
 
         val size = 80
         val scaled = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(scaled)
-        val minDim = min(cover.width, cover.height)
-        val left = (cover.width - minDim) / 2
-        val top = (cover.height - minDim) / 2
-        val src = Rect(left, top, left + minDim, top + minDim)
-        val dst = Rect(0, 0, size, size)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        canvas.drawBitmap(cover, src, dst, paint)
+        return try {
+            val canvas = Canvas(scaled)
+            val minDim = min(cover.width, cover.height)
+            val left = (cover.width - minDim) / 2
+            val top = (cover.height - minDim) / 2
+            val src = Rect(left, top, left + minDim, top + minDim)
+            val dst = Rect(0, 0, size, size)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            canvas.drawBitmap(cover, src, dst, paint)
 
-        val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 70, out)
-        lastCoverRef = cover
-        cachedArtBytes = out.toByteArray()
-        return cachedArtBytes
+            val out = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 70, out)
+            val bytes = out.toByteArray()
+            lastCoverRef = cover
+            cachedArtBytes = bytes
+            bytes
+        } catch (_: Throwable) {
+            ByteArray(0)
+        } finally {
+            scaled.recycle()
+        }
     }
 
     override fun onMessageReceived(event: MessageEvent) {
         when (event.path) {
-            PATH_CMD_PLAY_PAUSE -> LyricsPlaybackStore.onPlayPause?.invoke()
-            PATH_CMD_NEXT -> LyricsPlaybackStore.onNext?.invoke()
-            PATH_CMD_PREV -> LyricsPlaybackStore.onPrevious?.invoke()
+            PATH_CMD_PLAY_PAUSE -> mainHandler.post { LyricsPlaybackStore.onPlayPause?.invoke() }
+            PATH_CMD_NEXT -> mainHandler.post { LyricsPlaybackStore.onNext?.invoke() }
+            PATH_CMD_PREV -> mainHandler.post { LyricsPlaybackStore.onPrevious?.invoke() }
             PATH_CMD_SEEK -> {
                 val posMs = String(event.data, Charsets.UTF_8).toLongOrNull() ?: return
-                LyricsPlaybackStore.onSeekTo?.invoke(posMs.coerceAtLeast(0L))
+                mainHandler.post { LyricsPlaybackStore.onSeekTo?.invoke(posMs.coerceAtLeast(0L)) }
             }
             PATH_CMD_REQUEST_SYNC -> {
                 lastPlaybackKey = ""
-                if (lastTrackJson.isNotEmpty()) {
-                    dispatchTrackPayload(lastTrackJson, cachedArtBytes)
+                val json = lastTrackJson
+                val art = cachedArtBytes
+                if (json.isNotEmpty()) {
+                    dispatchTrackPayload(json, art)
                 }
-                publishPlayback(
-                    trackKey = lastTrackKey,
-                    isPlaying = LyricsPlaybackStore.isPlaying.value,
-                    positionMs = LyricsPlaybackStore.currentPositionMs(),
-                    speed = LyricsPlaybackStore.speed.value
-                )
+                mainHandler.post {
+                    publishPlayback(
+                        trackKey = lastTrackKey,
+                        isPlaying = LyricsPlaybackStore.isPlaying.value,
+                        positionMs = LyricsPlaybackStore.currentPositionMs(),
+                        speed = LyricsPlaybackStore.speed.value,
+                        force = true
+                    )
+                }
             }
         }
     }
