@@ -554,11 +554,6 @@ class HyperIslandNotifier(private val context: Context) {
             isPlaying = isPlaying
         )
 
-        val coverId = System.identityHashCode(cover)
-        val trackStateKey = "${pillLabel.text}|$isPlaying|$accentColor|$coverId"
-        lastTrackStateKey = trackStateKey
-        lastFullStateKey = "$trackStateKey|$prevText|$currText|$nextText"
-
         return buildNotificationInternal(
             pillLabel = pillLabel,
             accentColor = accentColor,
@@ -568,6 +563,30 @@ class HyperIslandNotifier(private val context: Context) {
             cover = cover,
             isPlaying = isPlaying
         )
+    }
+
+    fun markForegroundPosted(
+        title: String,
+        prevLyric: String,
+        currentLine: LyricLine?,
+        nextLyric1: String,
+        cover: Bitmap?,
+        palette: CoverPalette,
+        isPlaying: Boolean
+    ) {
+        val pillLabel = buildStaticPillLabel(title, isPlaying)
+        val accentColor = boostAccentBrightness(palette.accent.toArgb())
+        val (prevText, currText, nextText) = resolveDisplayLines(
+            prevLyric = prevLyric,
+            currentLine = currentLine,
+            nextLyric1 = nextLyric1,
+            title = title,
+            isPlaying = isPlaying
+        )
+        val coverId = System.identityHashCode(cover)
+        val trackStateKey = "${pillLabel.text}|$isPlaying|$accentColor|$coverId"
+        lastTrackStateKey = trackStateKey
+        lastFullStateKey = "$trackStateKey|$prevText|$currText|$nextText"
     }
 
     fun update(
