@@ -4,6 +4,18 @@ import android.content.Context
 import android.content.SharedPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
 
+enum class TargetFps(val fps: Int, val label: String) {
+    FPS_30(30, "30 FPS"),
+    FPS_60(60, "60 FPS"),
+    FPS_120(120, "120 FPS");
+
+    companion object {
+        fun fromFps(value: Int): TargetFps {
+            return entries.firstOrNull { it.fps == value } ?: FPS_60
+        }
+    }
+}
+
 enum class PreferredPlayer(
     val id: String,
     val label: String,
@@ -36,6 +48,7 @@ object AppPreferences {
     private const val KEY_APP_INFO_DONE = "app_info_step_done"
     private const val KEY_LAST_ACTIVE_PKG = "last_active_music_pkg"
     private const val KEY_LAST_PKG_PREFIX = "last_pkg_"
+    private const val KEY_TARGET_FPS = "target_fps"
 
     const val FACTORY_DEFAULT_OFFSET_MS = 600L
 
@@ -46,6 +59,7 @@ object AppPreferences {
     val defaultSyncOffsetMs = MutableStateFlow(FACTORY_DEFAULT_OFFSET_MS)
     val appInfoStepDone = MutableStateFlow(false)
     val lastActiveMusicPackage = MutableStateFlow("")
+    val targetFps = MutableStateFlow(TargetFps.FPS_60)
 
     fun init(context: Context) {
         if (prefs != null) return
@@ -55,6 +69,7 @@ object AppPreferences {
         defaultSyncOffsetMs.value = sp.getLong(KEY_DEFAULT_OFFSET_MS, FACTORY_DEFAULT_OFFSET_MS)
         appInfoStepDone.value = sp.getBoolean(KEY_APP_INFO_DONE, false)
         lastActiveMusicPackage.value = sp.getString(KEY_LAST_ACTIVE_PKG, "").orEmpty()
+        targetFps.value = TargetFps.fromFps(sp.getInt(KEY_TARGET_FPS, TargetFps.FPS_60.fps))
         LyricsPlaybackStore.syncOffsetMs.value = defaultSyncOffsetMs.value
     }
 
@@ -62,6 +77,12 @@ object AppPreferences {
         init(context)
         preferredPlayer.value = player
         prefs?.edit()?.putString(KEY_PLAYER_ID, player.id)?.apply()
+    }
+
+    fun setTargetFps(context: Context, fps: TargetFps) {
+        init(context)
+        targetFps.value = fps
+        prefs?.edit()?.putInt(KEY_TARGET_FPS, fps.fps)?.apply()
     }
 
     fun setDefaultSyncOffsetMs(context: Context, offsetMs: Long) {
