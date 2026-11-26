@@ -44,12 +44,28 @@ class BitChordListenerService : NotificationListenerService() {
             return enabled.contains(context.packageName)
         }
 
-        fun ensureConnected(context: Context) {
+        fun areNotificationsEnabled(context: Context): Boolean {
+            val nm = context.getSystemService(android.app.NotificationManager::class.java)
+            val enabled = nm?.areNotificationsEnabled() ?: true
+            return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                val granted = context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                enabled && granted
+            } else {
+                enabled
+            }
+        }
+
+        fun ensureConnected(context: Context, forceRepublish: Boolean = false) {
             AppPreferences.init(context)
             if (!isNotificationAccessGranted(context)) return
             val current = instance
             if (current != null) {
-                current.refreshActiveSessions()
+                if (forceRepublish) {
+                    current.forceRepublishPill()
+                } else {
+                    current.refreshActiveSessions()
+                }
             } else {
                 try {
                     requestRebind(ComponentName(context, BitChordListenerService::class.java))
@@ -290,7 +306,24 @@ class BitChordListenerService : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         instance = this
+        forceRepublishPill()
+    }
+
+    fun forceRepublishPill() {
+        lastRenderKey = ""
+        notifier.resetCache()
         refreshActiveSessions()
+        val ctrl = activeController
+        if (ctrl != null) {
+            handleMetadata(ctrl.metadata)
+            syncPlaybackClock(ctrl.playbackState, forceSync = true)
+            val playing = ctrl.playbackState?.state == PlaybackState.STATE_PLAYING
+            if (playing) startTicker()
+            syncLyrics(isPlaying = playing, forceImmediate = true)
+        } else if (currentTitle.isNotBlank()) {
+            val playing = LyricsPlaybackStore.isPlaying.value
+            syncLyrics(isPlaying = playing, forceImmediate = true)
+        }
     }
 
     override fun onListenerDisconnected() {
@@ -350,7 +383,11 @@ class BitChordListenerService : NotificationListenerService() {
                 val playing = target.playbackState?.state == PlaybackState.STATE_PLAYING
                 if (playing) {
                     startTicker()
-                    syncLyrics(isPlaying = true, forceImmediate = false)
+                    if (!isForegroundStarted) {
+                        lastRenderKey = ""
+                        notifier.resetCache()
+                    }
+                    syncLyrics(isPlaying = true, forceImmediate = !isForegroundStarted)
                 }
             }
             return

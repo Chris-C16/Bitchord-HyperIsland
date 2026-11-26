@@ -1,16 +1,21 @@
 package com.bitchord.island
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
 import android.graphics.drawable.ColorDrawable
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.*
+import kotlinx.coroutines.delay
 
 private enum class AppStage {
     SPLASH,
@@ -19,6 +24,33 @@ private enum class AppStage {
 }
 
 class MainActivity : ComponentActivity() {
+
+    private val permissionRefreshTick = mutableIntStateOf(0)
+
+    private val postNotifLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        permissionRefreshTick.intValue++
+        if (granted && BitChordListenerService.isNotificationAccessGranted(this)) {
+            BitChordListenerService.ensureConnected(this, forceRepublish = true)
+        }
+    }
+
+    private fun requestPostNotificationsIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            postNotifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            openAppNotificationSettings(this)
+        }
+    }
+
+    private fun allRequiredPermissionsReady(): Boolean {
+        return BitChordListenerService.isNotificationAccessGranted(this) &&
+            BitChordListenerService.areNotificationsEnabled(this)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
@@ -28,14 +60,38 @@ class MainActivity : ComponentActivity() {
         window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
         AppPreferences.init(this)
 
+        // 1. Chiede subito il permesso notifiche all'avvio su Android 13-16
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            postNotifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        // 2. Risveglia subito la pillola senza aspettare la fine dello splash
+        if (allRequiredPermissionsReady()) {
+            BitChordListenerService.ensureConnected(this, forceRepublish = true)
+        }
+
         setContent {
             MaterialTheme {
                 val font = rememberDynamicFont()
                 var stage by remember { mutableStateOf(AppStage.SPLASH) }
+                val refreshTick by permissionRefreshTick
+
+                // Se l'app era stata chiusa dai recenti, ritenta velocemente il rebind finché parte
+                LaunchedEffect(refreshTick) {
+                    if (allRequiredPermissionsReady()) {
+                        repeat(6) { attempt ->
+                            BitChordListenerService.ensureConnected(this@MainActivity, forceRepublish = true)
+                            if (BitChordListenerService.isRunning() && attempt > 0) return@LaunchedEffect
+                            delay(350L)
+                        }
+                    }
+                }
 
                 Crossfade(
                     targetState = stage,
-                    animationSpec = tween(360),
+                    animationSpec = tween(320),
                     label = "appStage"
                 ) { current ->
                     when (current) {
@@ -43,8 +99,8 @@ class MainActivity : ComponentActivity() {
                             DynamicLyricsSplashScreen(
                                 font = font,
                                 onFinished = {
-                                    if (BitChordListenerService.isNotificationAccessGranted(this@MainActivity)) {
-                                        BitChordListenerService.ensureConnected(this@MainActivity)
+                                    if (allRequiredPermissionsReady()) {
+                                        BitChordListenerService.ensureConnected(this@MainActivity, forceRepublish = true)
                                         stage = AppStage.PLAYER
                                     } else {
                                         stage = AppStage.PERMISSIONS
@@ -55,8 +111,10 @@ class MainActivity : ComponentActivity() {
                         AppStage.PERMISSIONS -> {
                             LiquidPermissionsScreen(
                                 font = font,
+                                refreshTick = refreshTick,
+                                onRequestNotifications = { requestPostNotificationsIfNeeded() },
                                 onAllReady = {
-                                    BitChordListenerService.ensureConnected(this@MainActivity)
+                                    BitChordListenerService.ensureConnected(this@MainActivity, forceRepublish = true)
                                     stage = AppStage.PLAYER
                                 }
                             )
@@ -75,8 +133,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (BitChordListenerService.isNotificationAccessGranted(this)) {
-            BitChordListenerService.ensureConnected(this)
+        permissionRefreshTick.intValue++
+        if (allRequiredPermissionsReady()) {
+            BitChordListenerService.ensureConnected(this, forceRepublish = true)
         }
     }
 }

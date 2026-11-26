@@ -398,25 +398,71 @@ fun LiquidAmbientBackground(
         } else {
             // Sfere luminose vivide quando non c'è copertina, così il vetro rifrange luce reale
             Canvas(modifier = Modifier.fillMaxSize()) {
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        listOf(Color(0xFF6366F1).copy(alpha = 0.55f), Color.Transparent),
-                        center = Offset(size.width * 0.22f, size.height * 0.18f),
-                        radius = size.width * 0.75f
-                    ),
-                    center = Offset(size.width * 0.22f, size.height * 0.18f),
-                    radius = size.width * 0.75f
-                )
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        listOf(Color(0xFFEC4899).copy(alpha = 0.42f), Color.Transparent),
-                        center = Offset(size.width * 0.85f, size.height * 0.78f),
-                        radius = size.width * 0.75f
-                    ),
-                    center = Offset(size.width * 0.85f, size.height * 0.78f),
-                    radius = size.width * 0.75f
-                )
-            }
+                    val w = size.width
+                    val h = size.height
+
+                    val bubbleW = w * 0.64f
+                    val bubbleH = h * 0.48f
+                    val bx = (w - bubbleW) / 2f
+                    val by = (h - bubbleH) / 2f - h * 0.03f
+                    val br = bubbleH * 0.34f
+
+                    drawRoundRect(
+                        brush = Brush.linearGradient(
+                            colors = listOf(Color(0xFFFF4D7D), Color(0xFFC026D3), Color(0xFF6366F1)),
+                            start = Offset(bx, by),
+                            end = Offset(bx + bubbleW, by + bubbleH)
+                        ),
+                        topLeft = Offset(bx, by),
+                        size = Size(bubbleW, bubbleH),
+                        cornerRadius = CornerRadius(br, br)
+                    )
+
+                    val tail = Path().apply {
+                        moveTo(bx + bubbleW * 0.14f, by + bubbleH * 0.82f)
+                        lineTo(bx + bubbleW * 0.04f, by + bubbleH * 1.14f)
+                        lineTo(bx + bubbleW * 0.34f, by + bubbleH * 0.94f)
+                        close()
+                    }
+                    drawPath(
+                        path = tail,
+                        brush = Brush.linearGradient(
+                            colors = listOf(Color(0xFFE0339B), Color(0xFF9333EA)),
+                            start = Offset(bx, by + bubbleH * 0.7f),
+                            end = Offset(bx + bubbleW * 0.4f, by + bubbleH * 1.15f)
+                        )
+                    )
+
+                    val activePulse = (sin(wavePhase) + 1f) * 0.5f
+                    val lineX = bx + bubbleW * 0.17f
+                    val widths = floatArrayOf(bubbleW * 0.46f, bubbleW * 0.64f, bubbleW * 0.36f)
+                    val heights = floatArrayOf(h * 0.052f, h * 0.062f, h * 0.052f)
+                    val ys = floatArrayOf(by + bubbleH * 0.24f, by + bubbleH * 0.46f, by + bubbleH * 0.70f)
+                    val alphas = floatArrayOf(
+                        0.45f + 0.30f * (1f - activePulse),
+                        0.82f + 0.18f * activePulse,
+                        0.38f + 0.32f * activePulse
+                    )
+
+                    for (i in 0 until 3) {
+                        val lh = heights[i]
+                        drawRoundRect(
+                            color = Color.White.copy(alpha = alphas[i]),
+                            topLeft = Offset(lineX, ys[i]),
+                            size = Size(widths[i], lh),
+                            cornerRadius = CornerRadius(lh / 2f, lh / 2f)
+                        )
+                    }
+
+                    val sheenX = w * shimmer
+                    drawRect(
+                        brush = Brush.linearGradient(
+                            colors = listOf(Color.Transparent, Color.White.copy(alpha = 0.24f), Color.Transparent),
+                            start = Offset(sheenX - w * 0.45f, 0f),
+                            end = Offset(sheenX + w * 0.25f, h)
+                        )
+                    )
+                }
         }
 
         // Leggero scrim contrasto per tenere i testi bianchi leggibili senza spegnere i colori
@@ -599,12 +645,17 @@ fun DynamicLyricsSplashScreen(
 @Composable
 fun LiquidPermissionsScreen(
     font: FontFamily,
+    refreshTick: Int = 0,
+    onRequestNotifications: () -> Unit,
     onAllReady: () -> Unit
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
     val appInfoDone by AppPreferences.appInfoStepDone.collectAsState()
-    var notifGranted by remember {
+    var postNotifOk by remember {
+        mutableStateOf(BitChordListenerService.areNotificationsEnabled(context))
+    }
+    var listenerGranted by remember {
         mutableStateOf(BitChordListenerService.isNotificationAccessGranted(context))
     }
     var awaitingAppInfoReturn by remember { mutableStateOf(false) }
@@ -612,18 +663,32 @@ fun LiquidPermissionsScreen(
     var rootTopLeft by remember { mutableStateOf(Offset.Zero) }
     var card1Rect by remember { mutableStateOf(Rect.Zero) }
     var card2Rect by remember { mutableStateOf(Rect.Zero) }
+    var card3Rect by remember { mutableStateOf(Rect.Zero) }
 
-    val glassEffect = remember(card1Rect, card2Rect, density.density) {
+    val glassEffect = remember(card1Rect, card2Rect, card3Rect, density.density) {
         buildLiquidGlassRenderEffect(
             rect0 = card1Rect,
             radius0Px = with(density) { 28.dp.toPx() },
             rect1 = card2Rect,
             radius1Px = with(density) { 28.dp.toPx() },
-            rect2 = Rect.Zero,
-            radius2Px = 0f,
+            rect2 = card3Rect,
+            radius2Px = with(density) { 28.dp.toPx() },
             densityPx = density.density
         )
     }
+
+    fun recheck() {
+        val pOk = BitChordListenerService.areNotificationsEnabled(context)
+        val lOk = BitChordListenerService.isNotificationAccessGranted(context)
+        postNotifOk = pOk
+        listenerGranted = lOk
+        if (pOk && lOk) {
+            BitChordListenerService.ensureConnected(context, forceRepublish = true)
+            onAllReady()
+        }
+    }
+
+    LaunchedEffect(refreshTick) { recheck() }
 
     DisposableEffect(context) {
         val owner = context as? LifecycleOwner
@@ -633,12 +698,7 @@ fun LiquidPermissionsScreen(
                     awaitingAppInfoReturn = false
                     AppPreferences.markAppInfoDone(context, true)
                 }
-                val granted = BitChordListenerService.isNotificationAccessGranted(context)
-                notifGranted = granted
-                if (granted) {
-                    BitChordListenerService.ensureConnected(context)
-                    onAllReady()
-                }
+                recheck()
             }
         }
         owner?.lifecycle?.addObserver(observer)
@@ -650,7 +710,6 @@ fun LiquidPermissionsScreen(
             .fillMaxSize()
             .onGloballyPositioned { rootTopLeft = it.boundsInRoot().topLeft }
     ) {
-        // Sfondo rifratto dallo shader Liquid Glass
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -679,7 +738,7 @@ fun LiquidPermissionsScreen(
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "Solo 2 passaggi rapidi per attivare i testi in tempo reale.",
+                text = "Attiva i permessi qui sotto per far comparire subito la pillola.",
                 fontFamily = font,
                 fontSize = 14.sp,
                 letterSpacing = (-0.2).sp,
@@ -687,17 +746,32 @@ fun LiquidPermissionsScreen(
                 textAlign = TextAlign.Center
             )
 
-            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.height(26.dp))
 
             PermissionGlassCard(
                 stepNumber = "1",
+                title = "Notifiche & Pillola",
+                subtitle = "Consenti notifiche e aggiornamenti live per mostrare la pillola.",
+                buttonLabel = if (postNotifOk) "Attivo" else "Consenti",
+                completed = postNotifOk,
+                font = font,
+                modifier = Modifier.onGloballyPositioned {
+                    card1Rect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                },
+                onClick = { onRequestNotifications() }
+            )
+
+            Spacer(Modifier.height(14.dp))
+
+            PermissionGlassCard(
+                stepNumber = "2",
                 title = "Info App",
                 subtitle = "Consenti impostazioni con restrizioni e nessuna limitazione batteria.",
                 buttonLabel = if (appInfoDone) "Riapri" else "Apri",
                 completed = appInfoDone,
                 font = font,
                 modifier = Modifier.onGloballyPositioned {
-                    card1Rect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                    card2Rect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
                 },
                 onClick = {
                     awaitingAppInfoReturn = true
@@ -708,14 +782,14 @@ fun LiquidPermissionsScreen(
             Spacer(Modifier.height(14.dp))
 
             PermissionGlassCard(
-                stepNumber = "2",
+                stepNumber = "3",
                 title = "Accesso alle notifiche",
-                subtitle = "Necessario per leggere il brano in riproduzione e sincronizzare i testi.",
-                buttonLabel = if (notifGranted) "Attivo" else "Attiva",
-                completed = notifGranted,
+                subtitle = "Legge il brano in riproduzione e sincronizza i testi in tempo reale.",
+                buttonLabel = if (listenerGranted) "Attivo" else "Attiva",
+                completed = listenerGranted,
                 font = font,
                 modifier = Modifier.onGloballyPositioned {
-                    card2Rect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                    card3Rect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
                 },
                 onClick = { openNotificationListenerSettings(context) }
             )
@@ -855,19 +929,22 @@ fun LiquidGlassLyricsPlayerScreen(
         }
     }
 
+    val activeOverlayRect = if (menuExpanded || showSettingsSheet) overlayRect else Rect.Zero
+    val activeBottomDockRect = if (showSettingsSheet) Rect.Zero else bottomDockRect
+
     val liquidRenderEffect = remember(
         topBarRect,
-        bottomDockRect,
-        overlayRect,
+        activeBottomDockRect,
+        activeOverlayRect,
         overlayRadiusDp,
         density.density
     ) {
         buildLiquidGlassRenderEffect(
             rect0 = topBarRect,
             radius0Px = with(density) { 30.dp.toPx() },
-            rect1 = bottomDockRect,
+            rect1 = activeBottomDockRect,
             radius1Px = with(density) { 32.dp.toPx() },
-            rect2 = overlayRect,
+            rect2 = activeOverlayRect,
             radius2Px = with(density) { overlayRadiusDp.toPx() },
             densityPx = density.density
         )
@@ -1112,19 +1189,21 @@ fun LiquidGlassLyricsPlayerScreen(
             }
         }
 
-        // DOCK CONTROLLI FLUTTUANTE LIQUID GLASS
+        //  FLUTTUANTE LIQUID GLASS
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 12.dp)
                 .fillMaxWidth()
+                .graphicsLayer { alpha = if (showSettingsSheet) 0f else 1f }
                 .onGloballyPositioned {
                     bottomDockRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
                 }
                 .clip(RoundedCornerShape(32.dp))
                 .padding(horizontal = 18.dp, vertical = 14.dp)
         ) {
+           
             LiquidProgressSection(
                 durationMs = durationMs,
                 syncOffsetMs = syncOffsetMs,
@@ -1219,9 +1298,11 @@ fun LiquidGlassLyricsPlayerScreen(
                 modifier = Modifier
                     .width(232.dp)
                     .onGloballyPositioned {
-                        overlayRadiusDp = 26.dp
-                        overlayRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                    }
+                        if (menuExpanded) {
+                            overlayRadiusDp = 26.dp
+                            overlayRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                            }
+                        }
                     .clip(RoundedCornerShape(26.dp))
                     .background(Color.Black.copy(alpha = 0.24f))
                     .padding(8.dp),
@@ -1363,8 +1444,10 @@ fun LiquidGlassLyricsPlayerScreen(
             LiquidSettingsModal(
                 font = font,
                 onSheetPositioned = { rect ->
-                    overlayRadiusDp = 34.dp
-                    overlayRect = rect.translate(-rootTopLeft.x, -rootTopLeft.y)
+                    if (showSettingsSheet) {
+                        overlayRadiusDp = 34.dp
+                        overlayRect = rect.translate(-rootTopLeft.x, -rootTopLeft.y)
+                    }
                 },
                 onDismiss = { showSettingsSheet = false }
             )
@@ -1978,14 +2061,15 @@ private fun MiniWaveIcon(size: Dp) {
     }
 }
 
-fun openAppInfoSettings(context: Context) {
+fun openAppNotificationSettings(context: Context) {
     try {
-        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-            data = Uri.parse("package:${context.packageName}")
+        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+            putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)
     } catch (_: Throwable) {
+        openAppInfoSettings(context)
     }
 }
 
