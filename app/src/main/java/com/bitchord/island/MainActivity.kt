@@ -1,115 +1,82 @@
 package com.bitchord.island
 
-import android.Manifest
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.Build
+import android.graphics.Color as AndroidColor
+import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
-import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.*
+
+private enum class AppStage {
+    SPLASH,
+    PERMISSIONS,
+    PLAYER
+}
 
 class MainActivity : ComponentActivity() {
-
-    private val requestNotificationPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { _ -> }
-
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+        )
         super.onCreate(savedInstanceState)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val granted = ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-            if (!granted) {
-                requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
+        window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
+        AppPreferences.init(this)
 
         setContent {
             MaterialTheme {
-                SetupScreen(
-                    onNotificationAccess = {
-                        startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                    },
-                    onLiveUpdates = {
-                        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
-                            putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                val font = rememberDynamicFont()
+                var stage by remember { mutableStateOf(AppStage.SPLASH) }
+
+                Crossfade(
+                    targetState = stage,
+                    animationSpec = tween(360),
+                    label = "appStage"
+                ) { current ->
+                    when (current) {
+                        AppStage.SPLASH -> {
+                            DynamicLyricsSplashScreen(
+                                font = font,
+                                onFinished = {
+                                    if (BitChordListenerService.isNotificationAccessGranted(this@MainActivity)) {
+                                        BitChordListenerService.ensureConnected(this@MainActivity)
+                                        stage = AppStage.PLAYER
+                                    } else {
+                                        stage = AppStage.PERMISSIONS
+                                    }
+                                }
+                            )
                         }
-                        startActivity(intent)
-                    },
-                    onAppInfo = {
-                        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                            data = Uri.parse("package:$packageName")
+                        AppStage.PERMISSIONS -> {
+                            LiquidPermissionsScreen(
+                                font = font,
+                                onAllReady = {
+                                    BitChordListenerService.ensureConnected(this@MainActivity)
+                                    stage = AppStage.PLAYER
+                                }
+                            )
                         }
-                        startActivity(intent)
-                    },
-                    onOpenPlayer = {
-                        startActivity(Intent(this, LyricsPlayerActivity::class.java))
+                        AppStage.PLAYER -> {
+                            LiquidGlassLyricsPlayerScreen(
+                                font = font,
+                                showCloseButton = false
+                            )
+                        }
                     }
-                )
+                }
             }
         }
     }
-}
 
-@Composable
-private fun SetupScreen(
-    onNotificationAccess: () -> Unit,
-    onLiveUpdates: () -> Unit,
-    onAppInfo: () -> Unit,
-    onOpenPlayer: () -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF0E0D14))
-            .statusBarsPadding()
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        Text(
-            text = "HyperIsland Lyrics",
-            color = Color.White,
-            fontSize = 26.sp,
-            fontWeight = FontWeight.Bold
-        )
-        Text(
-            text = "Attiva i permessi qui sotto, poi avvia un brano su BitChord.",
-            color = Color.White.copy(alpha = 0.7f),
-            fontSize = 14.sp
-        )
-        Spacer(Modifier.height(8.dp))
-
-        val btnColors = ButtonDefaults.buttonColors(containerColor = Color(0xFF282342))
-        val shape = RoundedCornerShape(14.dp)
-
-        Button(onClick = onNotificationAccess, modifier = Modifier.fillMaxWidth().height(54.dp), colors = btnColors, shape = shape) {
-            Text("1. Accesso alle Notifiche (legge BitChord)", color = Color.White)
-        }
-        Button(onClick = onLiveUpdates, modifier = Modifier.fillMaxWidth().height(54.dp), colors = btnColors, shape = shape) {
-            Text("2. Notifiche e Live Updates (Android 16)", color = Color.White)
-        }
-        Button(onClick = onAppInfo, modifier = Modifier.fillMaxWidth().height(54.dp), colors = btnColors, shape = shape) {
-            Text("3. Info App (Impostazioni con restrizioni)", color = Color.White)
-        }
-        OutlinedButton(onClick = onOpenPlayer, modifier = Modifier.fillMaxWidth().height(54.dp), shape = shape) {
-            Text("Apri Player Lyrics", color = Color.White)
+    override fun onResume() {
+        super.onResume()
+        if (BitChordListenerService.isNotificationAccessGranted(this)) {
+            BitChordListenerService.ensureConnected(this)
         }
     }
 }
