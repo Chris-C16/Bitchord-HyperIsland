@@ -5,10 +5,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <application
         android:allowBackup="true"
-        android:label="Lyrics"
+        android:label="DynamicLyrics"
         android:icon="@drawable/ic_launcher_lyrics"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
@@ -37,7 +38,7 @@
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
         </service>
-    
+
         <meta-data
             android:name="com.google.android.gms.car.application"
             android:resource="@xml/automotive_app_desc" />
@@ -53,6 +54,5 @@
         <receiver
             android:name=".IslandPlaybackReceiver"
             android:exported="false" />
-
     </application>
 </manifest>
