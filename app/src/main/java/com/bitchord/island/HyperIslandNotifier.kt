@@ -589,6 +589,11 @@ class HyperIslandNotifier(private val context: Context) {
         lastFullStateKey = "$trackStateKey|$prevText|$currText|$nextText"
     }
 
+    fun resetCache() {
+        lastTrackStateKey = ""
+        lastFullStateKey = ""
+    }
+
     fun update(
         title: String,
         prevLyric: String,
