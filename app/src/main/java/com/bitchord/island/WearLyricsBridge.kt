@@ -38,6 +38,9 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
         const val PATH_CMD_PREV = "/bitchord/cmd/prev"
         const val PATH_CMD_SEEK = "/bitchord/cmd/seek"
         const val PATH_CMD_REQUEST_SYNC = "/bitchord/cmd/request_sync"
+        const val PATH_CMD_WATCH_INACTIVE = "/bitchord/cmd/watch_inactive"
+
+        private const val WATCH_ACTIVE_TTL_MS = 4 * 60_000L
     }
 
     private val appContext = context.applicationContext
@@ -48,6 +51,7 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
 
     private var publishTrackJob: Job? = null
 
+    @Volatile private var watchActiveUntilMs: Long = 0L
     @Volatile private var lastTrackKey: String = ""
     @Volatile private var lastTrackJson: String = ""
     @Volatile private var lastCoverRef: Bitmap? = null
@@ -59,6 +63,10 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
             messageClient.addListener(this)
         } catch (_: Throwable) {
         }
+    }
+
+    private fun isWatchActive(): Boolean {
+        return SystemClock.elapsedRealtime() < watchActiveUntilMs
     }
 
     fun release() {
@@ -79,12 +87,13 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
         cover: Bitmap?,
         palette: CoverPalette
     ) {
-        if (title.isBlank()) return
+        if (!isWatchActive() || title.isBlank()) return
         val linesSnapshot = lines.toList()
         val accentArgb = palette.accent.toArgb()
 
         publishTrackJob?.cancel()
         publishTrackJob = scope.launch {
+            if (!isWatchActive()) return@launch
             val linesArray = JSONArray()
             for (line in linesSnapshot) {
                 linesArray.put(
@@ -133,6 +142,7 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
     }
 
     private fun dispatchTrackPayload(payload: String, artBytes: ByteArray) {
+        if (!isWatchActive()) return
         try {
             val req = PutDataMapRequest.create(PATH_TRACK_DATA).apply {
                 dataMap.putString("payload", payload)
@@ -153,6 +163,7 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
         speed: Float,
         force: Boolean = false
     ) {
+        if (!isWatchActive()) return
         val stateKey = "$trackKey|$isPlaying|${positionMs / 400L}|$speed"
         if (!force && stateKey == lastPlaybackKey) return
         lastPlaybackKey = stateKey
@@ -171,7 +182,9 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
         lastTrackKey = ""
         lastTrackJson = ""
         lastPlaybackKey = ""
-        publishPlayback(trackKey = "", isPlaying = false, positionMs = 0L, speed = 1f, force = true)
+        if (isWatchActive()) {
+            publishPlayback(trackKey = "", isPlaying = false, positionMs = 0L, speed = 1f, force = true)
+        }
     }
 
     private fun sendMessageToAllNodes(path: String, data: ByteArray) {
@@ -222,23 +235,51 @@ class WearLyricsBridge(context: Context) : MessageClient.OnMessageReceivedListen
 
     override fun onMessageReceived(event: MessageEvent) {
         when (event.path) {
-            PATH_CMD_PLAY_PAUSE -> mainHandler.post { LyricsPlaybackStore.onPlayPause?.invoke() }
-            PATH_CMD_NEXT -> mainHandler.post { LyricsPlaybackStore.onNext?.invoke() }
-            PATH_CMD_PREV -> mainHandler.post { LyricsPlaybackStore.onPrevious?.invoke() }
+            PATH_CMD_WATCH_INACTIVE -> {
+                watchActiveUntilMs = 0L
+                publishTrackJob?.cancel()
+            }
+            PATH_CMD_PLAY_PAUSE -> {
+                watchActiveUntilMs = SystemClock.elapsedRealtime() + WATCH_ACTIVE_TTL_MS
+                mainHandler.post { LyricsPlaybackStore.onPlayPause?.invoke() }
+            }
+            PATH_CMD_NEXT -> {
+                watchActiveUntilMs = SystemClock.elapsedRealtime() + WATCH_ACTIVE_TTL_MS
+                mainHandler.post { LyricsPlaybackStore.onNext?.invoke() }
+            }
+            PATH_CMD_PREV -> {
+                watchActiveUntilMs = SystemClock.elapsedRealtime() + WATCH_ACTIVE_TTL_MS
+                mainHandler.post { LyricsPlaybackStore.onPrevious?.invoke() }
+            }
             PATH_CMD_SEEK -> {
+                watchActiveUntilMs = SystemClock.elapsedRealtime() + WATCH_ACTIVE_TTL_MS
                 val posMs = String(event.data, Charsets.UTF_8).toLongOrNull() ?: return
                 mainHandler.post { LyricsPlaybackStore.onSeekTo?.invoke(posMs.coerceAtLeast(0L)) }
             }
             PATH_CMD_REQUEST_SYNC -> {
+                watchActiveUntilMs = SystemClock.elapsedRealtime() + WATCH_ACTIVE_TTL_MS
                 lastPlaybackKey = ""
-                val json = lastTrackJson
-                val art = cachedArtBytes
-                if (json.isNotEmpty()) {
-                    dispatchTrackPayload(json, art)
-                }
                 mainHandler.post {
+                    val title = LyricsPlaybackStore.title.value
+                    val artist = LyricsPlaybackStore.artist.value
+                    val currentKey = "$title|$artist"
+                    if (title.isNotBlank()) {
+                        if (currentKey == lastTrackKey && lastTrackJson.isNotEmpty()) {
+                            dispatchTrackPayload(lastTrackJson, cachedArtBytes)
+                        } else {
+                            publishTrack(
+                                trackKey = currentKey,
+                                title = title,
+                                artist = artist,
+                                durationMs = LyricsPlaybackStore.durationMs.value,
+                                lines = LyricsPlaybackStore.lines.value,
+                                cover = LyricsPlaybackStore.cover.value,
+                                palette = LyricsPlaybackStore.palette.value
+                            )
+                        }
+                    }
                     publishPlayback(
-                        trackKey = lastTrackKey,
+                        trackKey = currentKey,
                         isPlaying = LyricsPlaybackStore.isPlaying.value,
                         positionMs = LyricsPlaybackStore.currentPositionMs(),
                         speed = LyricsPlaybackStore.speed.value,
