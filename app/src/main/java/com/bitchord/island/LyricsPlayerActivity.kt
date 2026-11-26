@@ -8,6 +8,9 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 
 class LyricsPlayerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -18,10 +21,17 @@ class LyricsPlayerActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
         AppPreferences.init(this)
+        applyWindowFrameRate(this, AppPreferences.targetFps.value.fps)
 
         setContent {
             MaterialTheme {
                 val font = rememberDynamicFont()
+                val targetFps by AppPreferences.targetFps.collectAsState()
+
+                LaunchedEffect(targetFps) {
+                    applyWindowFrameRate(this@LyricsPlayerActivity, targetFps.fps)
+                }
+
                 LiquidGlassLyricsPlayerScreen(
                     font = font,
                     showCloseButton = true,
@@ -29,5 +39,10 @@ class LyricsPlayerActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        applyWindowFrameRate(this, AppPreferences.targetFps.value.fps)
     }
 }
