@@ -71,6 +71,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.ExperimentalTextApi
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -249,6 +250,7 @@ private fun buildLiquidGlassRenderEffect(
 // 1. Se esiste res/font/sf_pro.ttf usa SF Pro nativo
 // 2. Altrimenti scarica Inter Variable con TUTTI i pesi reali
 // ------------------------------------------------------------
+@OptIn(ExperimentalTextApi::class)
 @Composable
 fun rememberDynamicFont(): FontFamily {
     val context = LocalContext.current
