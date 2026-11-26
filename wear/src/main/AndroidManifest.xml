@@ -7,7 +7,9 @@
 
     <application
         android:allowBackup="true"
-        android:label="BitChord Lyrics"
+        android:icon="@drawable/ic_launcher_lyrics"
+        android:roundIcon="@drawable/ic_launcher_lyrics"
+        android:label="DynamicLyrics"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault">
 
