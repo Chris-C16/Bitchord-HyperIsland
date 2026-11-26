@@ -91,9 +91,14 @@ class WearLyricsActivity : ComponentActivity() {
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        WearSyncRepository.requestSyncFromPhone()
+     override fun onResume() {
+            super.onResume()
+            WearSyncRepository.requestSyncFromPhone()
+    }
+
+    override fun onStop() {
+        WearSyncRepository.notifyWatchInactive()
+        super.onStop()
     }
 }
 
@@ -163,6 +168,12 @@ private fun rememberComfortaaFamily(): FontFamily {
 
 @Composable
 private fun WearLyricsScreen() {
+        LaunchedEffect(Unit) {
+            while (true) {
+                delay(120_000L)
+                WearSyncRepository.requestSyncFromPhone()
+            }
+        }
     val trackState by WearSyncRepository.track.collectAsState()
     val isPlaying by WearSyncRepository.isPlaying.collectAsState()
     val phoneConnected by WearSyncRepository.phoneConnected.collectAsState()
