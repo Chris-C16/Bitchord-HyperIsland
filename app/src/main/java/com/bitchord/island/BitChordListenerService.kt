@@ -18,6 +18,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
+import android.view.KeyEvent
 import kotlinx.coroutines.*
 
 class BitChordListenerService : NotificationListenerService() {
@@ -33,6 +34,8 @@ class BitChordListenerService : NotificationListenerService() {
         @Volatile
         private var instance: BitChordListenerService? = null
 
+        fun isRunning(): Boolean = instance != null
+
         fun isNotificationAccessGranted(context: Context): Boolean {
             val enabled = Settings.Secure.getString(
                 context.contentResolver,
@@ -42,6 +45,7 @@ class BitChordListenerService : NotificationListenerService() {
         }
 
         fun ensureConnected(context: Context) {
+            AppPreferences.init(context)
             if (!isNotificationAccessGranted(context)) return
             val current = instance
             if (current != null) {
@@ -51,6 +55,46 @@ class BitChordListenerService : NotificationListenerService() {
                     requestRebind(ComponentName(context, BitChordListenerService::class.java))
                 } catch (_: Throwable) {
                 }
+            }
+        }
+
+        fun triggerPlayPreferred(context: Context) {
+            AppPreferences.init(context)
+            val current = instance
+            if (current != null) {
+                current.handlePlayPauseCommand()
+            } else {
+                launchOrResumePreferredApp(context)
+            }
+        }
+
+        private fun launchOrResumePreferredApp(context: Context) {
+            val preferred = AppPreferences.preferredPlayer.value
+            val pkg = AppPreferences.getRememberedPackageFor(context, preferred) ?: return
+            try {
+                // Prova prima un media button mirato esclusivamente al package scelto
+                val now = SystemClock.uptimeMillis()
+                val down = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+                    setPackage(pkg)
+                    putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY, 0))
+                }
+                val up = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+                    setPackage(pkg)
+                    putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY, 0))
+                }
+                context.sendBroadcast(down)
+                context.sendBroadcast(up)
+            } catch (_: Throwable) {
+            }
+
+            try {
+                val launch = context.packageManager.getLaunchIntentForPackage(pkg)?.apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                if (launch != null) {
+                    context.startActivity(launch)
+                }
+            } catch (_: Throwable) {
             }
         }
     }
@@ -119,7 +163,7 @@ class BitChordListenerService : NotificationListenerService() {
     }
 
     private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener {
-        attachToBitChord(it)
+        attachToPreferredSession(it)
     }
 
     private val mediaCallback = object : MediaController.Callback() {
@@ -154,6 +198,7 @@ class BitChordListenerService : NotificationListenerService() {
         override fun onSessionDestroyed() {
             activeController?.unregisterCallback(this)
             activeController = null
+            LyricsPlaybackStore.activePlayerPackage.value = ""
             stopTicker()
             LyricsPlaybackStore.isPlaying.value = false
             wearBridge.clearTrack()
@@ -164,6 +209,7 @@ class BitChordListenerService : NotificationListenerService() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        AppPreferences.init(this)
         notifier = HyperIslandNotifier(this)
         wearBridge = WearLyricsBridge(this)
         sessionManager = getSystemService(MediaSessionManager::class.java)
@@ -178,15 +224,7 @@ class BitChordListenerService : NotificationListenerService() {
         val screenFilter = IntentFilter(Intent.ACTION_SCREEN_ON)
         registerReceiver(screenOnReceiver, screenFilter, RECEIVER_NOT_EXPORTED)
 
-        LyricsPlaybackStore.onPlayPause = {
-            refreshActiveSessions()
-            val ctrl = activeController
-            if (ctrl?.playbackState?.state == PlaybackState.STATE_PLAYING) {
-                ctrl.transportControls?.pause()
-            } else {
-                ctrl?.transportControls?.play()
-            }
-        }
+        LyricsPlaybackStore.onPlayPause = { handlePlayPauseCommand() }
         LyricsPlaybackStore.onNext = {
             refreshActiveSessions()
             activeController?.transportControls?.skipToNext()
@@ -216,6 +254,23 @@ class BitChordListenerService : NotificationListenerService() {
         }
 
         refreshActiveSessions()
+    }
+
+    private fun handlePlayPauseCommand() {
+        refreshActiveSessions()
+        val ctrl = activeController
+        val preferred = AppPreferences.preferredPlayer.value
+
+        if (ctrl != null && (preferred == PreferredPlayer.AUTO || preferred.matches(ctrl.packageName))) {
+            if (ctrl.playbackState?.state == PlaybackState.STATE_PLAYING) {
+                ctrl.transportControls?.pause()
+            } else {
+                ctrl.transportControls?.play()
+            }
+        } else {
+            // La sessione del player scelto era scaduta: risveglia solo il player scelto (mai altri!)
+            launchOrResumePreferredApp(this)
+        }
     }
 
     private fun isCarModeActive(): Boolean {
@@ -256,20 +311,29 @@ class BitChordListenerService : NotificationListenerService() {
                 sessionManager.addOnActiveSessionsChangedListener(sessionsListener, component)
                 isSessionsRegistered = true
             }
-            attachToBitChord(sessionManager.getActiveSessions(component))
+            attachToPreferredSession(sessionManager.getActiveSessions(component))
         } catch (_: SecurityException) {
         }
     }
 
-    private fun attachToBitChord(controllers: List<MediaController>?) {
+    private fun attachToPreferredSession(controllers: List<MediaController>?) {
         val candidates = controllers?.filter { it.packageName != packageName }.orEmpty()
-        val target = candidates.firstOrNull {
-            it.packageName.contains("bitchord", ignoreCase = true) &&
-                it.playbackState?.state == PlaybackState.STATE_PLAYING
+        val preferred = AppPreferences.preferredPlayer.value
+
+        val target = if (preferred == PreferredPlayer.AUTO) {
+            candidates.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+                ?: candidates.firstOrNull()
+        } else {
+            val matching = candidates.filter { preferred.matches(it.packageName) }
+            matching.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+                ?: matching.firstOrNull()
         }
-            ?: candidates.firstOrNull { it.packageName.contains("bitchord", ignoreCase = true) }
-            ?: candidates.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
-            ?: candidates.firstOrNull()
+
+        if (target != null && preferred != PreferredPlayer.AUTO) {
+            AppPreferences.rememberPackageFor(this, preferred, target.packageName)
+        }
+
+        LyricsPlaybackStore.activePlayerPackage.value = target?.packageName.orEmpty()
 
         if (target?.sessionToken == activeController?.sessionToken) {
             if (target != null) {
@@ -323,11 +387,6 @@ class BitChordListenerService : NotificationListenerService() {
         return basePos + (elapsed * LyricsPlaybackStore.speed.value).toLong()
     }
 
-    /**
-     * Aggiorna il clock interno ignorando i micro-rimbalzi all'indietro del PlaybackState
-     * durante la riproduzione continua (causa principale del salto indietro di 1 riga).
-     * Restituisce true se lo stato è effettivamente cambiato in modo significativo.
-     */
     private fun syncPlaybackClock(state: PlaybackState?, forceSync: Boolean): Boolean {
         state ?: return false
         val now = SystemClock.elapsedRealtime()
@@ -451,7 +510,7 @@ class BitChordListenerService : NotificationListenerService() {
             currentLines = emptyList()
             lastLineIndex = -1
             LyricsPlaybackStore.lines.value = emptyList()
-            LyricsPlaybackStore.syncOffsetMs.value = 0L
+            LyricsPlaybackStore.syncOffsetMs.value = AppPreferences.defaultSyncOffsetMs.value
             lastRenderKey = ""
             if (isNewTrack) {
                 syncPlaybackClock(activeController?.playbackState, forceSync = true)
@@ -533,7 +592,6 @@ class BitChordListenerService : NotificationListenerService() {
         val posMs = LyricsPlaybackStore.currentPositionMs()
         var idx = if (currentLines.isEmpty()) -1 else findLineIndex(currentLines, posMs)
 
-        // Isteresi: evita di tornare indietro di 1 riga per micro-ritardi di clock
         if (
             isPlaying &&
             now > userSeekGraceUntilMs &&
