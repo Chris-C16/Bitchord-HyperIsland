@@ -16,11 +16,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -42,6 +42,22 @@ class LyricsPlayerActivity : ComponentActivity() {
     }
 }
 
+private fun findPlayerLineIndex(lines: List<LyricLine>, posMs: Long): Int {
+    var low = 0
+    var high = lines.lastIndex
+    var ans = -1
+    while (low <= high) {
+        val mid = (low + high) ushr 1
+        if (lines[mid].startMs <= posMs) {
+            ans = mid
+            low = mid + 1
+        } else {
+            high = mid - 1
+        }
+    }
+    return ans
+}
+
 @Composable
 private fun LyricsPlayerScreen(onClose: () -> Unit) {
     val title by LyricsPlaybackStore.title.collectAsState()
@@ -52,25 +68,62 @@ private fun LyricsPlayerScreen(onClose: () -> Unit) {
     val isPlaying by LyricsPlaybackStore.isPlaying.collectAsState()
     val durationMs by LyricsPlaybackStore.durationMs.collectAsState()
     val syncOffsetMs by LyricsPlaybackStore.syncOffsetMs.collectAsState()
+    val basePositionMs by LyricsPlaybackStore.basePositionMs.collectAsState()
 
-    var currentPosMs by remember { mutableLongStateOf(LyricsPlaybackStore.currentPositionMs()) }
-    var rawPosMs by remember { mutableLongStateOf(LyricsPlaybackStore.rawPositionMs()) }
-
-    LaunchedEffect(isPlaying, syncOffsetMs) {
-        while (true) {
-            currentPosMs = LyricsPlaybackStore.currentPositionMs()
-            rawPosMs = LyricsPlaybackStore.rawPositionMs()
-            delay(50L)
-        }
+    val coverBitmap = remember(cover) {
+        cover?.takeIf { !it.isRecycled && it.width > 0 && it.height > 0 }?.asImageBitmap()
+    }
+    val backgroundBrush = remember(palette) {
+        Brush.verticalGradient(
+            colors = listOf(palette.primary, palette.secondary, Color(0xFF0A090F))
+        )
     }
 
-    val activeIndex = remember(lines, currentPosMs) {
-        if (lines.isEmpty()) -1 else lines.indexOfLast { currentPosMs >= it.startMs }
+    // Stato del clock letto solo dai micro-composable figli (evita di ricomporre tutta la UI)
+    val currentPosState = remember { mutableLongStateOf(LyricsPlaybackStore.currentPositionMs()) }
+    val rawPosState = remember { mutableLongStateOf(LyricsPlaybackStore.rawPositionMs()) }
+    var activeIndex by remember(lines) { mutableIntStateOf(-1) }
+    var forceNextLineSync by remember { mutableStateOf(true) }
+
+    LaunchedEffect(syncOffsetMs) {
+        forceNextLineSync = true
+    }
+
+    LaunchedEffect(isPlaying, syncOffsetMs, basePositionMs, lines) {
+        while (true) {
+            val pos = LyricsPlaybackStore.currentPositionMs()
+            val raw = LyricsPlaybackStore.rawPositionMs()
+            currentPosState.longValue = pos
+            rawPosState.longValue = raw
+
+            if (lines.isEmpty()) {
+                activeIndex = -1
+            } else {
+                var idx = findPlayerLineIndex(lines, pos)
+                // Isteresi anti-rimbalzo durante il play continuo
+                if (isPlaying && !forceNextLineSync && activeIndex in lines.indices && idx < activeIndex) {
+                    val lagMs = lines[activeIndex].startMs - pos
+                    if (lagMs in 0L..1500L) {
+                        idx = activeIndex
+                    }
+                }
+                forceNextLineSync = false
+                if (idx != activeIndex) {
+                    activeIndex = idx
+                }
+            }
+
+            // In pausa non serve polling continuo
+            if (!isPlaying) break
+
+            val hasWordSync = activeIndex in lines.indices && lines[activeIndex].words.isNotEmpty()
+            delay(if (hasWordSync) 60L else 200L)
+        }
     }
 
     val listState = rememberLazyListState()
     LaunchedEffect(activeIndex) {
-        if (activeIndex >= 0) {
+        if (activeIndex >= 0 && !listState.isScrollInProgress) {
             listState.animateScrollToItem((activeIndex - 1).coerceAtLeast(0))
         }
     }
@@ -78,11 +131,7 @@ private fun LyricsPlayerScreen(onClose: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    colors = listOf(palette.primary, palette.secondary, Color(0xFF0A090F))
-                )
-            )
+            .background(backgroundBrush)
             .statusBarsPadding()
             .navigationBarsPadding()
             .padding(horizontal = 20.dp, vertical = 14.dp)
@@ -92,9 +141,9 @@ private fun LyricsPlayerScreen(onClose: () -> Unit) {
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                if (cover != null) {
+                if (coverBitmap != null) {
                     Image(
-                        bitmap = cover!!.asImageBitmap(),
+                        bitmap = coverBitmap,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
@@ -129,7 +178,9 @@ private fun LyricsPlayerScreen(onClose: () -> Unit) {
 
             if (lines.isEmpty()) {
                 Box(
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
@@ -141,46 +192,27 @@ private fun LyricsPlayerScreen(onClose: () -> Unit) {
             } else {
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
                     contentPadding = PaddingValues(vertical = 32.dp),
                     verticalArrangement = Arrangement.spacedBy(18.dp)
                 ) {
-                    itemsIndexed(lines) { idx, line ->
-                        val isActive = idx == activeIndex
-                        val targetAlpha by animateFloatAsState(
-                            targetValue = if (isActive) 1f else 0.35f,
-                            label = "lineAlpha"
-                        )
-                        val annotated = buildAnnotatedString {
-                            if (isActive && line.words.isNotEmpty()) {
-                                line.words.forEach { w ->
-                                    val spoken = currentPosMs >= w.startMs
-                                    withStyle(
-                                        SpanStyle(
-                                            color = if (spoken) Color.White else Color.White.copy(alpha = 0.45f),
-                                            fontWeight = FontWeight.ExtraBold
-                                        )
-                                    ) {
-                                        append(w.text)
-                                    }
-                                }
-                            } else {
-                                append(line.fullText)
+                    itemsIndexed(
+                        items = lines,
+                        key = { idx, line -> "${idx}_${line.startMs}" }
+                    ) { idx, line ->
+                        LyricLineItem(
+                            line = line,
+                            isActive = idx == activeIndex,
+                            currentPosProvider = { currentPosState.longValue },
+                            onClick = {
+                                forceNextLineSync = true
+                                activeIndex = idx
+                                LyricsPlaybackStore.onSeekTo?.invoke(
+                                    (line.startMs - syncOffsetMs).coerceAtLeast(0L)
+                                )
                             }
-                        }
-
-                        Text(
-                            text = annotated,
-                            color = Color.White,
-                            fontSize = if (isActive) 25.sp else 20.sp,
-                            lineHeight = if (isActive) 32.sp else 26.sp,
-                            fontWeight = if (isActive) FontWeight.ExtraBold else FontWeight.SemiBold,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .alpha(targetAlpha)
-                                .clickable {
-                                    LyricsPlaybackStore.onSeekTo?.invoke((line.startMs - syncOffsetMs).coerceAtLeast(0L))
-                                }
                         )
                     }
                 }
@@ -188,33 +220,11 @@ private fun LyricsPlayerScreen(onClose: () -> Unit) {
 
             Spacer(Modifier.height(12.dp))
 
-            val safeDuration = durationMs.coerceAtLeast(1L)
-            val progress = (rawPosMs.toFloat() / safeDuration.toFloat()).coerceIn(0f, 1f)
-            LinearProgressIndicator(
-                progress = { progress },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(2.dp)),
-                color = Color.White,
-                trackColor = Color.White.copy(alpha = 0.25f)
+            LyricsProgressSection(
+                durationMs = durationMs,
+                syncOffsetMs = syncOffsetMs,
+                rawPosProvider = { rawPosState.longValue }
             )
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(formatTime(rawPosMs), color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
-                if (syncOffsetMs != 0L) {
-                    val sign = if (syncOffsetMs > 0) "+" else ""
-                    Text(
-                        text = "Sync: $sign${syncOffsetMs / 1000f}s",
-                        color = Color.White.copy(alpha = 0.85f),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-                Text(formatTime(durationMs), color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
-            }
 
             Spacer(Modifier.height(10.dp))
 
@@ -244,6 +254,97 @@ private fun LyricsPlayerScreen(onClose: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun LyricLineItem(
+    line: LyricLine,
+    isActive: Boolean,
+    currentPosProvider: () -> Long,
+    onClick: () -> Unit
+) {
+    val animatedAlpha by animateFloatAsState(
+        targetValue = if (isActive) 1f else 0.35f,
+        label = "lineAlpha"
+    )
+
+    val rowModifier = Modifier
+        .fillMaxWidth()
+        .graphicsLayer { alpha = animatedAlpha }
+        .clickable(onClick = onClick)
+
+    if (isActive && line.words.isNotEmpty()) {
+        val posMs = currentPosProvider()
+        val annotated = buildAnnotatedString {
+            line.words.forEach { w ->
+                val spoken = posMs >= w.startMs
+                withStyle(
+                    SpanStyle(
+                        color = if (spoken) Color.White else Color.White.copy(alpha = 0.45f),
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                ) {
+                    append(w.text)
+                }
+            }
+        }
+        Text(
+            text = annotated,
+            color = Color.White,
+            fontSize = 25.sp,
+            lineHeight = 32.sp,
+            fontWeight = FontWeight.ExtraBold,
+            modifier = rowModifier
+        )
+    } else {
+        Text(
+            text = line.fullText,
+            color = Color.White,
+            fontSize = if (isActive) 25.sp else 20.sp,
+            lineHeight = if (isActive) 32.sp else 26.sp,
+            fontWeight = if (isActive) FontWeight.ExtraBold else FontWeight.SemiBold,
+            modifier = rowModifier
+        )
+    }
+}
+
+@Composable
+private fun LyricsProgressSection(
+    durationMs: Long,
+    syncOffsetMs: Long,
+    rawPosProvider: () -> Long
+) {
+    val rawPosMs = rawPosProvider()
+    val safeDuration = durationMs.coerceAtLeast(1L)
+    val progress = (rawPosMs.toFloat() / safeDuration.toFloat()).coerceIn(0f, 1f)
+
+    LinearProgressIndicator(
+        progress = { progress },
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(4.dp)
+            .clip(RoundedCornerShape(2.dp)),
+        color = Color.White,
+        trackColor = Color.White.copy(alpha = 0.25f)
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(formatTime(rawPosMs), color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+        if (syncOffsetMs != 0L) {
+            val sign = if (syncOffsetMs > 0) "+" else ""
+            Text(
+                text = "Sync: $sign${syncOffsetMs / 1000f}s",
+                color = Color.White.copy(alpha = 0.85f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+        }
+        Text(formatTime(durationMs), color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
     }
 }
 
