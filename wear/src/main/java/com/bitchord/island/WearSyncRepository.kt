@@ -47,6 +47,7 @@ object WearSyncRepository : DataClient.OnDataChangedListener, MessageClient.OnMe
     private const val PATH_CMD_PREV = "/bitchord/cmd/prev"
     private const val PATH_CMD_SEEK = "/bitchord/cmd/seek"
     private const val PATH_CMD_REQUEST_SYNC = "/bitchord/cmd/request_sync"
+    private const val PATH_CMD_WATCH_INACTIVE = "/bitchord/cmd/watch_inactive"
 
     private const val BT_ESTIMATED_LATENCY_MS = 45L
     private const val BACKWARD_JITTER_GUARD_MS = 1400L
@@ -80,7 +81,9 @@ object WearSyncRepository : DataClient.OnDataChangedListener, MessageClient.OnMe
         readCachedTrackData(ctx)
         requestSyncFromPhone()
     }
+     
 
+    
     fun currentPositionMs(): Long {
         if (!isPlaying.value) return basePositionMs.value
         val elapsed = (SystemClock.elapsedRealtime() - baseRealtimeMs.value).coerceAtLeast(0L)
@@ -105,6 +108,10 @@ object WearSyncRepository : DataClient.OnDataChangedListener, MessageClient.OnMe
         sendCommand(PATH_CMD_REQUEST_SYNC, ByteArray(0))
     }
 
+    fun notifyWatchInactive() {
+    sendCommand(PATH_CMD_WATCH_INACTIVE, ByteArray(0))
+    }
+    
     private fun sendCommand(path: String, data: ByteArray) {
         val ctx = appContext ?: return
         try {
