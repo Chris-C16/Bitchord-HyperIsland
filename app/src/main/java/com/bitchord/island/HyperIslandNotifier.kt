@@ -45,7 +45,7 @@ class HyperIslandNotifier(private val context: Context) {
 
         // Parametri rotazione 360° del vinile dentro RemoteViews
         private const val SPIN_FRAME_COUNT = 16
-        private const val SPIN_FRAME_SIZE = 56
+        private const val SPIN_FRAME_SIZE = 96
         private const val SPIN_INTERVAL_MS = 125L
 
         private val SPIN_FRAME_IDS = intArrayOf(
@@ -515,7 +515,6 @@ class HyperIslandNotifier(private val context: Context) {
             putString("miui.focus.param.custom", customFocusJson)
             putBundle("miui.focus.pics", focusPics)
             putParcelable("miui.focus.rv", expandedRv)
-            putParcelable("miui.focus.rvNight", expandedRv)
         }
 
         return Notification.Builder(context, CHANNEL_ID)
@@ -709,7 +708,7 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun renderVinylDiscBitmap(cover: Bitmap?, accentColor: Int): Bitmap {
-        val size = 112
+        val size = 128
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val cx = size / 2f
@@ -731,7 +730,7 @@ class HyperIslandNotifier(private val context: Context) {
                 setScale(scale, scale)
                 postTranslate(dx, dy)
             })
-            val artPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            val artPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
                 this.shader = shader
             }
             canvas.drawCircle(cx, cy, outerRadius - 3f, artPaint)
