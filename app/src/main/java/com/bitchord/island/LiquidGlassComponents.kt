@@ -3,8 +3,11 @@ package com.bitchord.island
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.Typeface
+import android.graphics.RenderEffect
+import android.graphics.RuntimeShader
+import android.graphics.Shader
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -47,6 +50,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -56,14 +60,21 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontVariation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -82,10 +93,161 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
 import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.sin
 
 // ------------------------------------------------------------
-// Font: Plus Jakarta Sans (simile a Apple SF Pro / SF Rounded)
+// AGSL Optical Liquid Glass Shader (Android 13+ / HyperOS 3)
+// Rifrazione convessa sui bordi + dispersione RGB + specular rim
+// ------------------------------------------------------------
+private const val LIQUID_GLASS_AGSL = """
+uniform shader composable;
+uniform float4 rect0;
+uniform float radius0;
+uniform float4 rect1;
+uniform float radius1;
+uniform float4 rect2;
+uniform float radius2;
+uniform float density;
+
+float sdRoundBox(float2 p, float2 b, float r) {
+    float2 q = abs(p) - b + float2(r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+}
+
+float3 glassSdf(float2 fragCoord, float4 rect, float radius) {
+    if (rect.z <= rect.x + 2.0 || rect.w <= rect.y + 2.0) {
+        return float3(10000.0, 0.0, 0.0);
+    }
+    float2 center = 0.5 * (rect.xy + rect.zw);
+    float2 halfSize = 0.5 * (rect.zw - rect.xy);
+    float r = min(radius, min(halfSize.x, halfSize.y));
+    float2 p = fragCoord - center;
+    float d = sdRoundBox(p, halfSize, r);
+
+    float eps = 1.6;
+    float gx = sdRoundBox(p + float2(eps, 0.0), halfSize, r) - sdRoundBox(p - float2(eps, 0.0), halfSize, r);
+    float gy = sdRoundBox(p + float2(0.0, eps), halfSize, r) - sdRoundBox(p - float2(0.0, eps), halfSize, r);
+    float len = length(float2(gx, gy));
+    float2 n = len > 0.0001 ? float2(gx, gy) / len : float2(0.0, -1.0);
+    return float3(d, n.x, n.y);
+}
+
+half4 sampleGlassBlur(float2 pos, float blurR) {
+    half4 c = composable.eval(pos) * half(0.28);
+    float2 o1 = float2(blurR, 0.0);
+    float2 o2 = float2(0.0, blurR);
+    float2 o3 = float2(blurR * 0.707, blurR * 0.707);
+    float2 o4 = float2(blurR * 0.707, -blurR * 0.707);
+    c += composable.eval(pos + o1) * half(0.09);
+    c += composable.eval(pos - o1) * half(0.09);
+    c += composable.eval(pos + o2) * half(0.09);
+    c += composable.eval(pos - o2) * half(0.09);
+    c += composable.eval(pos + o3) * half(0.09);
+    c += composable.eval(pos - o3) * half(0.09);
+    c += composable.eval(pos + o4) * half(0.09);
+    c += composable.eval(pos - o4) * half(0.09);
+    return c;
+}
+
+half4 main(float2 fragCoord) {
+    half4 baseColor = composable.eval(fragCoord);
+
+    float3 g0 = glassSdf(fragCoord, rect0, radius0);
+    float3 g1 = glassSdf(fragCoord, rect1, radius1);
+    float3 g2 = glassSdf(fragCoord, rect2, radius2);
+
+    float3 best = g0;
+    if (g1.x < best.x) best = g1;
+    if (g2.x < best.x) best = g2;
+    if (g2.x <= 1.5) best = g2;
+
+    float d = best.x;
+    float2 n = best.yz;
+
+    if (d > 22.0 * density) {
+        return baseColor;
+    }
+
+    // Ombra morbida fluttuante attorno al vetro
+    if (d > 1.0) {
+        float sh = exp(-d / (8.0 * density)) * 0.36;
+        return half4(baseColor.rgb * half(1.0 - sh), baseColor.a);
+    }
+
+    float distIn = max(-d, 0.0);
+    float bevel = 26.0 * density;
+    float edgeT = clamp(1.0 - distIn / bevel, 0.0, 1.0);
+    // Curvatura ottica marcata lungo il bordo, centro cristallino
+    float curve = edgeT * edgeT * edgeT;
+
+    // Rifrazione ottica convessa (curva i contenuti dietro il bordo)
+    float refractMag = curve * 30.0 * density;
+    float2 refractedPos = fragCoord - n * refractMag;
+
+    // Dispersione cromatica RGB prismatica sul bordo curvo
+    float chromaMag = curve * 5.0 * density;
+    float blurR = (2.4 + 2.8 * (1.0 - edgeT)) * density;
+
+    half rChan = sampleGlassBlur(refractedPos + n * chromaMag, blurR).r;
+    half gChan = sampleGlassBlur(refractedPos, blurR).g;
+    half bChan = sampleGlassBlur(refractedPos - n * chromaMag, blurR).b;
+    half3 glassRgb = half3(rChan, gChan, bChan);
+
+    // Vetro limpido e brillante (boost saturazione + luminosità da lente)
+    half luma = dot(glassRgb, half3(0.299, 0.587, 0.114));
+    glassRgb = mix(half3(luma), glassRgb, half(1.26));
+    glassRgb = glassRgb * half(1.08) + half3(0.045);
+
+    // Riflesso speculare Fresnel Apple Liquid Glass
+    float2 lightDir = normalize(float2(-0.58, -0.81));
+    float specPrimary = pow(max(dot(n, lightDir), 0.0), 2.1);
+    float specSecondary = pow(max(dot(n, -lightDir), 0.0), 2.5) * 0.72;
+    float rimLine = smoothstep(2.8 * density, 0.0, distIn);
+    float innerCaustic = smoothstep(14.0 * density, 0.0, distIn) * 0.24;
+
+    half specular = half(
+        rimLine * (0.34 + 0.66 * (specPrimary + specSecondary)) +
+        innerCaustic * (0.30 + 0.70 * specPrimary)
+    );
+    glassRgb = clamp(glassRgb + half3(specular), half3(0.0), half3(1.0));
+
+    float insideMask = smoothstep(1.0, -1.0, d);
+    half3 finalRgb = mix(baseColor.rgb, glassRgb, half(insideMask));
+    return half4(finalRgb, baseColor.a);
+}
+"""
+
+private fun buildLiquidGlassRenderEffect(
+    rect0: Rect,
+    radius0Px: Float,
+    rect1: Rect,
+    radius1Px: Float,
+    rect2: Rect,
+    radius2Px: Float,
+    densityPx: Float
+): androidx.compose.ui.graphics.RenderEffect? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
+    return try {
+        val shader = RuntimeShader(LIQUID_GLASS_AGSL).apply {
+            setFloatUniform("rect0", rect0.left, rect0.top, rect0.right, rect0.bottom)
+            setFloatUniform("radius0", radius0Px)
+            setFloatUniform("rect1", rect1.left, rect1.top, rect1.right, rect1.bottom)
+            setFloatUniform("radius1", radius1Px)
+            setFloatUniform("rect2", rect2.left, rect2.top, rect2.right, rect2.bottom)
+            setFloatUniform("radius2", radius2Px)
+            setFloatUniform("density", densityPx)
+        }
+        RenderEffect.createRuntimeShaderEffect(shader, "composable").asComposeRenderEffect()
+    } catch (_: Throwable) {
+        null
+    }
+}
+
+// ------------------------------------------------------------
+// Font stile Apple SF Pro Display:
+// 1. Se esiste res/font/sf_pro.ttf usa SF Pro nativo
+// 2. Altrimenti scarica Inter Variable con TUTTI i pesi reali
 // ------------------------------------------------------------
 @Composable
 fun rememberDynamicFont(): FontFamily {
@@ -93,19 +255,32 @@ fun rememberDynamicFont(): FontFamily {
     val family by produceState<FontFamily>(initialValue = FontFamily.SansSerif) {
         val loaded = withContext(Dispatchers.IO) {
             try {
+                // Supporto automatico se carichi sf_pro.ttf in res/font/
+                val localSfProId = context.resources.getIdentifier("sf_pro", "font", context.packageName)
+                if (localSfProId != 0) {
+                    return@withContext FontFamily(
+                        Font(localSfProId, FontWeight.Normal, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(400))),
+                        Font(localSfProId, FontWeight.Medium, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(500))),
+                        Font(localSfProId, FontWeight.SemiBold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(600))),
+                        Font(localSfProId, FontWeight.Bold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(700))),
+                        Font(localSfProId, FontWeight.ExtraBold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(800)))
+                    )
+                }
+
                 val dir = File(context.filesDir, "fonts")
-                val file = File(dir, "PlusJakartaSans.ttf")
-                if (!file.exists() || file.length() < 15_000L) {
+                val file = File(dir, "InterAppleStyle.ttf")
+                if (!file.exists() || file.length() < 40_000L) {
                     if (!dir.exists()) dir.mkdirs()
                     val urls = listOf(
-                        "https://raw.githubusercontent.com/google/fonts/main/ofl/plusjakartasans/PlusJakartaSans%5Bwght%5D.ttf",
-                        "https://raw.githubusercontent.com/google/fonts/main/ofl/outfit/Outfit%5Bwght%5D.ttf"
+                        "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/Inter%5Bopsz%2Cwght%5D.ttf",
+                        "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/Inter%5Bslnt%2Cwght%5D.ttf",
+                        "https://github.com/rsms/inter/raw/master/docs/font-files/InterVariable.ttf"
                     )
                     for (urlStr in urls) {
                         try {
                             val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-                                connectTimeout = 5000
-                                readTimeout = 5000
+                                connectTimeout = 6000
+                                readTimeout = 6000
                                 instanceFollowRedirects = true
                             }
                             if (conn.responseCode in 200..299) {
@@ -113,7 +288,7 @@ fun rememberDynamicFont(): FontFamily {
                                     file.outputStream().use { output -> input.copyTo(output) }
                                 }
                                 conn.disconnect()
-                                if (file.length() > 15_000L) break
+                                if (file.length() > 40_000L) break
                             } else {
                                 conn.disconnect()
                             }
@@ -121,8 +296,14 @@ fun rememberDynamicFont(): FontFamily {
                         }
                     }
                 }
-                if (file.exists() && file.length() > 15_000L) {
-                    FontFamily(Typeface.createFromFile(file))
+                if (file.exists() && file.length() > 40_000L) {
+                    FontFamily(
+                        Font(file, FontWeight.Normal, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(400))),
+                        Font(file, FontWeight.Medium, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(500))),
+                        Font(file, FontWeight.SemiBold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(600))),
+                        Font(file, FontWeight.Bold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(700))),
+                        Font(file, FontWeight.ExtraBold, FontStyle.Normal, FontVariation.Settings(FontVariation.weight(800)))
+                    )
                 } else {
                     null
                 }
@@ -136,46 +317,42 @@ fun rememberDynamicFont(): FontFamily {
 }
 
 // ------------------------------------------------------------
-// Modificatore Apple Liquid Glass (rifrazione + bordo speculare)
+// Modificatore Crystal Glass per pulsanti interni e card
 // ------------------------------------------------------------
-fun Modifier.liquidGlass(
-    shape: Shape = RoundedCornerShape(26.dp),
-    tint: Color = Color(0xFF14141F),
-    tintAlpha: Float = 0.42f,
-    highlightAlpha: Float = 0.22f,
-    borderAlpha: Float = 0.42f
+fun Modifier.crystalGlassButton(
+    shape: Shape = CircleShape,
+    highlightBoost: Float = 0.22f
 ): Modifier = this
     .clip(shape)
-    .background(tint.copy(alpha = tintAlpha))
     .background(
         Brush.verticalGradient(
-            0.0f to Color.White.copy(alpha = highlightAlpha),
-            0.35f to Color.White.copy(alpha = highlightAlpha * 0.30f),
-            1.0f to Color.White.copy(alpha = highlightAlpha * 0.48f)
+            0.0f to Color.White.copy(alpha = highlightBoost),
+            0.45f to Color.White.copy(alpha = 0.05f),
+            1.0f to Color.White.copy(alpha = highlightBoost * 0.55f)
         )
     )
     .border(
         width = 1.dp,
         brush = Brush.linearGradient(
-            0.0f to Color.White.copy(alpha = borderAlpha),
-            0.48f to Color.White.copy(alpha = borderAlpha * 0.16f),
-            1.0f to Color.White.copy(alpha = borderAlpha * 0.56f)
+            0.0f to Color.White.copy(alpha = 0.65f),
+            0.45f to Color.White.copy(alpha = 0.14f),
+            1.0f to Color.White.copy(alpha = 0.45f)
         ),
         shape = shape
     )
 
 // ------------------------------------------------------------
-// Sfondo Liquid Ambient (copertina pre-scalata 24x24 a 0 lag)
+// Sfondo Vivido per Rifrazione Liquid Glass (copertina + aurora)
 // ------------------------------------------------------------
 @Composable
 fun LiquidAmbientBackground(
     cover: Bitmap?,
     palette: CoverPalette
 ) {
-    val softCover = remember(cover) {
+    val coverImg = remember(cover) {
         if (cover != null && !cover.isRecycled && cover.width > 0 && cover.height > 0) {
             try {
-                Bitmap.createScaledBitmap(cover, 24, 24, true).asImageBitmap()
+                Bitmap.createScaledBitmap(cover, 128, 128, true).asImageBitmap()
             } catch (_: Throwable) {
                 null
             }
@@ -184,41 +361,72 @@ fun LiquidAmbientBackground(
         }
     }
 
-    val baseBrush = remember(palette) {
+    val blurEffect = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            RenderEffect.createBlurEffect(65f, 65f, Shader.TileMode.CLAMP).asComposeRenderEffect()
+        } else {
+            null
+        }
+    }
+
+    val fallbackBrush = remember(palette) {
         Brush.verticalGradient(
             colors = listOf(
-                palette.primary.copy(alpha = 0.92f),
-                palette.secondary.copy(alpha = 0.96f),
-                Color(0xFF07070C)
+                palette.accent.copy(alpha = 0.72f),
+                palette.primary,
+                Color(0xFF0A0A14)
             )
         )
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(baseBrush)) {
-        if (softCover != null) {
+    Box(modifier = Modifier.fillMaxSize().background(fallbackBrush)) {
+        if (coverImg != null) {
             Image(
-                bitmap = softCover,
+                bitmap = coverImg,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 filterQuality = FilterQuality.High,
                 modifier = Modifier
                     .fillMaxSize()
-                    .graphicsLayer { alpha = 0.55f }
+                    .graphicsLayer {
+                        scaleX = 1.25f
+                        scaleY = 1.25f
+                        renderEffect = blurEffect
+                    }
             )
+        } else {
+            // Sfere luminose vivide quando non c'è copertina, così il vetro rifrange luce reale
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        listOf(Color(0xFF6366F1).copy(alpha = 0.55f), Color.Transparent),
+                        center = Offset(size.width * 0.22f, size.height * 0.18f),
+                        radius = size.width * 0.75f
+                    ),
+                    center = Offset(size.width * 0.22f, size.height * 0.18f),
+                    radius = size.width * 0.75f
+                )
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        listOf(Color(0xFFEC4899).copy(alpha = 0.42f), Color.Transparent),
+                        center = Offset(size.width * 0.85f, size.height * 0.78f),
+                        radius = size.width * 0.75f
+                    ),
+                    center = Offset(size.width * 0.85f, size.height * 0.78f),
+                    radius = size.width * 0.75f
+                )
+            }
         }
 
-        // Glow superiore morbido che riflette dietro le superfici in vetro
+        // Leggero scrim contrasto per tenere i testi bianchi leggibili senza spegnere i colori
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
-                    Brush.radialGradient(
-                        colors = listOf(
-                            palette.accent.copy(alpha = 0.24f),
-                            Color(0xFF07070C).copy(alpha = 0.62f),
-                            Color(0xFF050509).copy(alpha = 0.88f)
-                        ),
-                        radius = 1200f
+                    Brush.verticalGradient(
+                        0.0f to Color.Black.copy(alpha = 0.22f),
+                        0.5f to Color.Black.copy(alpha = 0.34f),
+                        1.0f to Color.Black.copy(alpha = 0.48f)
                     )
                 )
         )
@@ -226,7 +434,7 @@ fun LiquidAmbientBackground(
 }
 
 // ------------------------------------------------------------
-// Nuova Icona Liquid Glass Animata (Splash Screen)
+// Splash Animato Liquid Glass
 // ------------------------------------------------------------
 @Composable
 fun DynamicLyricsSplashScreen(
@@ -237,12 +445,12 @@ fun DynamicLyricsSplashScreen(
 
     LaunchedEffect(Unit) {
         entered = true
-        delay(1350L)
+        delay(1250L)
         onFinished()
     }
 
     val scale by animateFloatAsState(
-        targetValue = if (entered) 1f else 0.72f,
+        targetValue = if (entered) 1f else 0.74f,
         animationSpec = spring(
             dampingRatio = Spring.DampingRatioMediumBouncy,
             stiffness = Spring.StiffnessLow
@@ -251,7 +459,7 @@ fun DynamicLyricsSplashScreen(
     )
     val contentAlpha by animateFloatAsState(
         targetValue = if (entered) 1f else 0f,
-        animationSpec = tween(420, easing = FastOutSlowInEasing),
+        animationSpec = tween(380, easing = FastOutSlowInEasing),
         label = "splashAlpha"
     )
 
@@ -260,7 +468,7 @@ fun DynamicLyricsSplashScreen(
         initialValue = 0f,
         targetValue = (2f * PI).toFloat(),
         animationSpec = infiniteRepeatable(
-            animation = tween(1150, easing = LinearEasing),
+            animation = tween(1100, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
         label = "wavePhase"
@@ -269,7 +477,7 @@ fun DynamicLyricsSplashScreen(
         initialValue = -0.6f,
         targetValue = 1.6f,
         animationSpec = infiniteRepeatable(
-            animation = tween(1300, easing = FastOutSlowInEasing),
+            animation = tween(1250, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Restart
         ),
         label = "shimmer"
@@ -280,22 +488,21 @@ fun DynamicLyricsSplashScreen(
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(Color(0xFF141126), Color(0xFF0B0A14), Color(0xFF06060A))
+                    listOf(Color(0xFF15122B), Color(0xFF0B0A16), Color(0xFF06060C))
                 )
             ),
         contentAlignment = Alignment.Center
     ) {
-        // Alone luminoso dietro l'icona
         Box(
             modifier = Modifier
-                .size(240.dp)
-                .graphicsLayer { alpha = contentAlpha * 0.7f }
+                .size(250.dp)
+                .graphicsLayer { alpha = contentAlpha * 0.78f }
                 .drawBehind {
                     drawCircle(
                         brush = Brush.radialGradient(
                             colors = listOf(
-                                Color(0xFF7C3AED).copy(alpha = 0.42f),
-                                Color(0xFF06B6D4).copy(alpha = 0.16f),
+                                Color(0xFF7C3AED).copy(alpha = 0.46f),
+                                Color(0xFF06B6D4).copy(alpha = 0.22f),
                                 Color.Transparent
                             )
                         )
@@ -315,22 +522,18 @@ fun DynamicLyricsSplashScreen(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .size(104.dp)
-                    .liquidGlass(
+                    .crystalGlassButton(
                         shape = RoundedCornerShape(30.dp),
-                        tint = Color(0xFF161529),
-                        tintAlpha = 0.62f,
-                        highlightAlpha = 0.30f,
-                        borderAlpha = 0.58f
+                        highlightBoost = 0.30f
                     )
             ) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
-                    // Riflesso diagonale Liquid Glass
                     val sheenX = size.width * shimmer
                     drawRect(
                         brush = Brush.linearGradient(
                             colors = listOf(
                                 Color.Transparent,
-                                Color.White.copy(alpha = 0.22f),
+                                Color.White.copy(alpha = 0.28f),
                                 Color.Transparent
                             ),
                             start = Offset(sheenX - size.width * 0.45f, 0f),
@@ -338,7 +541,6 @@ fun DynamicLyricsSplashScreen(
                         )
                     )
 
-                    // 5 barre onda sonora fluide
                     val barColors = listOf(
                         Color(0xFF38BDF8),
                         Color(0xFF818CF8),
@@ -373,8 +575,8 @@ fun DynamicLyricsSplashScreen(
                 text = "DynamicLyrics",
                 fontFamily = font,
                 fontWeight = FontWeight.Bold,
-                fontSize = 24.sp,
-                letterSpacing = (-0.4).sp,
+                fontSize = 25.sp,
+                letterSpacing = (-0.6).sp,
                 color = Color.White
             )
             Spacer(Modifier.height(4.dp))
@@ -383,7 +585,8 @@ fun DynamicLyricsSplashScreen(
                 fontFamily = font,
                 fontWeight = FontWeight.Medium,
                 fontSize = 12.sp,
-                color = Color.White.copy(alpha = 0.55f)
+                letterSpacing = (-0.1).sp,
+                color = Color.White.copy(alpha = 0.58f)
             )
         }
     }
@@ -398,13 +601,29 @@ fun LiquidPermissionsScreen(
     onAllReady: () -> Unit
 ) {
     val context = LocalContext.current
+    val density = LocalDensity.current
     val appInfoDone by AppPreferences.appInfoStepDone.collectAsState()
     var notifGranted by remember {
         mutableStateOf(BitChordListenerService.isNotificationAccessGranted(context))
     }
     var awaitingAppInfoReturn by remember { mutableStateOf(false) }
 
-    // Ricontrolla automaticamente i permessi al ritorno dalle impostazioni di sistema
+    var rootTopLeft by remember { mutableStateOf(Offset.Zero) }
+    var card1Rect by remember { mutableStateOf(Rect.Zero) }
+    var card2Rect by remember { mutableStateOf(Rect.Zero) }
+
+    val glassEffect = remember(card1Rect, card2Rect, density.density) {
+        buildLiquidGlassRenderEffect(
+            rect0 = card1Rect,
+            radius0Px = with(density) { 28.dp.toPx() },
+            rect1 = card2Rect,
+            radius1Px = with(density) { 28.dp.toPx() },
+            rect2 = Rect.Zero,
+            radius2Px = 0f,
+            densityPx = density.density
+        )
+    }
+
     DisposableEffect(context) {
         val owner = context as? LifecycleOwner
         val observer = LifecycleEventObserver { _, event ->
@@ -428,17 +647,23 @@ fun LiquidPermissionsScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFF1A1533), Color(0xFF0E0C1A), Color(0xFF07070C))
-                )
-            )
-            .statusBarsPadding()
-            .navigationBarsPadding()
-            .padding(horizontal = 22.dp, vertical = 20.dp)
+            .onGloballyPositioned { rootTopLeft = it.boundsInRoot().topLeft }
     ) {
+        // Sfondo rifratto dallo shader Liquid Glass
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer { renderEffect = glassEffect }
+        ) {
+            LiquidAmbientBackground(cover = null, palette = CoverPalette())
+        }
+
         Column(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(horizontal = 22.dp, vertical = 20.dp),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
@@ -446,7 +671,8 @@ fun LiquidPermissionsScreen(
                 text = "Configura DynamicLyrics",
                 fontFamily = font,
                 fontWeight = FontWeight.Bold,
-                fontSize = 24.sp,
+                fontSize = 26.sp,
+                letterSpacing = (-0.6).sp,
                 color = Color.White,
                 textAlign = TextAlign.Center
             )
@@ -455,20 +681,23 @@ fun LiquidPermissionsScreen(
                 text = "Solo 2 passaggi rapidi per attivare i testi in tempo reale.",
                 fontFamily = font,
                 fontSize = 14.sp,
-                color = Color.White.copy(alpha = 0.68f),
+                letterSpacing = (-0.2).sp,
+                color = Color.White.copy(alpha = 0.74f),
                 textAlign = TextAlign.Center
             )
 
             Spacer(Modifier.height(28.dp))
 
-            // STEP 1: Info App (impostazioni con restrizioni / batteria HyperOS)
             PermissionGlassCard(
                 stepNumber = "1",
                 title = "Info App",
                 subtitle = "Consenti impostazioni con restrizioni e nessuna limitazione batteria.",
-                buttonLabel = if (appInfoDone) "Riapri" else "Apri Info App",
+                buttonLabel = if (appInfoDone) "Riapri" else "Apri",
                 completed = appInfoDone,
                 font = font,
+                modifier = Modifier.onGloballyPositioned {
+                    card1Rect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                },
                 onClick = {
                     awaitingAppInfoReturn = true
                     openAppInfoSettings(context)
@@ -477,17 +706,17 @@ fun LiquidPermissionsScreen(
 
             Spacer(Modifier.height(14.dp))
 
-            // STEP 2: Accesso alle notifiche
             PermissionGlassCard(
                 stepNumber = "2",
                 title = "Accesso alle notifiche",
                 subtitle = "Necessario per leggere il brano in riproduzione e sincronizzare i testi.",
-                buttonLabel = if (notifGranted) "Attivo" else "Attiva ora",
+                buttonLabel = if (notifGranted) "Attivo" else "Attiva",
                 completed = notifGranted,
                 font = font,
-                onClick = {
-                    openNotificationListenerSettings(context)
-                }
+                modifier = Modifier.onGloballyPositioned {
+                    card2Rect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                },
+                onClick = { openNotificationListenerSettings(context) }
             )
         }
     }
@@ -501,18 +730,14 @@ private fun PermissionGlassCard(
     buttonLabel: String,
     completed: Boolean,
     font: FontFamily,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .liquidGlass(
-                shape = RoundedCornerShape(26.dp),
-                tintAlpha = 0.48f,
-                highlightAlpha = 0.22f,
-                borderAlpha = if (completed) 0.55f else 0.36f
-            )
+            .clip(RoundedCornerShape(28.dp))
             .clickable(onClick = onClick)
             .padding(horizontal = 18.dp, vertical = 18.dp)
     ) {
@@ -520,20 +745,10 @@ private fun PermissionGlassCard(
             contentAlignment = Alignment.Center,
             modifier = Modifier
                 .size(38.dp)
-                .clip(CircleShape)
-                .background(
-                    if (completed) Color(0xFF34D399).copy(alpha = 0.22f)
-                    else Color.White.copy(alpha = 0.14f)
-                )
-                .border(
-                    1.dp,
-                    if (completed) Color(0xFF34D399).copy(alpha = 0.7f)
-                    else Color.White.copy(alpha = 0.32f),
-                    CircleShape
-                )
+                .crystalGlassButton(CircleShape, highlightBoost = 0.24f)
         ) {
             if (completed) {
-                CheckIcon(color = Color(0xFF34D399), size = 18.dp)
+                CheckIcon(color = Color(0xFF4ADE80), size = 18.dp)
             } else {
                 Text(
                     text = stepNumber,
@@ -553,6 +768,7 @@ private fun PermissionGlassCard(
                 fontFamily = font,
                 fontWeight = FontWeight.Bold,
                 fontSize = 16.sp,
+                letterSpacing = (-0.3).sp,
                 color = Color.White
             )
             Spacer(Modifier.height(3.dp))
@@ -561,7 +777,7 @@ private fun PermissionGlassCard(
                 fontFamily = font,
                 fontSize = 12.sp,
                 lineHeight = 16.sp,
-                color = Color.White.copy(alpha = 0.68f)
+                color = Color.White.copy(alpha = 0.76f)
             )
         }
 
@@ -569,28 +785,22 @@ private fun PermissionGlassCard(
 
         Box(
             modifier = Modifier
-                .liquidGlass(
-                    shape = RoundedCornerShape(50),
-                    tint = if (completed) Color(0xFF0D3B2E) else Color(0xFF282442),
-                    tintAlpha = 0.65f,
-                    highlightAlpha = 0.24f,
-                    borderAlpha = 0.45f
-                )
-                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .crystalGlassButton(RoundedCornerShape(50), highlightBoost = 0.26f)
+                .padding(horizontal = 14.dp, vertical = 8.dp)
         ) {
             Text(
                 text = buttonLabel,
                 fontFamily = font,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 12.sp,
-                color = if (completed) Color(0xFF6EE7B7) else Color.White
+                color = if (completed) Color(0xFF86EFAC) else Color.White
             )
         }
     }
 }
 
 // ------------------------------------------------------------
-// Player Lyrics Liquid Glass Unificato + Hamburger Menu
+// Player Lyrics con VERO Apple Liquid Glass (Rifrazione Live)
 // ------------------------------------------------------------
 private fun findLiquidLineIndex(lines: List<LyricLine>, posMs: Long): Int {
     var low = 0
@@ -615,6 +825,7 @@ fun LiquidGlassLyricsPlayerScreen(
     onClose: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
+    val density = LocalDensity.current
     val title by LyricsPlaybackStore.title.collectAsState()
     val artist by LyricsPlaybackStore.artist.collectAsState()
     val cover by LyricsPlaybackStore.cover.collectAsState()
@@ -629,21 +840,43 @@ fun LiquidGlassLyricsPlayerScreen(
     var menuExpanded by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
     var statusBannerText by remember { mutableStateOf<String?>(null) }
-    var serviceHealthy by remember {
-        mutableStateOf(
-            BitChordListenerService.isNotificationAccessGranted(context) &&
-                BitChordListenerService.isRunning()
+
+    // Coordinate reali dei pannelli Liquid Glass per la rifrazione GPU
+    var rootTopLeft by remember { mutableStateOf(Offset.Zero) }
+    var topBarRect by remember { mutableStateOf(Rect.Zero) }
+    var bottomDockRect by remember { mutableStateOf(Rect.Zero) }
+    var overlayRect by remember { mutableStateOf(Rect.Zero) }
+    var overlayRadiusDp by remember { mutableStateOf(26.dp) }
+
+    LaunchedEffect(menuExpanded, showSettingsSheet) {
+        if (!menuExpanded && !showSettingsSheet) {
+            overlayRect = Rect.Zero
+        }
+    }
+
+    val liquidRenderEffect = remember(
+        topBarRect,
+        bottomDockRect,
+        overlayRect,
+        overlayRadiusDp,
+        density.density
+    ) {
+        buildLiquidGlassRenderEffect(
+            rect0 = topBarRect,
+            radius0Px = with(density) { 30.dp.toPx() },
+            rect1 = bottomDockRect,
+            radius1Px = with(density) { 32.dp.toPx() },
+            rect2 = overlayRect,
+            radius2Px = with(density) { overlayRadiusDp.toPx() },
+            densityPx = density.density
         )
     }
 
-    // Aggiorna lo stato reale del servizio quando si torna in app
     DisposableEffect(context) {
         val owner = context as? LifecycleOwner
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 BitChordListenerService.ensureConnected(context)
-                serviceHealthy = BitChordListenerService.isNotificationAccessGranted(context) &&
-                    BitChordListenerService.isRunning()
             }
         }
         owner?.lifecycle?.addObserver(observer)
@@ -661,7 +894,6 @@ fun LiquidGlassLyricsPlayerScreen(
         cover?.takeIf { !it.isRecycled && it.width > 0 && it.height > 0 }?.asImageBitmap()
     }
 
-    // Stato clock isolato (evita ricomposizioni della schermata intera)
     val currentPosState = remember { mutableLongStateOf(LyricsPlaybackStore.currentPositionMs()) }
     val rawPosState = remember { mutableLongStateOf(LyricsPlaybackStore.rawPositionMs()) }
     var activeIndex by remember(lines) { mutableIntStateOf(-1) }
@@ -705,259 +937,253 @@ fun LiquidGlassLyricsPlayerScreen(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        LiquidAmbientBackground(cover = cover, palette = palette)
-
-        Column(
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { rootTopLeft = it.boundsInRoot().topLeft }
+    ) {
+        // ============================================================
+        // STRATO 1 (SOTTO IL VETRO): Sfondo vivido + Testi full-bleed
+        // Lo shader AGSL rifrange e curva i testi che scorrono dietro!
+        // ============================================================
+        Box(
             modifier = Modifier
                 .fillMaxSize()
-                .statusBarsPadding()
-                .navigationBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .graphicsLayer { renderEffect = liquidRenderEffect }
         ) {
-            // 1. TOP BAR LIQUID GLASS (Cover + Titolo + Menu Hamburger a destra)
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .liquidGlass(
-                        shape = RoundedCornerShape(28.dp),
-                        tintAlpha = 0.40f,
-                        highlightAlpha = 0.24f,
-                        borderAlpha = 0.44f
-                    )
-                    .padding(horizontal = 12.dp, vertical = 10.dp)
-            ) {
-                if (coverBitmap != null) {
-                    Image(
-                        bitmap = coverBitmap,
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .size(46.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .border(1.dp, Color.White.copy(alpha = 0.28f), RoundedCornerShape(14.dp))
-                    )
-                } else {
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .size(46.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(Color.White.copy(alpha = 0.12f))
-                    ) {
-                        MiniWaveIcon(size = 22.dp)
-                    }
-                }
+            LiquidAmbientBackground(cover = cover, palette = palette)
 
-                Spacer(Modifier.width(12.dp))
-
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = title.ifBlank { "DynamicLyrics" },
-                        fontFamily = font,
-                        color = Color.White,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = artist.ifBlank { "Pronto per ${preferredPlayer.label}" },
-                        fontFamily = font,
-                        color = Color.White.copy(alpha = 0.68f),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                if (showCloseButton && onClose != null) {
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .size(38.dp)
-                            .liquidGlass(
-                                shape = CircleShape,
-                                tintAlpha = 0.35f,
-                                highlightAlpha = 0.20f,
-                                borderAlpha = 0.36f
-                            )
-                            .clickable(onClick = onClose)
-                    ) {
-                        CloseIcon(size = 15.dp)
-                    }
-                    Spacer(Modifier.width(8.dp))
-                }
-
-                // Pulsante Hamburger in alto a destra
-                Box(
-                    contentAlignment = Alignment.Center,
+            if (lines.isEmpty()) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
                     modifier = Modifier
-                        .size(40.dp)
-                        .liquidGlass(
-                            shape = CircleShape,
-                            tintAlpha = if (menuExpanded) 0.62f else 0.38f,
-                            highlightAlpha = 0.26f,
-                            borderAlpha = 0.48f
-                        )
-                        .clickable { menuExpanded = !menuExpanded }
+                        .fillMaxSize()
+                        .padding(horizontal = 32.dp)
                 ) {
-                    HamburgerIcon(size = 18.dp)
-                }
-            }
-
-            Spacer(Modifier.height(14.dp))
-
-            // 2. AREA TESTI LIQUID GLASS
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-            ) {
-                if (lines.isEmpty()) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center,
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .fillMaxWidth()
-                            .liquidGlass(
-                                shape = RoundedCornerShape(30.dp),
-                                tintAlpha = 0.36f,
-                                highlightAlpha = 0.18f,
-                                borderAlpha = 0.36f
-                            )
-                            .padding(horizontal = 24.dp, vertical = 28.dp)
-                    ) {
-                        Text(
-                            text = if (title.isBlank()) {
-                                "Nessun brano in riproduzione"
-                            } else {
-                                "Nessun testo sincronizzato"
-                            },
-                            fontFamily = font,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 17.sp,
-                            color = Color.White,
-                            textAlign = TextAlign.Center
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            text = if (title.isBlank()) {
-                                "Premi Play qui sotto per avviare ${preferredPlayer.label}"
-                            } else {
-                                "Questo brano non ha un testo sincronizzato disponibile."
-                            },
-                            fontFamily = font,
-                            fontSize = 13.sp,
-                            color = Color.White.copy(alpha = 0.68f),
-                            textAlign = TextAlign.Center
-                        )
-                    }
-                } else {
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(top = 24.dp, bottom = 36.dp, start = 6.dp, end = 6.dp),
-                        verticalArrangement = Arrangement.spacedBy(18.dp)
-                    ) {
-                        itemsIndexed(
-                            items = lines,
-                            key = { idx, line -> "${idx}_${line.startMs}" }
-                        ) { idx, line ->
-                            LiquidLyricLineItem(
-                                line = line,
-                                isActive = idx == activeIndex,
-                                font = font,
-                                currentPosProvider = { currentPosState.longValue },
-                                onClick = {
-                                    forceNextLineSync = true
-                                    activeIndex = idx
-                                    LyricsPlaybackStore.onSeekTo?.invoke(
-                                        (line.startMs - syncOffsetMs).coerceAtLeast(0L)
-                                    )
-                                }
-                            )
-                        }
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            // 3. DOCK CONTROLLI LIQUID GLASS (Progress + Offset + Media)
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .liquidGlass(
-                        shape = RoundedCornerShape(30.dp),
-                        tintAlpha = 0.44f,
-                        highlightAlpha = 0.22f,
-                        borderAlpha = 0.42f
+                    Text(
+                        text = if (title.isBlank()) "Nessun brano attivo" else "Nessun testo sincronizzato",
+                        fontFamily = font,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp,
+                        letterSpacing = (-0.5).sp,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
                     )
-                    .padding(horizontal = 16.dp, vertical = 14.dp)
-            ) {
-                LiquidProgressSection(
-                    durationMs = durationMs,
-                    syncOffsetMs = syncOffsetMs,
-                    font = font,
-                    rawPosProvider = { rawPosState.longValue }
-                )
-
-                Spacer(Modifier.height(12.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = if (title.isBlank()) {
+                            "Premi Play qui sotto per avviare la musica"
+                        } else {
+                            "Nessun testo sincronizzato trovato per questo brano"
+                        },
+                        fontFamily = font,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 14.sp,
+                        letterSpacing = (-0.2).sp,
+                        color = Color.White.copy(alpha = 0.72f),
+                        textAlign = TextAlign.Center
+                    )
+                }
+            } else {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(
+                        top = 132.dp,
+                        bottom = 178.dp,
+                        start = 22.dp,
+                        end = 22.dp
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(20.dp)
                 ) {
-                    GlassPillTextButton(
-                        label = "-0.5s",
-                        font = font,
-                        onClick = { LyricsPlaybackStore.syncOffsetMs.value -= 500L }
-                    )
-
-                    GlassCircleIconButton(
-                        size = 44.dp,
-                        onClick = { LyricsPlaybackStore.onPrevious?.invoke() }
-                    ) {
-                        SkipPrevIcon(size = 18.dp)
-                    }
-
-                    GlassCircleIconButton(
-                        size = 58.dp,
-                        elevated = true,
-                        onClick = {
-                            val handler = LyricsPlaybackStore.onPlayPause
-                            if (handler != null) {
-                                handler.invoke()
-                            } else {
-                                BitChordListenerService.triggerPlayPreferred(context)
+                    itemsIndexed(
+                        items = lines,
+                        key = { idx, line -> "${idx}_${line.startMs}" }
+                    ) { idx, line ->
+                        LiquidLyricLineItem(
+                            line = line,
+                            isActive = idx == activeIndex,
+                            font = font,
+                            currentPosProvider = { currentPosState.longValue },
+                            onClick = {
+                                forceNextLineSync = true
+                                activeIndex = idx
+                                LyricsPlaybackStore.onSeekTo?.invoke(
+                                    (line.startMs - syncOffsetMs).coerceAtLeast(0L)
+                                )
                             }
-                        }
-                    ) {
-                        if (isPlaying) PauseIcon(size = 24.dp) else PlayIcon(size = 24.dp)
+                        )
                     }
-
-                    GlassCircleIconButton(
-                        size = 44.dp,
-                        onClick = { LyricsPlaybackStore.onNext?.invoke() }
-                    ) {
-                        SkipNextIcon(size = 18.dp)
-                    }
-
-                    GlassPillTextButton(
-                        label = "+0.5s",
-                        font = font,
-                        onClick = { LyricsPlaybackStore.syncOffsetMs.value += 500L }
-                    )
                 }
             }
         }
 
-        // 4. POPOVER LIQUID GLASS DAL MENU HAMBURGER (2 OPZIONI: CHECK VERDE + IMPOSTAZIONI)
+        // ============================================================
+        // STRATO 2 (SOPRA LE LENTI): Top Bar trasparente + Dock trasparente
+        // ============================================================
+
+        // TOP BAR FLUTTUANTE LIQUID GLASS
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .fillMaxWidth()
+                .onGloballyPositioned {
+                    topBarRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                }
+                .clip(RoundedCornerShape(30.dp))
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+        ) {
+            if (coverBitmap != null) {
+                Image(
+                    bitmap = coverBitmap,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(46.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .border(1.dp, Color.White.copy(alpha = 0.42f), RoundedCornerShape(14.dp))
+                )
+            } else {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(46.dp)
+                        .crystalGlassButton(RoundedCornerShape(14.dp), highlightBoost = 0.24f)
+                ) {
+                    MiniWaveIcon(size = 22.dp)
+                }
+            }
+
+            Spacer(Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title.ifBlank { "DynamicLyrics" },
+                    fontFamily = font,
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    letterSpacing = (-0.4).sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = artist.ifBlank { "Player: ${preferredPlayer.label}" },
+                    fontFamily = font,
+                    color = Color.White.copy(alpha = 0.78f),
+                    fontSize = 12.sp,
+                    letterSpacing = (-0.2).sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            if (showCloseButton && onClose != null) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(38.dp)
+                        .crystalGlassButton(CircleShape, highlightBoost = 0.20f)
+                        .clickable(onClick = onClose)
+                ) {
+                    CloseIcon(size = 14.dp)
+                }
+                Spacer(Modifier.width(8.dp))
+            }
+
+            // Menu Hamburger in alto a destra
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(40.dp)
+                    .crystalGlassButton(
+                        CircleShape,
+                        highlightBoost = if (menuExpanded) 0.34f else 0.22f
+                    )
+                    .clickable { menuExpanded = !menuExpanded }
+            ) {
+                HamburgerIcon(size = 18.dp)
+            }
+        }
+
+        // DOCK CONTROLLI FLUTTUANTE LIQUID GLASS
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .fillMaxWidth()
+                .onGloballyPositioned {
+                    bottomDockRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                }
+                .clip(RoundedCornerShape(32.dp))
+                .padding(horizontal = 18.dp, vertical = 14.dp)
+        ) {
+            LiquidProgressSection(
+                durationMs = durationMs,
+                syncOffsetMs = syncOffsetMs,
+                font = font,
+                rawPosProvider = { rawPosState.longValue }
+            )
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                GlassPillTextButton(
+                    label = "-0.5s",
+                    font = font,
+                    onClick = { LyricsPlaybackStore.syncOffsetMs.value -= 500L }
+                )
+
+                GlassCircleIconButton(
+                    size = 44.dp,
+                    onClick = { LyricsPlaybackStore.onPrevious?.invoke() }
+                ) {
+                    SkipPrevIcon(size = 18.dp)
+                }
+
+                GlassCircleIconButton(
+                    size = 58.dp,
+                    elevated = true,
+                    onClick = {
+                        val handler = LyricsPlaybackStore.onPlayPause
+                        if (handler != null) {
+                            handler.invoke()
+                        } else {
+                            BitChordListenerService.triggerPlayPreferred(context)
+                        }
+                    }
+                ) {
+                    if (isPlaying) PauseIcon(size = 24.dp) else PlayIcon(size = 24.dp)
+                }
+
+                GlassCircleIconButton(
+                    size = 44.dp,
+                    onClick = { LyricsPlaybackStore.onNext?.invoke() }
+                ) {
+                    SkipNextIcon(size = 18.dp)
+                }
+
+                GlassPillTextButton(
+                    label = "+0.5s",
+                    font = font,
+                    onClick = { LyricsPlaybackStore.syncOffsetMs.value += 500L }
+                )
+            }
+        }
+
+        // ============================================================
+        // STRATO 3: POPOVER MENU HAMBURGER (Check Verde + Impostazioni)
+        // ============================================================
         if (menuExpanded) {
             Box(
                 modifier = Modifier
@@ -972,53 +1198,50 @@ fun LiquidGlassLyricsPlayerScreen(
         AnimatedVisibility(
             visible = menuExpanded,
             enter = fadeIn(tween(160)) + scaleIn(
-                initialScale = 0.86f,
+                initialScale = 0.88f,
                 transformOrigin = TransformOrigin(1f, 0f),
                 animationSpec = spring(dampingRatio = 0.78f, stiffness = 500f)
             ),
             exit = fadeOut(tween(140)) + scaleOut(
-                targetScale = 0.88f,
+                targetScale = 0.90f,
                 transformOrigin = TransformOrigin(1f, 0f)
             ),
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .statusBarsPadding()
-                .padding(top = 74.dp, end = 16.dp)
+                .padding(top = 82.dp, end = 16.dp)
         ) {
+            val granted = BitChordListenerService.isNotificationAccessGranted(context)
+            val activeNow = granted && BitChordListenerService.isRunning()
+
             Column(
                 modifier = Modifier
-                    .width(230.dp)
-                    .liquidGlass(
-                        shape = RoundedCornerShape(24.dp),
-                        tint = Color(0xFF141422),
-                        tintAlpha = 0.80f,
-                        highlightAlpha = 0.24f,
-                        borderAlpha = 0.50f
-                    )
+                    .width(232.dp)
+                    .onGloballyPositioned {
+                        overlayRadiusDp = 26.dp
+                        overlayRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                    }
+                    .clip(RoundedCornerShape(26.dp))
+                    .background(Color.Black.copy(alpha = 0.24f))
                     .padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                // OPZIONE 1: Check Verde conferma servizio attivo
-                val granted = BitChordListenerService.isNotificationAccessGranted(context)
-                val activeNow = granted && BitChordListenerService.isRunning()
-                serviceHealthy = activeNow
-
+                // OPZIONE 1: Check Verde stato servizio
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
+                        .clip(RoundedCornerShape(18.dp))
                         .background(
-                            if (activeNow) Color(0xFF34D399).copy(alpha = 0.14f)
-                            else Color(0xFFFBBF24).copy(alpha = 0.14f)
+                            if (activeNow) Color(0xFF22C55E).copy(alpha = 0.16f)
+                            else Color(0xFFF59E0B).copy(alpha = 0.18f)
                         )
                         .clickable {
                             menuExpanded = false
                             val ok = BitChordListenerService.isNotificationAccessGranted(context)
                             if (ok) {
                                 BitChordListenerService.ensureConnected(context)
-                                serviceHealthy = true
-                                statusBannerText = "Servizio attivo • Player: ${preferredPlayer.label}"
+                                statusBannerText = "Servizio attivo • Tutto pronto"
                             } else {
                                 openNotificationListenerSettings(context)
                             }
@@ -1031,12 +1254,12 @@ fun LiquidGlassLyricsPlayerScreen(
                             .size(30.dp)
                             .clip(CircleShape)
                             .background(
-                                if (activeNow) Color(0xFF34D399).copy(alpha = 0.24f)
-                                else Color(0xFFFBBF24).copy(alpha = 0.24f)
+                                if (activeNow) Color(0xFF22C55E).copy(alpha = 0.28f)
+                                else Color(0xFFF59E0B).copy(alpha = 0.28f)
                             )
                     ) {
                         CheckIcon(
-                            color = if (activeNow) Color(0xFF34D399) else Color(0xFFFBBF24),
+                            color = if (activeNow) Color(0xFF4ADE80) else Color(0xFFFCD34D),
                             size = 16.dp
                         )
                     }
@@ -1047,13 +1270,14 @@ fun LiquidGlassLyricsPlayerScreen(
                             fontFamily = font,
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 13.sp,
+                            letterSpacing = (-0.2).sp,
                             color = Color.White
                         )
                         Text(
                             text = if (activeNow) "Tocca per verificare" else "Tocca per attivare",
                             fontFamily = font,
                             fontSize = 11.sp,
-                            color = if (activeNow) Color(0xFF6EE7B7) else Color(0xFFFDE68A)
+                            color = if (activeNow) Color(0xFF86EFAC) else Color(0xFFFDE68A)
                         )
                     }
                 }
@@ -1063,7 +1287,7 @@ fun LiquidGlassLyricsPlayerScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
+                        .clip(RoundedCornerShape(18.dp))
                         .clickable {
                             menuExpanded = false
                             showSettingsSheet = true
@@ -1074,8 +1298,7 @@ fun LiquidGlassLyricsPlayerScreen(
                         contentAlignment = Alignment.Center,
                         modifier = Modifier
                             .size(30.dp)
-                            .clip(CircleShape)
-                            .background(Color.White.copy(alpha = 0.14f))
+                            .crystalGlassButton(CircleShape, highlightBoost = 0.22f)
                     ) {
                         GearIcon(color = Color.White, size = 16.dp)
                     }
@@ -1086,20 +1309,21 @@ fun LiquidGlassLyricsPlayerScreen(
                             fontFamily = font,
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 13.sp,
+                            letterSpacing = (-0.2).sp,
                             color = Color.White
                         )
                         Text(
                             text = "Player, offset e stato",
                             fontFamily = font,
                             fontSize = 11.sp,
-                            color = Color.White.copy(alpha = 0.65f)
+                            color = Color.White.copy(alpha = 0.72f)
                         )
                     }
                 }
             }
         }
 
-        // 5. TOAST LIQUID GLASS DI CONFERMA SERVIZIO
+        // TOAST DI CONFERMA
         AnimatedVisibility(
             visible = statusBannerText != null,
             enter = fadeIn(tween(180)) + slideInVertically { -it / 2 },
@@ -1107,21 +1331,16 @@ fun LiquidGlassLyricsPlayerScreen(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()
-                .padding(top = 76.dp, start = 24.dp, end = 24.dp)
+                .padding(top = 84.dp, start = 24.dp, end = 24.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
-                    .liquidGlass(
-                        shape = RoundedCornerShape(50),
-                        tint = Color(0xFF0E2B22),
-                        tintAlpha = 0.85f,
-                        highlightAlpha = 0.24f,
-                        borderAlpha = 0.55f
-                    )
+                    .crystalGlassButton(RoundedCornerShape(50), highlightBoost = 0.26f)
+                    .background(Color(0xFF0A261D).copy(alpha = 0.72f))
                     .padding(horizontal = 16.dp, vertical = 10.dp)
             ) {
-                CheckIcon(color = Color(0xFF34D399), size = 16.dp)
+                CheckIcon(color = Color(0xFF4ADE80), size = 16.dp)
                 Spacer(Modifier.width(8.dp))
                 Text(
                     text = statusBannerText.orEmpty(),
@@ -1133,7 +1352,7 @@ fun LiquidGlassLyricsPlayerScreen(
             }
         }
 
-        // 6. PANNELLO IMPOSTAZIONI & DIAGNOSTICA LIQUID GLASS
+        // PANNELLO IMPOSTAZIONI & VERIFICA STATO LIQUID GLASS
         AnimatedVisibility(
             visible = showSettingsSheet,
             enter = fadeIn(tween(180)),
@@ -1142,6 +1361,10 @@ fun LiquidGlassLyricsPlayerScreen(
         ) {
             LiquidSettingsModal(
                 font = font,
+                onSheetPositioned = { rect ->
+                    overlayRadiusDp = 34.dp
+                    overlayRect = rect.translate(-rootTopLeft.x, -rootTopLeft.y)
+                },
                 onDismiss = { showSettingsSheet = false }
             )
         }
@@ -1162,7 +1385,7 @@ private fun LiquidLyricLineItem(
         label = "lyricAlpha"
     )
     val animatedScale by animateFloatAsState(
-        targetValue = if (isActive) 1.02f else 0.97f,
+        targetValue = if (isActive) 1.03f else 0.97f,
         animationSpec = tween(220),
         label = "lyricScale"
     )
@@ -1188,8 +1411,8 @@ private fun LiquidLyricLineItem(
                 val spoken = posMs >= w.startMs
                 withStyle(
                     SpanStyle(
-                        color = if (spoken) Color.White else Color.White.copy(alpha = 0.42f),
-                        fontWeight = FontWeight.ExtraBold
+                        color = if (spoken) Color.White else Color.White.copy(alpha = 0.44f),
+                        fontWeight = FontWeight.Bold
                     )
                 ) {
                     append(w.text)
@@ -1200,9 +1423,10 @@ private fun LiquidLyricLineItem(
             text = annotated,
             fontFamily = font,
             color = Color.White,
-            fontSize = 25.sp,
-            lineHeight = 33.sp,
-            fontWeight = FontWeight.ExtraBold,
+            fontSize = 27.sp,
+            lineHeight = 34.sp,
+            letterSpacing = (-0.6).sp,
+            fontWeight = FontWeight.Bold,
             modifier = rowModifier
         )
     } else {
@@ -1210,9 +1434,10 @@ private fun LiquidLyricLineItem(
             text = line.fullText,
             fontFamily = font,
             color = Color.White,
-            fontSize = if (isActive) 25.sp else 20.sp,
-            lineHeight = if (isActive) 33.sp else 27.sp,
-            fontWeight = if (isActive) FontWeight.ExtraBold else FontWeight.SemiBold,
+            fontSize = if (isActive) 27.sp else 21.sp,
+            lineHeight = if (isActive) 34.sp else 28.sp,
+            letterSpacing = if (isActive) (-0.6).sp else (-0.35).sp,
+            fontWeight = if (isActive) FontWeight.Bold else FontWeight.SemiBold,
             modifier = rowModifier
         )
     }
@@ -1236,7 +1461,7 @@ private fun LiquidProgressSection(
             .height(4.dp)
             .clip(RoundedCornerShape(50)),
         color = Color.White,
-        trackColor = Color.White.copy(alpha = 0.22f)
+        trackColor = Color.White.copy(alpha = 0.28f)
     )
     Row(
         modifier = Modifier
@@ -1247,21 +1472,23 @@ private fun LiquidProgressSection(
         Text(
             text = formatPlayerTime(rawPosMs),
             fontFamily = font,
-            color = Color.White.copy(alpha = 0.70f),
+            fontWeight = FontWeight.Medium,
+            color = Color.White.copy(alpha = 0.82f),
             fontSize = 11.sp
         )
         val sign = if (syncOffsetMs >= 0L) "+" else ""
         Text(
             text = String.format(Locale.US, "Sync %s%.1fs", sign, syncOffsetMs / 1000f),
             fontFamily = font,
-            color = Color.White.copy(alpha = 0.85f),
+            color = Color.White,
             fontSize = 11.sp,
             fontWeight = FontWeight.SemiBold
         )
         Text(
             text = formatPlayerTime(durationMs),
             fontFamily = font,
-            color = Color.White.copy(alpha = 0.70f),
+            fontWeight = FontWeight.Medium,
+            color = Color.White.copy(alpha = 0.82f),
             fontSize = 11.sp
         )
     }
@@ -1273,12 +1500,14 @@ private fun LiquidProgressSection(
 @Composable
 private fun LiquidSettingsModal(
     font: FontFamily,
+    onSheetPositioned: (Rect) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     val preferredPlayer by AppPreferences.preferredPlayer.collectAsState()
     val defaultOffsetMs by AppPreferences.defaultSyncOffsetMs.collectAsState()
     val activePkg by LyricsPlaybackStore.activePlayerPackage.collectAsState()
+    val lastPkg by AppPreferences.lastActiveMusicPackage.collectAsState()
 
     val notifGranted = BitChordListenerService.isNotificationAccessGranted(context)
     val serviceAlive = BitChordListenerService.isRunning()
@@ -1286,7 +1515,7 @@ private fun LiquidSettingsModal(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.56f))
+            .background(Color.Black.copy(alpha = 0.36f))
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -1299,13 +1528,9 @@ private fun LiquidSettingsModal(
                 .fillMaxWidth()
                 .navigationBarsPadding()
                 .padding(horizontal = 14.dp, vertical = 14.dp)
-                .liquidGlass(
-                    shape = RoundedCornerShape(32.dp),
-                    tint = Color(0xFF131320),
-                    tintAlpha = 0.88f,
-                    highlightAlpha = 0.24f,
-                    borderAlpha = 0.52f
-                )
+                .onGloballyPositioned { onSheetPositioned(it.boundsInRoot()) }
+                .clip(RoundedCornerShape(34.dp))
+                .background(Color.Black.copy(alpha = 0.36f))
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
@@ -1323,14 +1548,15 @@ private fun LiquidSettingsModal(
                     text = "Impostazioni & Stato",
                     fontFamily = font,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 19.sp,
+                    fontSize = 20.sp,
+                    letterSpacing = (-0.5).sp,
                     color = Color.White
                 )
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
                         .size(34.dp)
-                        .liquidGlass(shape = CircleShape, tintAlpha = 0.45f)
+                        .crystalGlassButton(CircleShape, highlightBoost = 0.24f)
                         .clickable(onClick = onDismiss)
                 ) {
                     CloseIcon(size = 14.dp)
@@ -1339,14 +1565,13 @@ private fun LiquidSettingsModal(
 
             Spacer(Modifier.height(18.dp))
 
-            // SEZIONE 1: VERIFICA STATO SISTEMA
             Text(
                 text = "VERIFICA SISTEMA",
                 fontFamily = font,
                 fontWeight = FontWeight.Bold,
                 fontSize = 11.sp,
-                letterSpacing = 1.sp,
-                color = Color.White.copy(alpha = 0.52f)
+                letterSpacing = 0.8.sp,
+                color = Color.White.copy(alpha = 0.60f)
             )
             Spacer(Modifier.height(10.dp))
 
@@ -1360,7 +1585,7 @@ private fun LiquidSettingsModal(
             Spacer(Modifier.height(8.dp))
             DiagnosticRow(
                 label = "Servizio DynamicLyrics",
-                status = if (serviceAlive) "In esecuzione" else "Riaggancia",
+                status = if (serviceAlive) "Attivo" else "Riaggancia",
                 ok = serviceAlive,
                 font = font,
                 onClick = { BitChordListenerService.ensureConnected(context) }
@@ -1375,30 +1600,29 @@ private fun LiquidSettingsModal(
             )
             Spacer(Modifier.height(8.dp))
             DiagnosticRow(
-                label = "Sessione rilevata",
-                status = activePkg.ifBlank { "Nessuna sessione attiva" },
-                ok = activePkg.isNotBlank(),
+                label = "Player rilevato",
+                status = activePkg.ifBlank { lastPkg.ifBlank { "In attesa di musica" } },
+                ok = activePkg.isNotBlank() || lastPkg.isNotBlank(),
                 font = font,
                 onClick = { BitChordListenerService.ensureConnected(context) }
             )
 
             Spacer(Modifier.height(22.dp))
 
-            // SEZIONE 2: SELETTORE PLAYER PREDEFINITO
             Text(
                 text = "PLAYER PREDEFINITO (TASTO PLAY)",
                 fontFamily = font,
                 fontWeight = FontWeight.Bold,
                 fontSize = 11.sp,
-                letterSpacing = 1.sp,
-                color = Color.White.copy(alpha = 0.52f)
+                letterSpacing = 0.8.sp,
+                color = Color.White.copy(alpha = 0.60f)
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                text = "Scegli quale app musicale ascoltare e avviare dalla pillola.",
+                text = "Automatico usa sempre l'ultima app musicale avviata senza risvegliare Spotify.",
                 fontFamily = font,
                 fontSize = 12.sp,
-                color = Color.White.copy(alpha = 0.64f)
+                color = Color.White.copy(alpha = 0.72f)
             )
             Spacer(Modifier.height(10.dp))
 
@@ -1412,12 +1636,13 @@ private fun LiquidSettingsModal(
                     val selected = player == preferredPlayer
                     Box(
                         modifier = Modifier
-                            .liquidGlass(
-                                shape = RoundedCornerShape(50),
-                                tint = if (selected) Color(0xFF4F46E5) else Color(0xFF1D1D2E),
-                                tintAlpha = if (selected) 0.78f else 0.50f,
-                                highlightAlpha = if (selected) 0.32f else 0.16f,
-                                borderAlpha = if (selected) 0.75f else 0.30f
+                            .crystalGlassButton(
+                                RoundedCornerShape(50),
+                                highlightBoost = if (selected) 0.42f else 0.16f
+                            )
+                            .background(
+                                if (selected) Color(0xFF6366F1).copy(alpha = 0.45f)
+                                else Color.Transparent
                             )
                             .clickable {
                                 AppPreferences.setPreferredPlayer(context, player)
@@ -1438,14 +1663,13 @@ private fun LiquidSettingsModal(
 
             Spacer(Modifier.height(22.dp))
 
-            // SEZIONE 3: OFFSET PREDEFINITO (+0.6s default)
             Text(
                 text = "OFFSET PREDEFINITO",
                 fontFamily = font,
                 fontWeight = FontWeight.Bold,
                 fontSize = 11.sp,
-                letterSpacing = 1.sp,
-                color = Color.White.copy(alpha = 0.52f)
+                letterSpacing = 0.8.sp,
+                color = Color.White.copy(alpha = 0.60f)
             )
             Spacer(Modifier.height(10.dp))
 
@@ -1454,12 +1678,7 @@ private fun LiquidSettingsModal(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .liquidGlass(
-                        shape = RoundedCornerShape(20.dp),
-                        tintAlpha = 0.45f,
-                        highlightAlpha = 0.16f,
-                        borderAlpha = 0.34f
-                    )
+                    .crystalGlassButton(RoundedCornerShape(22.dp), highlightBoost = 0.16f)
                     .padding(horizontal = 14.dp, vertical = 10.dp)
             ) {
                 GlassPillTextButton(
@@ -1475,6 +1694,7 @@ private fun LiquidSettingsModal(
                         fontFamily = font,
                         fontWeight = FontWeight.Bold,
                         fontSize = 18.sp,
+                        letterSpacing = (-0.4).sp,
                         color = Color.White
                     )
                     if (defaultOffsetMs != AppPreferences.FACTORY_DEFAULT_OFFSET_MS) {
@@ -1515,12 +1735,7 @@ private fun DiagnosticRow(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .liquidGlass(
-                shape = RoundedCornerShape(18.dp),
-                tintAlpha = 0.40f,
-                highlightAlpha = 0.16f,
-                borderAlpha = if (ok) 0.42f else 0.28f
-            )
+            .crystalGlassButton(RoundedCornerShape(18.dp), highlightBoost = 0.16f)
             .clickable(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 12.dp)
     ) {
@@ -1530,12 +1745,12 @@ private fun DiagnosticRow(
                 .size(26.dp)
                 .clip(CircleShape)
                 .background(
-                    if (ok) Color(0xFF34D399).copy(alpha = 0.22f)
-                    else Color(0xFFFBBF24).copy(alpha = 0.20f)
+                    if (ok) Color(0xFF22C55E).copy(alpha = 0.26f)
+                    else Color(0xFFF59E0B).copy(alpha = 0.24f)
                 )
         ) {
             CheckIcon(
-                color = if (ok) Color(0xFF34D399) else Color(0xFFFBBF24),
+                color = if (ok) Color(0xFF4ADE80) else Color(0xFFFCD34D),
                 size = 14.dp
             )
         }
@@ -1545,6 +1760,7 @@ private fun DiagnosticRow(
             fontFamily = font,
             fontWeight = FontWeight.SemiBold,
             fontSize = 14.sp,
+            letterSpacing = (-0.2).sp,
             color = Color.White,
             modifier = Modifier.weight(1f)
         )
@@ -1552,7 +1768,7 @@ private fun DiagnosticRow(
             text = status,
             fontFamily = font,
             fontSize = 12.sp,
-            color = if (ok) Color(0xFF6EE7B7) else Color(0xFFFDE68A),
+            color = if (ok) Color(0xFF86EFAC) else Color(0xFFFDE68A),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
@@ -1560,7 +1776,7 @@ private fun DiagnosticRow(
 }
 
 // ------------------------------------------------------------
-// Componenti Pulsanti & Icone Vettoriali Liquid Glass
+// Pulsanti & Icone Vettoriali Crystal Glass
 // ------------------------------------------------------------
 @Composable
 private fun GlassPillTextButton(
@@ -1571,12 +1787,7 @@ private fun GlassPillTextButton(
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
-            .liquidGlass(
-                shape = RoundedCornerShape(50),
-                tintAlpha = 0.42f,
-                highlightAlpha = 0.22f,
-                borderAlpha = 0.38f
-            )
+            .crystalGlassButton(RoundedCornerShape(50), highlightBoost = 0.22f)
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 9.dp)
     ) {
@@ -1585,6 +1796,7 @@ private fun GlassPillTextButton(
             fontFamily = font,
             fontWeight = FontWeight.SemiBold,
             fontSize = 13.sp,
+            letterSpacing = (-0.2).sp,
             color = Color.White
         )
     }
@@ -1601,12 +1813,9 @@ private fun GlassCircleIconButton(
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .size(size)
-            .liquidGlass(
+            .crystalGlassButton(
                 shape = CircleShape,
-                tint = if (elevated) Color(0xFF28263D) else Color(0xFF181826),
-                tintAlpha = if (elevated) 0.56f else 0.40f,
-                highlightAlpha = if (elevated) 0.32f else 0.20f,
-                borderAlpha = if (elevated) 0.58f else 0.38f
+                highlightBoost = if (elevated) 0.34f else 0.20f
             )
             .clickable(onClick = onClick)
     ) {
@@ -1658,9 +1867,9 @@ private fun GearIcon(color: Color, size: Dp) {
 
         for (i in 0 until 8) {
             val angle = i * (PI / 4.0)
-            val x1 = cx + (outerR * 0.72f * kotlin.math.cos(angle)).toFloat()
+            val x1 = cx + (outerR * 0.72f * cos(angle)).toFloat()
             val y1 = cy + (outerR * 0.72f * sin(angle)).toFloat()
-            val x2 = cx + (outerR * kotlin.math.cos(angle)).toFloat()
+            val x2 = cx + (outerR * cos(angle)).toFloat()
             val y2 = cy + (outerR * sin(angle)).toFloat()
             drawLine(color, Offset(x1, y1), Offset(x2, y2), strokeWidth = strokeW, cap = StrokeCap.Round)
         }
@@ -1768,9 +1977,6 @@ private fun MiniWaveIcon(size: Dp) {
     }
 }
 
-// ------------------------------------------------------------
-// Helper di sistema
-// ------------------------------------------------------------
 fun openAppInfoSettings(context: Context) {
     try {
         val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
