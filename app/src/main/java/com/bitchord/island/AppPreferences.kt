@@ -1,10 +1,15 @@
 package com.bitchord.island
 
+import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.os.Build
+import android.os.Process
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.PrintWriter
 import java.io.StringWriter
+import kotlin.system.exitProcess
 
 enum class TargetFps(val fps: Int, val label: String) {
     FPS_30(30, "30 FPS"),
@@ -52,6 +57,8 @@ object AppPreferences {
     private const val KEY_LAST_PKG_PREFIX = "last_pkg_"
     private const val KEY_TARGET_FPS = "target_fps"
     private const val KEY_LAST_CRASH = "last_uncaught_crash"
+    private const val KEY_SHADER_SAFE_MODE = "shader_safe_mode"
+    private const val KEY_SHADER_PENDING_FRAME = "shader_pending_frame"
 
     const val FACTORY_DEFAULT_OFFSET_MS = 600L
 
@@ -61,47 +68,172 @@ object AppPreferences {
     @Volatile
     private var crashHandlerInstalled = false
 
+    @Volatile
+    private var crashInProgress = false
+
     val preferredPlayer = MutableStateFlow(PreferredPlayer.AUTO)
     val defaultSyncOffsetMs = MutableStateFlow(FACTORY_DEFAULT_OFFSET_MS)
     val appInfoStepDone = MutableStateFlow(false)
     val lastActiveMusicPackage = MutableStateFlow("")
     val targetFps = MutableStateFlow(TargetFps.FPS_60)
     val lastUncaughtCrash = MutableStateFlow("")
+    val shaderSafeMode = MutableStateFlow(false)
 
+    private fun safeString(sp: SharedPreferences, key: String, fallback: String): String {
+        return try {
+            sp.getString(key, fallback) ?: fallback
+        } catch (_: Throwable) {
+            fallback
+        }
+    }
+
+    private fun safeLong(sp: SharedPreferences, key: String, fallback: Long): Long {
+        return try {
+            sp.getLong(key, fallback)
+        } catch (_: Throwable) {
+            try {
+                sp.getInt(key, fallback.toInt()).toLong()
+            } catch (_: Throwable) {
+                fallback
+            }
+        }
+    }
+
+    private fun safeBoolean(sp: SharedPreferences, key: String, fallback: Boolean): Boolean {
+        return try {
+            sp.getBoolean(key, fallback)
+        } catch (_: Throwable) {
+            fallback
+        }
+    }
+
+    private fun safeInt(sp: SharedPreferences, key: String, fallback: Int): Int {
+        return try {
+            sp.getInt(key, fallback)
+        } catch (_: Throwable) {
+            fallback
+        }
+    }
+
+    @Synchronized
     fun init(context: Context) {
         installCrashLogger(context)
         if (prefs != null) return
         val sp = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs = sp
-        preferredPlayer.value = PreferredPlayer.fromId(sp.getString(KEY_PLAYER_ID, PreferredPlayer.AUTO.id))
-        defaultSyncOffsetMs.value = sp.getLong(KEY_DEFAULT_OFFSET_MS, FACTORY_DEFAULT_OFFSET_MS)
-        appInfoStepDone.value = sp.getBoolean(KEY_APP_INFO_DONE, false)
-        lastActiveMusicPackage.value = sp.getString(KEY_LAST_ACTIVE_PKG, "").orEmpty()
-        targetFps.value = TargetFps.fromFps(sp.getInt(KEY_TARGET_FPS, TargetFps.FPS_60.fps))
-        lastUncaughtCrash.value = sp.getString(KEY_LAST_CRASH, "").orEmpty()
+        preferredPlayer.value = PreferredPlayer.fromId(safeString(sp, KEY_PLAYER_ID, PreferredPlayer.AUTO.id))
+        defaultSyncOffsetMs.value = safeLong(sp, KEY_DEFAULT_OFFSET_MS, FACTORY_DEFAULT_OFFSET_MS)
+        appInfoStepDone.value = safeBoolean(sp, KEY_APP_INFO_DONE, false)
+        lastActiveMusicPackage.value = safeString(sp, KEY_LAST_ACTIVE_PKG, "")
+        targetFps.value = TargetFps.fromFps(safeInt(sp, KEY_TARGET_FPS, TargetFps.FPS_60.fps))
+        lastUncaughtCrash.value = safeString(sp, KEY_LAST_CRASH, "")
+
+        val wasPending = safeBoolean(sp, KEY_SHADER_PENDING_FRAME, false)
+        val savedSafeMode = safeBoolean(sp, KEY_SHADER_SAFE_MODE, false)
+        if (wasPending) {
+            try {
+                sp.edit()
+                    .putBoolean(KEY_SHADER_PENDING_FRAME, false)
+                    .putBoolean(KEY_SHADER_SAFE_MODE, true)
+                    .commit()
+            } catch (_: Throwable) {
+            }
+            shaderSafeMode.value = true
+        } else {
+            shaderSafeMode.value = savedSafeMode
+        }
+
         LyricsPlaybackStore.syncOffsetMs.value = defaultSyncOffsetMs.value
+    }
+
+    fun markShaderPendingFrameSync(context: Context, pending: Boolean) {
+        init(context)
+        try {
+            prefs?.edit()?.putBoolean(KEY_SHADER_PENDING_FRAME, pending)?.commit()
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun setShaderSafeMode(context: Context, enabled: Boolean) {
+        init(context)
+        shaderSafeMode.value = enabled
+        try {
+            prefs?.edit()
+                ?.putBoolean(KEY_SHADER_SAFE_MODE, enabled)
+                ?.putBoolean(KEY_SHADER_PENDING_FRAME, false)
+                ?.commit()
+        } catch (_: Throwable) {
+        }
     }
 
     fun installCrashLogger(context: Context) {
         if (crashHandlerInstalled) return
+        val procName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                Application.getProcessName()
+            } catch (_: Throwable) {
+                ""
+            }
+        } else {
+            ""
+        }
+        if (procName.endsWith(":crash")) return
+
         crashHandlerInstalled = true
         val appCtx = context.applicationContext
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            if (crashInProgress) {
+                previous?.uncaughtException(thread, throwable)
+                return@setDefaultUncaughtExceptionHandler
+            }
+            crashInProgress = true
+
+            var launchedCrashUi = false
             try {
                 val sw = StringWriter()
                 val pw = PrintWriter(sw)
                 throwable.printStackTrace(pw)
                 pw.flush()
-                val summary = "[${thread.name}] ${sw.toString().trim().take(1800)}"
-                appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                    .edit()
-                    .putString(KEY_LAST_CRASH, summary)
-                    .commit()
-                lastUncaughtCrash.value = summary
+
+                val fullReport = buildString {
+                    append("Device: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE} / SDK ${Build.VERSION.SDK_INT})\n")
+                    append("Thread: ${thread.name}\n\n")
+                    append(sw.toString().trim())
+                }
+
+                try {
+                    appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                        .edit()
+                        .putString(KEY_LAST_CRASH, fullReport.take(2200))
+                        .commit()
+                    lastUncaughtCrash.value = fullReport.take(2200)
+                } catch (_: Throwable) {
+                }
+
+                val reportIntent = Intent(appCtx, CrashReportActivity::class.java).apply {
+                    putExtra(CrashReportActivity.EXTRA_STACKTRACE, fullReport.take(16_000))
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_CLEAR_TASK or
+                            Intent.FLAG_ACTIVITY_NO_ANIMATION
+                    )
+                }
+                appCtx.startActivity(reportIntent)
+                launchedCrashUi = true
+                try {
+                    Thread.sleep(140L)
+                } catch (_: Throwable) {
+                }
             } catch (_: Throwable) {
             }
-            previous?.uncaughtException(thread, throwable)
+
+            if (launchedCrashUi) {
+                Process.killProcess(Process.myPid())
+                exitProcess(10)
+            } else {
+                previous?.uncaughtException(thread, throwable)
+            }
         }
     }
 

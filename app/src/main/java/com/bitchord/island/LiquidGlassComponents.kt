@@ -133,6 +133,9 @@ import kotlin.math.sin
 private object LiquidGlassDiagnostics {
     val shaderStatus = MutableStateFlow("AGSL non inizializzato")
 
+    @Volatile
+    var shaderFrameVerified = false
+
     fun updateStatus(status: String) {
         if (shaderStatus.value != status) {
             shaderStatus.value = status
@@ -873,6 +876,9 @@ private fun rememberLiquidGlassRenderEffect(
     shape5: GlassShapeSpec = GlassShapeSpec(),
     densityPx: Float
 ): androidx.compose.ui.graphics.RenderEffect? {
+    val context = LocalContext.current
+    val shaderSafeMode by AppPreferences.shaderSafeMode.collectAsState()
+
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
         SideEffect {
             LiquidGlassDiagnostics.updateStatus("Richiede Android 13+")
@@ -880,10 +886,25 @@ private fun rememberLiquidGlassRenderEffect(
         return null
     }
 
-    val compiledPair = remember {
+    if (shaderSafeMode) {
+        SideEffect {
+            LiquidGlassDiagnostics.updateStatus("Safe Mode (crash nativo)")
+        }
+        return null
+    }
+
+    val compiledPair = remember(shaderSafeMode) {
+        if (!LiquidGlassDiagnostics.shaderFrameVerified) {
+            AppPreferences.markShaderPendingFrameSync(context, true)
+        }
         try {
-            RuntimeShader(IOS_LIQUID_GLASS_AGSL) to "AGSL OK"
+            RuntimeShader(IOS_LIQUID_GLASS_AGSL).also {
+                if (!LiquidGlassDiagnostics.shaderFrameVerified) {
+                    AppPreferences.markShaderPendingFrameSync(context, false)
+                }
+            } to "AGSL OK"
         } catch (t: Throwable) {
+            AppPreferences.markShaderPendingFrameSync(context, false)
             val detail = "${t.javaClass.simpleName}: ${t.message ?: "errore sconosciuto"}"
             Log.e("LiquidGlass", "RuntimeShader compilation failed: $detail", t)
             null to detail
@@ -906,6 +927,9 @@ private fun rememberLiquidGlassRenderEffect(
             null to "AGSL OK"
         } else {
             try {
+                if (!LiquidGlassDiagnostics.shaderFrameVerified) {
+                    AppPreferences.markShaderPendingFrameSync(context, true)
+                }
                 compiledShader.setFloatUniform("rect0", shape0.rect.left, shape0.rect.top, shape0.rect.right, shape0.rect.bottom)
                 compiledShader.setFloatUniform("rect1", shape1.rect.left, shape1.rect.top, shape1.rect.right, shape1.rect.bottom)
                 compiledShader.setFloatUniform("rect2", shape2.rect.left, shape2.rect.top, shape2.rect.right, shape2.rect.bottom)
@@ -928,6 +952,7 @@ private fun rememberLiquidGlassRenderEffect(
                 val effect = RenderEffect.createRuntimeShaderEffect(compiledShader, "composable").asComposeRenderEffect()
                 effect to "AGSL OK"
             } catch (t: Throwable) {
+                AppPreferences.markShaderPendingFrameSync(context, false)
                 val detail = "${t.javaClass.simpleName}: ${t.message ?: "errore uniform/effect"}"
                 Log.e("LiquidGlass", "RenderEffect update failed: $detail", t)
                 val fallback = if (shape5.style >= 2.5f) safeBlurRenderEffect(20f) else null
@@ -936,12 +961,22 @@ private fun rememberLiquidGlassRenderEffect(
         }
     }
 
+    val effect = resultPair.first
+    LaunchedEffect(effect, shaderSafeMode) {
+        if (!shaderSafeMode && effect != null && !LiquidGlassDiagnostics.shaderFrameVerified) {
+            withFrameNanos { }
+            withFrameNanos { }
+            LiquidGlassDiagnostics.shaderFrameVerified = true
+            AppPreferences.markShaderPendingFrameSync(context, false)
+        }
+    }
+
     val statusText = resultPair.second
     SideEffect {
         LiquidGlassDiagnostics.updateStatus(statusText)
     }
 
-    return resultPair.first
+    return effect
 }
 
 private fun Modifier.reportBoundsInRoot(onBounds: (Rect) -> Unit): Modifier =
@@ -1541,7 +1576,8 @@ fun LiquidPermissionsScreen(
     val density = LocalDensity.current
     val densityPx = density.density
     val shaderStatus by LiquidGlassDiagnostics.shaderStatus.collectAsState()
-    val shaderFailed = shaderStatus != "AGSL OK" && shaderStatus != "AGSL non inizializzato"
+    val shaderSafeMode by AppPreferences.shaderSafeMode.collectAsState()
+    val shaderFailed = shaderSafeMode || (shaderStatus != "AGSL OK" && shaderStatus != "AGSL non inizializzato")
 
     val appInfoDone by AppPreferences.appInfoStepDone.collectAsState()
     var postNotifOk by remember {
@@ -1908,7 +1944,8 @@ fun LiquidGlassLyricsPlayerScreen(
     val density = LocalDensity.current
     val densityPx = density.density
     val shaderStatus by LiquidGlassDiagnostics.shaderStatus.collectAsState()
-    val shaderFailed = shaderStatus != "AGSL OK" && shaderStatus != "AGSL non inizializzato"
+    val shaderSafeMode by AppPreferences.shaderSafeMode.collectAsState()
+    val shaderFailed = shaderSafeMode || (shaderStatus != "AGSL OK" && shaderStatus != "AGSL non inizializzato")
 
     val title by LyricsPlaybackStore.title.collectAsState()
     val artist by LyricsPlaybackStore.artist.collectAsState()
@@ -3075,6 +3112,7 @@ private fun LiquidSettingsModal(
     val activePkg by LyricsPlaybackStore.activePlayerPackage.collectAsState()
     val lastPkg by AppPreferences.lastActiveMusicPackage.collectAsState()
     val shaderStatus by LiquidGlassDiagnostics.shaderStatus.collectAsState()
+    val shaderSafeMode by AppPreferences.shaderSafeMode.collectAsState()
     val lastCrash by AppPreferences.lastUncaughtCrash.collectAsState()
 
     val notifGranted = BitChordListenerService.isNotificationAccessGranted(context)
@@ -3140,8 +3178,36 @@ private fun LiquidSettingsModal(
                 }
             }
 
-            // Avviso visibile rosso se RuntimeShader o RenderEffect fallisce su questo dispositivo
-            if (shaderFailed) {
+            // Safe Mode automatico dopo eventuale crash nativo Skia / AGSL
+            if (shaderSafeMode) {
+                Spacer(Modifier.height(10.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color(0xFFF59E0B).copy(alpha = 0.22f))
+                        .border(0.8.dp, Color(0xFFFBBF24).copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 12.dp, vertical = 10.dp)
+                ) {
+                    Text(
+                        text = "Shader AGSL disattivato automaticamente dopo crash nativo",
+                        fontFamily = font,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFFFDE68A)
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    GlassPillTextButton(
+                        label = "Riattiva Shader AGSL",
+                        font = font,
+                        onClick = {
+                            LiquidGlassDiagnostics.shaderFrameVerified = false
+                            AppPreferences.setShaderSafeMode(context, false)
+                        }
+                    )
+                }
+            } else if (shaderFailed) {
+                // Avviso visibile rosso se RuntimeShader o RenderEffect fallisce via eccezione Kotlin
                 Spacer(Modifier.height(10.dp))
                 Text(
                     text = "Shader Liquid Glass non attivo: $shaderStatus",
@@ -3240,10 +3306,15 @@ private fun LiquidSettingsModal(
             Spacer(Modifier.height(8.dp))
             DiagnosticRow(
                 label = "Motore Liquid Glass",
-                status = shaderStatus,
-                ok = shaderStatus == "AGSL OK",
+                status = if (shaderSafeMode) "Safe Mode (tocca per riattivare)" else shaderStatus,
+                ok = !shaderSafeMode && shaderStatus == "AGSL OK",
                 font = font,
-                onClick = {}
+                onClick = {
+                    if (shaderSafeMode) {
+                        LiquidGlassDiagnostics.shaderFrameVerified = false
+                        AppPreferences.setShaderSafeMode(context, false)
+                    }
+                }
             )
             Spacer(Modifier.height(8.dp))
             DiagnosticRow(

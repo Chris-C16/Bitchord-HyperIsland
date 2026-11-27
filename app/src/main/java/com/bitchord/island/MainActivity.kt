@@ -47,21 +47,35 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun allRequiredPermissionsReady(): Boolean {
-        return BitChordListenerService.isNotificationAccessGranted(this) &&
-            BitChordListenerService.areNotificationsEnabled(this)
+        return try {
+            BitChordListenerService.isNotificationAccessGranted(this) &&
+                BitChordListenerService.areNotificationsEnabled(this)
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
-        )
+        try {
+            AppPreferences.installCrashLogger(this)
+        } catch (_: Throwable) {
+        }
+        try {
+            enableEdgeToEdge(
+                statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+                navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+            )
+        } catch (_: Throwable) {
+        }
         super.onCreate(savedInstanceState)
         try {
             window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
         } catch (_: Throwable) {
         }
-        AppPreferences.init(this)
+        try {
+            AppPreferences.init(this)
+        } catch (_: Throwable) {
+        }
         applyWindowFrameRate(this, AppPreferences.targetFps.value.fps)
 
         // 1. Chiede subito il permesso notifiche all'avvio su Android 13-16
@@ -75,8 +89,11 @@ class MainActivity : ComponentActivity() {
         }
 
         // 2. Risveglia subito la pillola senza aspettare la fine dello splash
-        if (allRequiredPermissionsReady()) {
-            BitChordListenerService.ensureConnected(this, forceRepublish = true)
+        try {
+            if (allRequiredPermissionsReady()) {
+                BitChordListenerService.ensureConnected(this, forceRepublish = true)
+            }
+        } catch (_: Throwable) {
         }
 
         setContent {

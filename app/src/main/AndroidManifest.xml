@@ -8,10 +8,18 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <application
+        android:name=".DynamicLyricsApp"
         android:allowBackup="true"
         android:label="DynamicLyrics"
         android:icon="@drawable/ic_launcher_lyrics"
         android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <activity
+            android:name=".CrashReportActivity"
+            android:exported="false"
+            android:process=":crash"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
 
         <activity
             android:name=".MainActivity"

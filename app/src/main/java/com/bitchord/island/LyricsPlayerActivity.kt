@@ -13,16 +13,26 @@ import androidx.compose.runtime.getValue
 
 class LyricsPlayerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
-        )
+        try {
+            AppPreferences.installCrashLogger(this)
+        } catch (_: Throwable) {
+        }
+        try {
+            enableEdgeToEdge(
+                statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+                navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+            )
+        } catch (_: Throwable) {
+        }
         super.onCreate(savedInstanceState)
         try {
             window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
         } catch (_: Throwable) {
         }
-        AppPreferences.init(this)
+        try {
+            AppPreferences.init(this)
+        } catch (_: Throwable) {
+        }
         applyWindowFrameRate(this, AppPreferences.targetFps.value.fps)
 
         setContent {
