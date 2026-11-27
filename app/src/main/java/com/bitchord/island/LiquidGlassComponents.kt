@@ -60,6 +60,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -75,6 +76,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.ExperimentalTextApi
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
@@ -163,10 +165,10 @@ fun applyWindowFrameRate(activity: Activity, targetFps: Int) {
 
 // ------------------------------------------------------------
 // AGSL iOS 26 True Optical Liquid Glass Shader
-// - Rifrazione fisica a menisco (centro limpido + bordo curvo)
-// - Blur Vogel Disk 16-tap (ZERO ghosting sui testi)
-// - Dispersione cromatica prismatica solo sul bordo curvo
-// - Bordo speculare Fresnel affilato (1.3dp) + ombra fluttuante
+// - Profilo 3D a menisco convesso (Snell / IOR)
+// - Blur Vogel Disk gaussiano 16-tap (barre) / 20-tap (popover/sheet)
+// - Dispersione cromatica RGB prismatica solo sul bordo curvo (t < 0.85)
+// - Riflesso speculare Fresnel dual-rim (~1.15dp) + caustica + ombra
 // ------------------------------------------------------------
 private const val IOS_LIQUID_GLASS_AGSL = """
 uniform shader composable;
@@ -203,8 +205,8 @@ float4 evalGlassShape(float2 fragCoord, float4 rect, float radius) {
     return float4(d, n.x, n.y, normY);
 }
 
-// Blur ottico Vogel Disk a 16 campioni (spirale aurea: zero doppie immagini)
-half4 sampleVogelBlur(float2 pos, float radiusPx) {
+// Blur ottico Vogel Disk gaussiano a 16 campioni per barre fluttuanti cristalline
+half4 sampleVogelBlur16(float2 pos, float radiusPx) {
     if (radiusPx < 0.35) {
         return composable.eval(pos);
     }
@@ -217,7 +219,28 @@ half4 sampleVogelBlur(float2 pos, float radiusPx) {
         float r = sqrt(t) * radiusPx;
         float ang = fi * GOLDEN_ANGLE;
         float2 off = float2(cos(ang), sin(ang)) * r;
-        float w = exp(-2.2 * t);
+        float w = exp(-2.4 * t);
+        acc += composable.eval(pos + off) * half(w);
+        totalW += w;
+    }
+    return acc / half(totalW);
+}
+
+// Blur ottico Vogel Disk cremoso a 20 campioni per popover e sheet
+half4 sampleVogelBlur20(float2 pos, float radiusPx) {
+    if (radiusPx < 0.35) {
+        return composable.eval(pos);
+    }
+    half4 acc = half4(0.0);
+    float totalW = 0.0;
+    const float GOLDEN_ANGLE = 2.39996323;
+    for (int i = 0; i < 20; i++) {
+        float fi = float(i);
+        float t = (fi + 0.5) / 20.0;
+        float r = sqrt(t) * radiusPx;
+        float ang = fi * GOLDEN_ANGLE;
+        float2 off = float2(cos(ang), sin(ang)) * r;
+        float w = exp(-1.9 * t);
         acc += composable.eval(pos + off) * half(w);
         totalW += w;
     }
@@ -255,19 +278,21 @@ half4 main(float2 fragCoord) {
     float d = best.x;
     float2 n = best.yz;
     float normY = best.w;
+    float isOverlay = activeId == 2 ? 1.0 : 0.0;
+    float isSheet = (activeId == 2 && overlayMode > 0.5) ? 1.0 : 0.0;
 
-    // Ombra morbida fluttuante spostata leggermente verso il basso (stile iOS 26)
+    // Ombra ambientale morbida spostata verso il basso (+5dp su Y)
     if (d > 0.75) {
-        float2 shPos = fragCoord - float2(0.0, 4.5 * density);
+        float2 shPos = fragCoord - float2(0.0, 5.0 * density);
         float dSh = 10000.0;
         if (activeId == 0) dSh = evalGlassShape(shPos, rect0, radius0).x;
         else if (activeId == 1) dSh = evalGlassShape(shPos, rect1, radius1).x;
         else dSh = evalGlassShape(shPos, rect2, radius2).x;
 
-        if (dSh > 26.0 * density) {
+        if (dSh > 28.0 * density) {
             return baseColor;
         }
-        float shAlpha = exp(-max(dSh, 0.0) / (9.5 * density)) * (activeId == 2 ? 0.42 : 0.30);
+        float shAlpha = exp(-max(dSh, 0.0) / (10.0 * density)) * (isOverlay > 0.5 ? 0.38 : 0.26);
         return half4(baseColor.rgb * half(1.0 - shAlpha), baseColor.a);
     }
 
@@ -277,68 +302,85 @@ half4 main(float2 fragCoord) {
     float minHalf = min(halfSize.x, halfSize.y);
 
     float distIn = max(-d, 0.0);
-    // Larghezza fisica del menisco curvo (proporzionata alla pillola)
-    float bezel = min(19.0 * density, minHalf * 0.62);
-    float u = clamp(1.0 - distIn / max(bezel, 1.0), 0.0, 1.0);
+    // Profilo 3D a menisco convesso (Snell / IOR)
+    float bezelTarget = isOverlay > 0.5 ? 24.0 : 20.0;
+    float bezel = max(min(bezelTarget * density, minHalf * 0.68), 1.0);
+    float t = clamp(distIn / bezel, 0.0, 1.0);
+    float z = sqrt(max(1.0 - (1.0 - t) * (1.0 - t), 0.001));
+    float meniscusSlope = (1.0 - t) / max(z, 0.24);
 
-    // Profilo ottico curvo: centro cristallino, forte curvatura lungo il bordo
-    float bevelSlope = pow(max(u, 0.0001), 2.35);
+    // Deviazione lungo la normale sul bordo curvo + leggera lente convessa nella zona piatta
+    float magScale = isSheet > 0.5 ? 1.5 : (isOverlay > 0.5 ? 2.0 : 2.8);
+    float refractBasePx = (isOverlay > 0.5 ? 5.2 : 6.4) * density;
+    float2 centerLens = -localNorm * (magScale * density) * z;
+    float2 edgeRefract = -n * (meniscusSlope * refractBasePx);
+    float iorR = 0.90;
+    float iorG = 1.00;
+    float iorB = 1.10;
+    float2 refractedPos = fragCoord + centerLens + edgeRefract * iorG;
 
-    // Leggera lente convessa interna + rifrazione lungo la normale sul bordo
-    float magScale = (activeId == 2 && overlayMode > 0.5) ? 1.8 : 3.2;
-    float refractPx = ((activeId == 2 && overlayMode > 0.5) ? 16.0 : 23.0) * density;
-    float2 lensShift = -localNorm * (magScale * density) * (1.0 - u) - n * (bevelSlope * refractPx);
-    float2 refractedPos = fragCoord + lensShift;
+    // Sfocatura ottica cristallina sulle barre vs densa/cremosa su popover e sheet
+    float centerBlur = (isSheet > 0.5 ? 5.6 : (isOverlay > 0.5 ? 4.8 : 1.4)) * density;
+    float edgeBlur = (isOverlay > 0.5 ? 3.2 : 0.75) * density;
+    float blurR = mix(edgeBlur, centerBlur, t);
 
-    // Raggio di sfocatura ottica controllato (mai troppo largo -> zero ghosting!)
-    float isDarkSheet = (activeId == 2 && overlayMode > 0.5) ? 1.0 : 0.0;
-    float centerBlur = (isDarkSheet > 0.5 ? 3.8 : 1.75) * density;
-    float edgeBlur = (isDarkSheet > 0.5 ? 2.6 : 0.85) * density;
-    float blurR = mix(centerBlur, edgeBlur, u);
-
-    half4 sampled = sampleVogelBlur(refractedPos, blurR);
+    half4 sampled;
+    if (isOverlay > 0.5) {
+        sampled = sampleVogelBlur20(refractedPos, blurR);
+    } else {
+        sampled = sampleVogelBlur16(refractedPos, blurR);
+    }
     half3 glassRgb = sampled.rgb;
 
-    // Dispersione cromatica RGB sottile SOLO sulla curvatura del menisco
-    if (u > 0.18) {
-        float chromaPx = bevelSlope * (isDarkSheet > 0.5 ? 2.2 : 3.8) * density;
-        half rEdge = composable.eval(refractedPos + n * chromaPx).r;
-        half bEdge = composable.eval(refractedPos - n * chromaPx).b;
-        float chromaMix = smoothstep(0.18, 0.92, u) * 0.72;
+    // Dispersione cromatica RGB prismatica pulita SOLO sulla fascia curva del bordo (t < 0.85)
+    if (t < 0.85) {
+        float2 posR = fragCoord + centerLens + edgeRefract * iorR;
+        float2 posB = fragCoord + centerLens + edgeRefract * iorB;
+        half rEdge = composable.eval(posR).r;
+        half bEdge = composable.eval(posB).b;
+        float chromaMix = smoothstep(0.85, 0.10, t) * (isOverlay > 0.5 ? 0.50 : 0.78);
         glassRgb.r = mix(glassRgb.r, rEdge, half(chromaMix));
         glassRgb.b = mix(glassRgb.b, bEdge, half(chromaMix));
     }
 
-    // Vibrancy Apple (colori vivi e cristallini, mai grigi slavati)
+    // Vibrancy Apple + lieve boost di luminosita' sulle barre cristalline
     half luma = dot(glassRgb, half3(0.299, 0.587, 0.114));
-    glassRgb = mix(half3(luma), glassRgb, half(1.34));
+    float vibrancy = isOverlay > 0.5 ? 1.38 : 1.43;
+    glassRgb = mix(half3(luma), glassRgb, half(vibrancy));
+    if (isOverlay < 0.5) {
+        glassRgb *= half(1.06);
+    }
 
-    // Tinta cristallina adattiva (Apple Music Dark Liquid Glass)
-    half3 crystalTint = isDarkSheet > 0.5 ? half3(0.06, 0.065, 0.095) : half3(0.07, 0.075, 0.11);
-    float tintStrength = isDarkSheet > 0.5 ? 0.54 : (activeId == 2 ? 0.42 : 0.22);
+    // Tinta cristallina leggera sulle barre, piu' traslucida-leggibile su popover/sheet
+    half3 crystalTint = isOverlay > 0.5 ? half3(0.055, 0.06, 0.095) : half3(0.06, 0.07, 0.11);
+    float tintStrength = isSheet > 0.5 ? 0.44 : (isOverlay > 0.5 ? 0.39 : 0.10);
     glassRgb = mix(glassRgb, crystalTint, half(tintStrength));
 
-    // Leggera velatura lucida superiore (riflesso curvo del vetro)
-    float topGlaze = smoothstep(0.35, -1.0, normY) * (isDarkSheet > 0.5 ? 0.055 : 0.095);
+    // Leggero gradiente lucido superiore
+    float topGlaze = smoothstep(0.40, -1.0, normY) * (isOverlay > 0.5 ? 0.045 : 0.075);
     glassRgb += half3(topGlaze);
 
-    // Sottile ombra interna di rifrazione subito dentro il bordo (da profondita' 3D al vetro)
-    float innerGroove = smoothstep(0.8 * density, 3.2 * density, distIn) *
-                        smoothstep(8.5 * density, 3.2 * density, distIn) * 0.12;
+    // Sottile ombra interna di rifrazione subito dentro il bordo
+    float innerGroove = smoothstep(0.9 * density, 3.0 * density, distIn) *
+                        smoothstep(7.5 * density, 3.0 * density, distIn) *
+                        (isOverlay > 0.5 ? 0.08 : 0.06);
     glassRgb *= half(1.0 - innerGroove);
 
-    // RIFLESSO SPECULARE FRESNEL AFFILATO (la firma visiva di iOS 26)
-    float2 keyLight = normalize(float2(-0.50, -0.86));
-    float2 rimLight = normalize(float2(0.50, 0.86));
-    float specKey = pow(max(dot(n, keyLight), 0.0001), 2.2);
-    float specBack = pow(max(dot(n, rimLight), 0.0001), 2.8) * 0.62;
+    // Riflesso speculare Fresnel dual-rim (~1.15dp) + caustica interna morbida (~5dp)
+    float2 keyLight = normalize(float2(-0.55, -0.83));
+    float2 rimLight = normalize(float2(0.55, 0.83));
+    float fresnel = pow(max(1.0 - z, 0.0001), 1.8);
+    float specKey = pow(max(dot(n, keyLight), 0.0001), 2.4);
+    float specBack = pow(max(dot(n, rimLight), 0.0001), 3.0) * 0.55;
+    float dirWeight = specKey + specBack;
 
-    // Linea speculare razor-sharp (~1.35 dp) + morbida caustica interna sul bordo
-    float hairlineRim = smoothstep(1.45 * density, 0.0, distIn);
-    float softEdgeSheen = smoothstep(6.5 * density, 0.0, distIn) * 0.20;
+    float hairlineRim = smoothstep(1.18 * density, 0.0, distIn);
+    float softCaustic = smoothstep(5.0 * density, 0.0, distIn) * (0.10 + 0.14 * fresnel);
 
-    float specular = hairlineRim * (0.20 + 0.82 * (specKey + specBack)) +
-                     softEdgeSheen * (0.18 + 0.82 * specKey);
+    float rimBase = isOverlay > 0.5 ? 0.12 : 0.14;
+    float rimPeak = isOverlay > 0.5 ? 0.68 : 0.78;
+    float specular = hairlineRim * (rimBase + rimPeak * dirWeight) +
+                     softCaustic * (0.16 + 0.84 * specKey);
 
     glassRgb = clamp(glassRgb + half3(specular), half3(0.0), half3(1.0));
 
@@ -449,24 +491,64 @@ fun rememberDynamicFont(): FontFamily {
 // ------------------------------------------------------------
 // Modificatore Crystal Glass per pulsanti interni iOS 26
 // ------------------------------------------------------------
+private val GlassTextShadowStyle = TextStyle(
+    shadow = Shadow(
+        color = Color.Black.copy(alpha = 0.38f),
+        offset = Offset(0f, 1.5f),
+        blurRadius = 6f
+    )
+)
+
 fun Modifier.iosGlassButton(
     shape: Shape = CircleShape,
-    elevated: Boolean = false
+    elevated: Boolean = false,
+    pressed: Boolean = false
 ): Modifier = this
     .clip(shape)
     .background(
         Brush.verticalGradient(
-            0.0f to Color.White.copy(alpha = if (elevated) 0.24f else 0.14f),
-            0.48f to Color.White.copy(alpha = if (elevated) 0.08f else 0.04f),
-            1.0f to Color.White.copy(alpha = if (elevated) 0.14f else 0.07f)
+            0.0f to Color.White.copy(
+                alpha = when {
+                    pressed -> if (elevated) 0.30f else 0.22f
+                    elevated -> 0.22f
+                    else -> 0.13f
+                }
+            ),
+            0.32f to Color.White.copy(
+                alpha = when {
+                    pressed -> 0.12f
+                    elevated -> 0.08f
+                    else -> 0.04f
+                }
+            ),
+            0.65f to Color.White.copy(alpha = 0.02f),
+            1.0f to Color.White.copy(
+                alpha = when {
+                    pressed -> 0.16f
+                    elevated -> 0.12f
+                    else -> 0.06f
+                }
+            )
         )
     )
     .border(
-        width = 0.85.dp,
+        width = 0.75.dp,
         brush = Brush.linearGradient(
-            0.0f to Color.White.copy(alpha = if (elevated) 0.72f else 0.52f),
-            0.48f to Color.White.copy(alpha = 0.08f),
-            1.0f to Color.White.copy(alpha = if (elevated) 0.45f else 0.30f)
+            0.0f to Color.White.copy(
+                alpha = when {
+                    pressed -> 0.88f
+                    elevated -> 0.68f
+                    else -> 0.50f
+                }
+            ),
+            0.45f to Color.White.copy(alpha = if (pressed) 0.24f else 0.08f),
+            1.0f to Color.White.copy(
+                alpha = when {
+                    pressed -> 0.62f
+                    elevated -> 0.42f
+                    else -> 0.28f
+                }
+            )
         ),
         shape = shape
     )
@@ -1038,11 +1120,12 @@ fun LiquidGlassLyricsPlayerScreen(
     }
 
     val activeOverlayRect = if (menuExpanded || showSettingsSheet) overlayRect else Rect.Zero
+    val activeTopBarRect = if (showSettingsSheet) Rect.Zero else topBarRect
     val activeBottomDockRect = if (showSettingsSheet) Rect.Zero else bottomDockRect
     val topBarRadiusPx = if (topBarRect.height > 2f) topBarRect.height / 2f else with(density) { 33.dp.toPx() }
 
     val liquidRenderEffect = remember(
-        topBarRect,
+        activeTopBarRect,
         topBarRadiusPx,
         activeBottomDockRect,
         activeOverlayRect,
@@ -1051,7 +1134,7 @@ fun LiquidGlassLyricsPlayerScreen(
         density.density
     ) {
         buildLiquidGlassRenderEffect(
-            rect0 = topBarRect,
+            rect0 = activeTopBarRect,
             radius0Px = topBarRadiusPx,
             rect1 = activeBottomDockRect,
             radius1Px = with(density) { 34.dp.toPx() },
@@ -1240,6 +1323,7 @@ fun LiquidGlassLyricsPlayerScreen(
                 .statusBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 10.dp)
                 .fillMaxWidth()
+                .graphicsLayer { alpha = if (showSettingsSheet) 0f else 1f }
                 .onGloballyPositioned {
                     topBarRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
                 }
@@ -1278,7 +1362,8 @@ fun LiquidGlassLyricsPlayerScreen(
                     letterSpacing = (-0.4).sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    style = GlassTextShadowStyle
                 )
                 Text(
                     text = artist.ifBlank { "Player: ${preferredPlayer.label}" },
@@ -1288,7 +1373,8 @@ fun LiquidGlassLyricsPlayerScreen(
                     letterSpacing = (-0.2).sp,
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    style = GlassTextShadowStyle
                 )
             }
 
@@ -1296,6 +1382,7 @@ fun LiquidGlassLyricsPlayerScreen(
                 GlassCircleIconButton(
                     size = 38.dp,
                     elevated = false,
+                    enabled = !showSettingsSheet,
                     onClick = onClose
                 ) {
                     CloseIcon(size = 13.dp)
@@ -1306,6 +1393,7 @@ fun LiquidGlassLyricsPlayerScreen(
             GlassCircleIconButton(
                 size = 38.dp,
                 elevated = menuExpanded,
+                enabled = !showSettingsSheet,
                 onClick = { menuExpanded = !menuExpanded }
             ) {
                 HamburgerIcon(size = 17.dp)
@@ -1681,7 +1769,8 @@ private fun LiquidProgressSection(
             fontFamily = font,
             fontWeight = FontWeight.Medium,
             color = Color.White.copy(alpha = 0.84f),
-            fontSize = 11.sp
+            fontSize = 11.sp,
+            style = GlassTextShadowStyle
         )
         val sign = if (syncOffsetMs >= 0L) "+" else ""
         Text(
@@ -1689,14 +1778,16 @@ private fun LiquidProgressSection(
             fontFamily = font,
             color = Color.White,
             fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold
+            fontWeight = FontWeight.SemiBold,
+            style = GlassTextShadowStyle
         )
         Text(
             text = formatPlayerTime(durationMs),
             fontFamily = font,
             fontWeight = FontWeight.Medium,
             color = Color.White.copy(alpha = 0.84f),
-            fontSize = 11.sp
+            fontSize = 11.sp,
+            style = GlassTextShadowStyle
         )
     }
 }
@@ -1735,6 +1826,7 @@ private fun LiquidSettingsModal(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .statusBarsPadding()
                 .navigationBarsPadding()
                 .padding(horizontal = 14.dp, vertical = 14.dp)
                 .onGloballyPositioned { onSheetPositioned(it.boundsInRoot()) }
@@ -1747,6 +1839,15 @@ private fun LiquidSettingsModal(
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 20.dp)
         ) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .padding(bottom = 12.dp)
+                    .size(width = 36.dp, height = 4.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(Color.White.copy(alpha = 0.36f))
+            )
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -2078,7 +2179,7 @@ private fun GlassPillTextButton(
                 scaleX = scale
                 scaleY = scale
             }
-            .iosGlassButton(RoundedCornerShape(50), elevated = pressed)
+            .iosGlassButton(RoundedCornerShape(50), elevated = pressed, pressed = pressed)
             .clickable(
                 interactionSource = interactionSource,
                 indication = null,
@@ -2092,7 +2193,8 @@ private fun GlassPillTextButton(
             fontWeight = FontWeight.SemiBold,
             fontSize = 13.sp,
             letterSpacing = (-0.2).sp,
-            color = Color.White
+            color = Color.White,
+            style = GlassTextShadowStyle
         )
     }
 }
@@ -2101,13 +2203,14 @@ private fun GlassPillTextButton(
 private fun GlassCircleIconButton(
     size: Dp,
     elevated: Boolean = false,
+    enabled: Boolean = true,
     onClick: () -> Unit,
     content: @Composable () -> Unit
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val scale by animateFloatAsState(
-        targetValue = if (pressed) 0.90f else 1f,
+        targetValue = if (enabled && pressed) 0.90f else 1f,
         animationSpec = spring(dampingRatio = 0.62f, stiffness = 620f),
         label = "circleScale"
     )
@@ -2122,9 +2225,11 @@ private fun GlassCircleIconButton(
             }
             .iosGlassButton(
                 shape = CircleShape,
-                elevated = elevated || pressed
+                elevated = elevated || (enabled && pressed),
+                pressed = enabled && pressed
             )
             .clickable(
+                enabled = enabled,
                 interactionSource = interactionSource,
                 indication = null,
                 onClick = onClick
