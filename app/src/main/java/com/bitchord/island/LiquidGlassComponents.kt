@@ -7,10 +7,18 @@ import android.graphics.Bitmap
 import android.graphics.RenderEffect
 import android.graphics.RuntimeShader
 import android.graphics.Shader
+import android.hardware.display.DisplayManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
+import android.view.Choreographer
+import android.view.Display
 import android.view.View
+import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.view.Window
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -74,6 +82,7 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.ExperimentalTextApi
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -96,17 +105,88 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.lang.reflect.Method
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 // ------------------------------------------------------------
 // Blocco Frame Rate Reale (30 / 60 / 120 FPS — Default 60 FPS)
+// Applica il voto su DecorView + ricorsivamente su TUTTE le view
+// (incluso AndroidComposeView) con enforcement continuo in PreDraw
+// così Jetpack Compose / HyperOS 3 non lo sovrascrivono durante scroll e animazioni.
 // ------------------------------------------------------------
+private object FrameRateReflectionCache {
+    val setRequestedFrameRate: Method? by lazy {
+        if (Build.VERSION.SDK_INT >= 35) {
+            try {
+                View::class.java.getMethod(
+                    "setRequestedFrameRate",
+                    Float::class.javaPrimitiveType
+                )
+            } catch (_: Throwable) {
+                null
+            }
+        } else {
+            null
+        }
+    }
+
+    val getRequestedFrameRate: Method? by lazy {
+        if (Build.VERSION.SDK_INT >= 35) {
+            try {
+                View::class.java.getMethod("getRequestedFrameRate")
+            } catch (_: Throwable) {
+                null
+            }
+        } else {
+            null
+        }
+    }
+
+    val setFrameRateBoostOnTouch: Method? by lazy {
+        if (Build.VERSION.SDK_INT >= 35) {
+            try {
+                Window::class.java.getMethod(
+                    "setFrameRateBoostOnTouchEnabled",
+                    Boolean::class.javaPrimitiveType
+                )
+            } catch (_: Throwable) {
+                null
+            }
+        } else {
+            null
+        }
+    }
+}
+
+private fun selectDesiredDisplayMode(display: Display?, targetFps: Int): Display.Mode? {
+    val currentMode = display?.mode ?: return null
+    val modes = display.supportedModes ?: return null
+    if (modes.isEmpty()) return null
+
+    val sameRes = modes.filter {
+        it.physicalWidth == currentMode.physicalWidth &&
+            it.physicalHeight == currentMode.physicalHeight
+    }
+    val pool = sameRes.ifEmpty { modes.toList() }
+    return if (targetFps <= 30) {
+        val closest30 = pool.minByOrNull { abs(it.refreshRate - 30f) }
+        if (closest30 != null && closest30.refreshRate <= 35f) {
+            closest30
+        } else {
+            pool.minByOrNull { abs(it.refreshRate - 60f) }
+        }
+    } else {
+        pool.minByOrNull { abs(it.refreshRate - targetFps.toFloat()) }
+    }
+}
+
 fun applyWindowFrameRate(activity: Activity, targetFps: Int) {
     val window = activity.window ?: return
     val lp = window.attributes
@@ -114,61 +194,213 @@ fun applyWindowFrameRate(activity: Activity, targetFps: Int) {
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         try {
-            val display = activity.display
-            val currentMode = display?.mode
-            val modes = display?.supportedModes
-            if (currentMode != null && modes != null && modes.isNotEmpty()) {
-                val sameRes = modes.filter {
-                    it.physicalWidth == currentMode.physicalWidth &&
-                        it.physicalHeight == currentMode.physicalHeight
-                }
-                val pool = sameRes.ifEmpty { modes.toList() }
-                val desiredMode = if (targetFps <= 30) {
-                    val closest30 = pool.minByOrNull { abs(it.refreshRate - 30f) }
-                    if (closest30 != null && closest30.refreshRate <= 35f) {
-                        closest30
-                    } else {
-                        pool.minByOrNull { abs(it.refreshRate - 60f) }
-                    }
-                } else {
-                    pool.minByOrNull { abs(it.refreshRate - targetFps.toFloat()) }
-                }
-                if (desiredMode != null) {
-                    lp.preferredDisplayModeId = desiredMode.modeId
-                }
+            selectDesiredDisplayMode(activity.display, targetFps)?.let { desiredMode ->
+                lp.preferredDisplayModeId = desiredMode.modeId
             }
         } catch (_: Throwable) {
         }
     }
     window.attributes = lp
 
-    // Android 15/16 (HyperOS 3): blocco diretto SurfaceFlinger + touch boost controllato
+    // Android 15/16 (HyperOS 3): blocco diretto SurfaceFlinger + disattivazione touch boost (< 120 FPS)
     if (Build.VERSION.SDK_INT >= 35) {
+        applyFrameRateRecursive(window.decorView, targetFps.toFloat())
         try {
-            val setRate = View::class.java.getMethod(
-                "setRequestedFrameRate",
-                Float::class.javaPrimitiveType
-            )
-            setRate.invoke(window.decorView, targetFps.toFloat())
-        } catch (_: Throwable) {
-        }
-        try {
-            val setBoost = Window::class.java.getMethod(
-                "setFrameRateBoostOnTouchEnabled",
-                Boolean::class.javaPrimitiveType
-            )
-            setBoost.invoke(window, targetFps >= 120)
+            FrameRateReflectionCache.setFrameRateBoostOnTouch?.invoke(window, targetFps >= 120)
         } catch (_: Throwable) {
         }
     }
 }
 
+/**
+ * Applica setRequestedFrameRate su una view e ricorsivamente su tutti i figli
+ * (inclusa AndroidComposeView), aggiornando solo i nodi che hanno un voto diverso.
+ */
+fun applyFrameRateRecursive(view: View, fps: Float) {
+    if (Build.VERSION.SDK_INT >= 35) {
+        val setter = FrameRateReflectionCache.setRequestedFrameRate
+        if (setter != null) {
+            try {
+                val getter = FrameRateReflectionCache.getRequestedFrameRate
+                val current = (getter?.invoke(view) as? Float)
+                if (current == null || current.isNaN() || abs(current - fps) > 0.1f) {
+                    setter.invoke(view, fps)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+    if (view is ViewGroup) {
+        for (i in 0 until view.childCount) {
+            applyFrameRateRecursive(view.getChildAt(i), fps)
+        }
+    }
+}
+
+/**
+ * Applica il blocco frame rate su Window, DecorView e albero Compose corrente.
+ */
+fun applyFrameRateToComposeView(composeView: View, activity: Activity, targetFps: Int) {
+    applyWindowFrameRate(activity, targetFps)
+    if (Build.VERSION.SDK_INT >= 35) {
+        applyFrameRateRecursive(composeView, targetFps.toFloat())
+    }
+}
+
+/**
+ * Composable riutilizzabile che aggancia il blocco FPS (30/60/120) a DecorView e ComposeView,
+ * riapplicandolo su cambio targetFps, ON_RESUME e in PreDraw così scroll e animazioni Compose
+ * non sovrascrivono il voto SurfaceFlinger.
+ */
+@Composable
+fun BindFrameRateLock(targetFps: TargetFps) {
+    val context = LocalContext.current
+    val composeView = LocalView.current
+    val activity = context as? Activity
+
+    LaunchedEffect(activity, composeView, targetFps) {
+        if (activity != null) {
+            applyFrameRateToComposeView(composeView, activity, targetFps.fps)
+            composeView.post {
+                applyFrameRateToComposeView(composeView, activity, targetFps.fps)
+            }
+        }
+    }
+
+    DisposableEffect(activity, composeView, targetFps) {
+        if (activity == null) {
+            return@DisposableEffect onDispose {}
+        }
+
+        val owner = context as? LifecycleOwner
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                applyFrameRateToComposeView(composeView, activity, AppPreferences.targetFps.value.fps)
+            }
+        }
+        owner?.lifecycle?.addObserver(lifecycleObserver)
+
+        val preDrawListener = if (Build.VERSION.SDK_INT >= 35) {
+            ViewTreeObserver.OnPreDrawListener {
+                val rate = targetFps.fps.toFloat()
+                applyFrameRateRecursive(composeView, rate)
+                activity.window?.decorView?.let { applyFrameRateRecursive(it, rate) }
+                true
+            }
+        } else {
+            null
+        }
+        val vto = composeView.viewTreeObserver
+        if (preDrawListener != null && vto.isAlive) {
+            vto.addOnPreDrawListener(preDrawListener)
+        }
+
+        onDispose {
+            owner?.lifecycle?.removeObserver(lifecycleObserver)
+            if (preDrawListener != null && composeView.viewTreeObserver.isAlive) {
+                composeView.viewTreeObserver.removeOnPreDrawListener(preDrawListener)
+            }
+        }
+    }
+}
+
+/**
+ * Misura gli FPS reali consegnati dal Choreographer di sistema ogni ~0.5 secondi.
+ * Resta attivo solo finché il composable chiamante è montato (es. pannello Impostazioni).
+ */
+@Composable
+fun rememberChoreographerFps(): Int {
+    var measuredFps by remember { mutableIntStateOf(0) }
+    DisposableEffect(Unit) {
+        val choreographer = Choreographer.getInstance()
+        var active = true
+        var frameCount = 0
+        var windowStartNs = 0L
+
+        val callback = object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                if (!active) return
+                if (windowStartNs == 0L) {
+                    windowStartNs = frameTimeNanos
+                    frameCount = 0
+                } else {
+                    frameCount++
+                    val elapsedNs = frameTimeNanos - windowStartNs
+                    if (elapsedNs >= 500_000_000L) {
+                        val computed = ((frameCount * 1_000_000_000.0) / elapsedNs).roundToInt()
+                        measuredFps = computed.coerceAtLeast(1)
+                        frameCount = 0
+                        windowStartNs = frameTimeNanos
+                    }
+                }
+                choreographer.postFrameCallback(this)
+            }
+        }
+        choreographer.postFrameCallback(callback)
+
+        onDispose {
+            active = false
+            choreographer.removeFrameCallback(callback)
+        }
+    }
+    return measuredFps
+}
+
+/**
+ * Osserva la frequenza fisica corrente del pannello Display (es. 60 Hz / 120 Hz).
+ */
+@Composable
+fun rememberCurrentDisplayRefreshHz(): Int {
+    val context = LocalContext.current
+    fun readHz(): Int {
+        return try {
+            val dm = context.getSystemService(DisplayManager::class.java)
+            val display = (context as? Activity)?.display ?: dm?.getDisplay(Display.DEFAULT_DISPLAY)
+            display?.mode?.refreshRate?.roundToInt() ?: 60
+        } catch (_: Throwable) {
+            60
+        }
+    }
+
+    var refreshHz by remember { mutableIntStateOf(readHz()) }
+
+    DisposableEffect(context) {
+        val dm = context.getSystemService(DisplayManager::class.java)
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {
+                refreshHz = readHz()
+            }
+
+            override fun onDisplayRemoved(displayId: Int) = Unit
+
+            override fun onDisplayChanged(displayId: Int) {
+                val activeId = try {
+                    (context as? Activity)?.display?.displayId ?: Display.DEFAULT_DISPLAY
+                } catch (_: Throwable) {
+                    Display.DEFAULT_DISPLAY
+                }
+                if (displayId == activeId || displayId == Display.DEFAULT_DISPLAY) {
+                    refreshHz = readHz()
+                }
+            }
+        }
+        dm?.registerDisplayListener(listener, Handler(Looper.getMainLooper()))
+        refreshHz = readHz()
+        onDispose {
+            dm?.unregisterDisplayListener(listener)
+        }
+    }
+    return refreshHz
+}
+
 // ------------------------------------------------------------
-// AGSL iOS 26 True Optical Liquid Glass Shader
-// - Profilo 3D a menisco convesso (Snell / IOR)
-// - Blur Vogel Disk gaussiano 16-tap (barre) / 20-tap (popover/sheet)
-// - Dispersione cromatica RGB prismatica solo sul bordo curvo (t < 0.85)
-// - Riflesso speculare Fresnel dual-rim (~1.15dp) + caustica + ombra
+// AGSL iOS 26 True Optical Liquid Glass Shader V4
+// - Centro cristallino quasi totalmente limpido (~0.45dp) sulle barre
+// - Magnificazione ottica convessa centrale tipo goccia di vetro liquido
+// - Menisco curvo con Legge di Snell esatta (zero overshoot/artefatti)
+// - Dispersione cromatica RGB prismatica (etaR / etaG / etaB) sui bordi curvi
+// - Popover & Sheet: Vogel Disk ruotato con IGN per blur cremoso senza ghosting
+// - Riflesso speculare Fresnel dual-rim + caustica interna + ombra 3D morbida
 // ------------------------------------------------------------
 private const val IOS_LIQUID_GLASS_AGSL = """
 uniform shader composable;
@@ -205,42 +437,56 @@ float4 evalGlassShape(float2 fragCoord, float4 rect, float radius) {
     return float4(d, n.x, n.y, normY);
 }
 
-// Blur ottico Vogel Disk gaussiano a 16 campioni per barre fluttuanti cristalline
-half4 sampleVogelBlur16(float2 pos, float radiusPx) {
-    if (radiusPx < 0.35) {
+// Interleaved Gradient Noise per eliminare ghosting e banding sul blur satinato
+float interleavedGradientNoise(float2 coord) {
+    return fract(52.9829189 * fract(dot(coord, float2(0.06711056, 0.00583715))));
+}
+
+// Rifrazione fisica esatta tramite Legge di Snell attraverso il menisco curvo
+float2 snellShift(float2 n, float sinA, float cosA, float eta) {
+    float sin2T = eta * eta * sinA * sinA;
+    float cosT = sqrt(max(1.0 - sin2T, 0.0001));
+    float k = eta * cosA - cosT;
+    float tz = max(eta - k * cosA, 0.25);
+    return n * ((k * sinA) / tz);
+}
+
+// Campionamento cristallino 12-tap per barre (nitidissimo al centro, ZERO nebbia)
+half4 sampleVogelCrystal12(float2 pos, float radiusPx, float baseRot) {
+    if (radiusPx < 0.30) {
         return composable.eval(pos);
     }
     half4 acc = half4(0.0);
     float totalW = 0.0;
     const float GOLDEN_ANGLE = 2.39996323;
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 12; i++) {
         float fi = float(i);
-        float t = (fi + 0.5) / 16.0;
-        float r = sqrt(t) * radiusPx;
-        float ang = fi * GOLDEN_ANGLE;
+        float s = (fi + 0.5) / 12.0;
+        float r = sqrt(s) * radiusPx;
+        float ang = baseRot + fi * GOLDEN_ANGLE;
         float2 off = float2(cos(ang), sin(ang)) * r;
-        float w = exp(-2.4 * t);
+        float w = exp(-3.4 * s);
         acc += composable.eval(pos + off) * half(w);
         totalW += w;
     }
     return acc / half(totalW);
 }
 
-// Blur ottico Vogel Disk cremoso a 20 campioni per popover e sheet
-half4 sampleVogelBlur20(float2 pos, float radiusPx) {
-    if (radiusPx < 0.35) {
+// Campionamento satinato cremoso 28-tap + rotazione IGN (ZERO ghosting sui testi)
+half4 sampleVogelFrosted28(float2 pos, float radiusPx, float baseRot) {
+    if (radiusPx < 0.30) {
         return composable.eval(pos);
     }
     half4 acc = half4(0.0);
     float totalW = 0.0;
     const float GOLDEN_ANGLE = 2.39996323;
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < 28; i++) {
         float fi = float(i);
-        float t = (fi + 0.5) / 20.0;
-        float r = sqrt(t) * radiusPx;
-        float ang = fi * GOLDEN_ANGLE;
+        float s = (fi + 0.5) / 28.0;
+        float r = sqrt(s) * radiusPx;
+        float ang = baseRot + fi * GOLDEN_ANGLE;
         float2 off = float2(cos(ang), sin(ang)) * r;
-        float w = exp(-1.9 * t);
+        float w = exp(-2.0 * s);
         acc += composable.eval(pos + off) * half(w);
         totalW += w;
     }
@@ -268,7 +514,7 @@ half4 main(float2 fragCoord) {
         activeId = 2;
         activeRect = rect2;
     }
-    // L'overlay (menu/impostazioni) prevale sempre se il pixel e' dentro
+    // L'overlay (popover o impostazioni) ha priorita' visiva quando aperto
     if (g2.x <= 1.2) {
         best = g2;
         activeId = 2;
@@ -281,18 +527,18 @@ half4 main(float2 fragCoord) {
     float isOverlay = activeId == 2 ? 1.0 : 0.0;
     float isSheet = (activeId == 2 && overlayMode > 0.5) ? 1.0 : 0.0;
 
-    // Ombra ambientale morbida spostata verso il basso (+5dp su Y)
+    // Ombra esterna morbida e diffusa per staccare otticamente pillole e pannelli
     if (d > 0.75) {
-        float2 shPos = fragCoord - float2(0.0, 5.0 * density);
+        float2 shPos = fragCoord - float2(0.0, 5.5 * density);
         float dSh = 10000.0;
         if (activeId == 0) dSh = evalGlassShape(shPos, rect0, radius0).x;
         else if (activeId == 1) dSh = evalGlassShape(shPos, rect1, radius1).x;
         else dSh = evalGlassShape(shPos, rect2, radius2).x;
 
-        if (dSh > 28.0 * density) {
+        if (dSh > 32.0 * density) {
             return baseColor;
         }
-        float shAlpha = exp(-max(dSh, 0.0) / (10.0 * density)) * (isOverlay > 0.5 ? 0.38 : 0.26);
+        float shAlpha = exp(-max(dSh, 0.0) / (11.5 * density)) * (isOverlay > 0.5 ? 0.40 : 0.28);
         return half4(baseColor.rgb * half(1.0 - shAlpha), baseColor.a);
     }
 
@@ -302,87 +548,92 @@ half4 main(float2 fragCoord) {
     float minHalf = min(halfSize.x, halfSize.y);
 
     float distIn = max(-d, 0.0);
-    // Profilo 3D a menisco convesso (Snell / IOR)
-    float bezelTarget = isOverlay > 0.5 ? 24.0 : 20.0;
+    // Profilo sferico/superellittico continuo del menisco curvo (18dp barre, 22-26dp overlay)
+    float bezelTarget = isSheet > 0.5 ? 26.0 : (isOverlay > 0.5 ? 22.0 : 18.0);
     float bezel = max(min(bezelTarget * density, minHalf * 0.68), 1.0);
     float t = clamp(distIn / bezel, 0.0, 1.0);
-    float z = sqrt(max(1.0 - (1.0 - t) * (1.0 - t), 0.001));
-    float meniscusSlope = (1.0 - t) / max(z, 0.24);
+    float sinA = 1.0 - t;
+    float z = sqrt(max(1.0 - sinA * sinA, 0.0001));
 
-    // Deviazione lungo la normale sul bordo curvo + leggera lente convessa nella zona piatta
-    float magScale = isSheet > 0.5 ? 1.5 : (isOverlay > 0.5 ? 2.0 : 2.8);
-    float refractBasePx = (isOverlay > 0.5 ? 5.2 : 6.4) * density;
-    float2 centerLens = -localNorm * (magScale * density) * z;
-    float2 edgeRefract = -n * (meniscusSlope * refractBasePx);
-    float iorR = 0.90;
-    float iorG = 1.00;
-    float iorB = 1.10;
-    float2 refractedPos = fragCoord + centerLens + edgeRefract * iorG;
+    // 1. Magnificazione ottica convessa centrale (effetto goccia di vetro liquido reale)
+    float2 magPx = isSheet > 0.5 ? float2(1.0, 1.2) : (isOverlay > 0.5 ? float2(1.4, 1.8) : float2(1.6, 2.9));
+    float2 centerLens = -localNorm * (magPx * density) * z;
 
-    // Sfocatura ottica cristallina sulle barre vs densa/cremosa su popover e sheet
-    float centerBlur = (isSheet > 0.5 ? 5.6 : (isOverlay > 0.5 ? 4.8 : 1.4)) * density;
-    float edgeBlur = (isOverlay > 0.5 ? 3.2 : 0.75) * density;
+    // 2. Rifrazione curvilinea tramite Legge di Snell lungo il bordo (limitata e continua)
+    float refractDepthPx = (isOverlay > 0.5 ? 8.5 : 11.5) * density;
+    float etaR = 1.0 / 1.42;
+    float etaG = 1.0 / 1.52;
+    float etaB = 1.0 / 1.66;
+
+    float2 refractedPos = fragCoord + centerLens + snellShift(n, sinA, z, etaG) * refractDepthPx;
+
+    // 3. Centro quasi trasparente/cristallino sulle barre (~0.45dp) vs blur satinato senza ghosting sugli overlay
+    float centerBlur = (isSheet > 0.5 ? 4.8 : (isOverlay > 0.5 ? 4.2 : 0.45)) * density;
+    float edgeBlur = (isOverlay > 0.5 ? 2.2 : 1.10) * density;
     float blurR = mix(edgeBlur, centerBlur, t);
+    float rot = interleavedGradientNoise(fragCoord) * 6.2831853;
 
     half4 sampled;
     if (isOverlay > 0.5) {
-        sampled = sampleVogelBlur20(refractedPos, blurR);
+        sampled = sampleVogelFrosted28(refractedPos, blurR, rot);
     } else {
-        sampled = sampleVogelBlur16(refractedPos, blurR);
+        sampled = sampleVogelCrystal12(refractedPos, blurR, rot);
     }
     half3 glassRgb = sampled.rgb;
 
-    // Dispersione cromatica RGB prismatica pulita SOLO sulla fascia curva del bordo (t < 0.85)
-    if (t < 0.85) {
-        float2 posR = fragCoord + centerLens + edgeRefract * iorR;
-        float2 posB = fragCoord + centerLens + edgeRefract * iorB;
+    // 4. Dispersione cromatica RGB prismatica rigorosamente sulla fascia curva ripida (t < 0.80)
+    if (t < 0.80) {
+        float2 posR = fragCoord + centerLens + snellShift(n, sinA, z, etaR) * refractDepthPx;
+        float2 posB = fragCoord + centerLens + snellShift(n, sinA, z, etaB) * refractDepthPx;
         half rEdge = composable.eval(posR).r;
         half bEdge = composable.eval(posB).b;
-        float chromaMix = smoothstep(0.85, 0.10, t) * (isOverlay > 0.5 ? 0.50 : 0.78);
+        float chromaMix = smoothstep(0.80, 0.04, t) * (isOverlay > 0.5 ? 0.45 : 0.90);
         glassRgb.r = mix(glassRgb.r, rEdge, half(chromaMix));
         glassRgb.b = mix(glassRgb.b, bEdge, half(chromaMix));
     }
 
-    // Vibrancy Apple + lieve boost di luminosita' sulle barre cristalline
+    // 5. Luminanza adattiva Apple iOS 26 (ZERO patina grigia o pannello nero opaco sulle barre)
     half luma = dot(glassRgb, half3(0.299, 0.587, 0.114));
-    float vibrancy = isOverlay > 0.5 ? 1.38 : 1.43;
-    glassRgb = mix(half3(luma), glassRgb, half(vibrancy));
     if (isOverlay < 0.5) {
-        glassRgb *= half(1.06);
+        glassRgb = mix(half3(luma), glassRgb, half(1.45));
+        float adaptiveGain = mix(1.08, 0.90, smoothstep(0.45, 0.85, float(luma)));
+        glassRgb *= half(adaptiveGain);
+        glassRgb += half3(0.015, 0.018, 0.025);
+    } else {
+        glassRgb = mix(half3(luma), glassRgb, half(1.32));
+        half3 satinTint = half3(0.055, 0.065, 0.11);
+        float tintStrength = isSheet > 0.5 ? 0.38 : 0.30;
+        glassRgb = mix(glassRgb, satinTint, half(tintStrength));
     }
 
-    // Tinta cristallina leggera sulle barre, piu' traslucida-leggibile su popover/sheet
-    half3 crystalTint = isOverlay > 0.5 ? half3(0.055, 0.06, 0.095) : half3(0.06, 0.07, 0.11);
-    float tintStrength = isSheet > 0.5 ? 0.44 : (isOverlay > 0.5 ? 0.39 : 0.10);
-    glassRgb = mix(glassRgb, crystalTint, half(tintStrength));
+    // Rifletti leggermente la curvatura superiore e il rimbalzo inferiore della lente 3D
+    float topGlaze = smoothstep(0.25, -1.0, normY) * (isOverlay > 0.5 ? 0.045 : 0.085);
+    float bottomBounce = smoothstep(0.55, 1.0, normY) * (isOverlay > 0.5 ? 0.018 : 0.035);
+    glassRgb += half3(half(topGlaze + bottomBounce));
 
-    // Leggero gradiente lucido superiore
-    float topGlaze = smoothstep(0.40, -1.0, normY) * (isOverlay > 0.5 ? 0.045 : 0.075);
-    glassRgb += half3(topGlaze);
-
-    // Sottile ombra interna di rifrazione subito dentro il bordo
-    float innerGroove = smoothstep(0.9 * density, 3.0 * density, distIn) *
-                        smoothstep(7.5 * density, 3.0 * density, distIn) *
-                        (isOverlay > 0.5 ? 0.08 : 0.06);
+    // Leggerissima ombra interna da spessore del vetro subito dentro il bordo
+    float innerGroove = smoothstep(0.9 * density, 2.8 * density, distIn) *
+                        smoothstep(6.8 * density, 2.8 * density, distIn) *
+                        (isOverlay > 0.5 ? 0.06 : 0.045);
     glassRgb *= half(1.0 - innerGroove);
 
-    // Riflesso speculare Fresnel dual-rim (~1.15dp) + caustica interna morbida (~5dp)
-    float2 keyLight = normalize(float2(-0.55, -0.83));
-    float2 rimLight = normalize(float2(0.55, 0.83));
-    float fresnel = pow(max(1.0 - z, 0.0001), 1.8);
-    float specKey = pow(max(dot(n, keyLight), 0.0001), 2.4);
-    float specBack = pow(max(dot(n, rimLight), 0.0001), 3.0) * 0.55;
+    // 6. Doppio riflesso speculare Fresnel iOS 26 (luce primaria alto-sx + rim light basso-dx)
+    float2 keyLight = normalize(float2(-0.52, -0.85));
+    float2 rimLight = normalize(float2(0.52, 0.85));
+    float fresnel = pow(max(1.0 - z, 0.0001), 2.0);
+    float specKey = pow(max(dot(n, keyLight), 0.0001), 2.2);
+    float specBack = pow(max(dot(n, rimLight), 0.0001), 3.0) * 0.54;
     float dirWeight = specKey + specBack;
 
-    float hairlineRim = smoothstep(1.18 * density, 0.0, distIn);
-    float softCaustic = smoothstep(5.0 * density, 0.0, distIn) * (0.10 + 0.14 * fresnel);
+    float hairlineRim = smoothstep(1.22 * density, 0.0, distIn);
+    float softCaustic = smoothstep(5.5 * density, 0.0, distIn) * (0.09 + 0.17 * fresnel);
 
-    float rimBase = isOverlay > 0.5 ? 0.12 : 0.14;
-    float rimPeak = isOverlay > 0.5 ? 0.68 : 0.78;
+    float rimBase = isOverlay > 0.5 ? 0.15 : 0.20;
+    float rimPeak = isOverlay > 0.5 ? 0.74 : 0.92;
     float specular = hairlineRim * (rimBase + rimPeak * dirWeight) +
                      softCaustic * (0.16 + 0.84 * specKey);
 
-    glassRgb = clamp(glassRgb + half3(specular), half3(0.0), half3(1.0));
+    glassRgb = clamp(glassRgb + half3(half(specular)), half3(0.0), half3(1.0));
 
     float insideMask = smoothstep(0.75, -0.75, d);
     half3 finalRgb = mix(baseColor.rgb, glassRgb, half(insideMask));
@@ -634,9 +885,9 @@ fun LiquidAmbientBackground(
                 .fillMaxSize()
                 .background(
                     Brush.verticalGradient(
-                        0.0f to Color.Black.copy(alpha = 0.20f),
-                        0.5f to Color.Black.copy(alpha = 0.30f),
-                        1.0f to Color.Black.copy(alpha = 0.44f)
+                        0.0f to Color.Black.copy(alpha = 0.16f),
+                        0.5f to Color.Black.copy(alpha = 0.24f),
+                        1.0f to Color.Black.copy(alpha = 0.35f)
                     )
                 )
         )
@@ -1034,7 +1285,8 @@ private fun PermissionGlassCard(
                 fontWeight = FontWeight.Bold,
                 fontSize = 16.sp,
                 letterSpacing = (-0.3).sp,
-                color = Color.White
+                color = Color.White,
+                style = GlassTextShadowStyle
             )
             Spacer(Modifier.height(3.dp))
             Text(
@@ -1042,7 +1294,8 @@ private fun PermissionGlassCard(
                 fontFamily = font,
                 fontSize = 12.sp,
                 lineHeight = 16.sp,
-                color = Color.White.copy(alpha = 0.78f)
+                color = Color.White.copy(alpha = 0.84f),
+                style = GlassTextShadowStyle
             )
         }
 
@@ -1174,19 +1427,20 @@ fun LiquidGlassLyricsPlayerScreen(
 
     LaunchedEffect(syncOffsetMs) { forceNextLineSync = true }
 
-    // Cadenza sincronizzata al blocco FPS scelto dall'utente (30 / 60 / 120 FPS)
+    // Cadenza esatta sincronizzata al blocco FPS scelto dall'utente (30 / 60 / 120 FPS)
     LaunchedEffect(isPlaying, syncOffsetMs, basePositionMs, lines, targetFps) {
-        val activeFrameDelayMs = when (targetFps) {
+        val activeFrameIntervalMs = when (targetFps) {
             TargetFps.FPS_30 -> 33L
             TargetFps.FPS_60 -> 16L
             TargetFps.FPS_120 -> 8L
         }
-        val lineOnlyDelayMs = when (targetFps) {
+        val lineOnlyIntervalMs = when (targetFps) {
             TargetFps.FPS_30 -> 160L
             TargetFps.FPS_60 -> 100L
             TargetFps.FPS_120 -> 60L
         }
 
+        var nextTickAt = SystemClock.uptimeMillis()
         while (true) {
             val pos = LyricsPlaybackStore.currentPositionMs()
             val raw = LyricsPlaybackStore.rawPositionMs()
@@ -1211,7 +1465,13 @@ fun LiquidGlassLyricsPlayerScreen(
 
             if (!isPlaying) break
             val hasWordSync = activeIndex in lines.indices && lines[activeIndex].words.isNotEmpty()
-            delay(if (hasWordSync) activeFrameDelayMs else lineOnlyDelayMs)
+            val stepMs = if (hasWordSync) activeFrameIntervalMs else lineOnlyIntervalMs
+            nextTickAt += stepMs
+            val now = SystemClock.uptimeMillis()
+            if (nextTickAt <= now) {
+                nextTickAt = now + stepMs
+            }
+            delay((nextTickAt - now).coerceAtLeast(1L))
         }
     }
 
@@ -1583,6 +1843,7 @@ fun LiquidGlassLyricsPlayerScreen(
                         .clip(RoundedCornerShape(18.dp))
                         .clickable {
                             menuExpanded = false
+                            overlayRect = Rect.Zero
                             showSettingsSheet = true
                         }
                         .padding(horizontal = 12.dp, vertical = 11.dp)
@@ -1629,8 +1890,9 @@ fun LiquidGlassLyricsPlayerScreen(
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(Color(0xFF0A261D).copy(alpha = 0.62f))
                     .iosGlassButton(RoundedCornerShape(50), elevated = true)
-                    .background(Color(0xFF0A261D).copy(alpha = 0.74f))
                     .padding(horizontal = 16.dp, vertical = 10.dp)
             ) {
                 CheckIcon(color = Color(0xFF4ADE80), size = 16.dp)
@@ -1932,6 +2194,10 @@ private fun LiquidSettingsModal(
             Spacer(Modifier.height(22.dp))
 
             // SEZIONE 2: BLOCCO FRAME RATE (30 / 60 / 120 FPS)
+            val composeView = LocalView.current
+            val measuredFps = rememberChoreographerFps()
+            val displayHz = rememberCurrentDisplayRefreshHz()
+
             Text(
                 text = "BLOCCO FRAME RATE (FPS)",
                 fontFamily = font,
@@ -1969,7 +2235,9 @@ private fun LiquidSettingsModal(
                             )
                             .clickable {
                                 AppPreferences.setTargetFps(context, option)
-                                (context as? Activity)?.let { applyWindowFrameRate(it, option.fps) }
+                                (context as? Activity)?.let {
+                                    applyFrameRateToComposeView(composeView, it, option.fps)
+                                }
                             }
                             .padding(vertical = 11.dp)
                     ) {
@@ -1983,6 +2251,43 @@ private fun LiquidSettingsModal(
                         )
                     }
                 }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .iosGlassButton(RoundedCornerShape(14.dp), elevated = false)
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (measuredFps > 0 && abs(measuredFps - targetFps.fps) <= 6) Color(0xFF4ADE80)
+                                else Color(0xFF93C5FD)
+                            )
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = if (measuredFps > 0) "Reali: $measuredFps FPS" else "Misura FPS reali…",
+                        fontFamily = font,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 12.sp,
+                        color = Color.White
+                    )
+                }
+                Text(
+                    text = "Pannello: ${displayHz} Hz • Target: ${targetFps.fps}",
+                    fontFamily = font,
+                    fontSize = 11.sp,
+                    color = Color.White.copy(alpha = 0.74f)
+                )
             }
 
             Spacer(Modifier.height(22.dp))

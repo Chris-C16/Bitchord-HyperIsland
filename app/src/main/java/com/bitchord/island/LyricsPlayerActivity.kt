@@ -8,7 +8,6 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 
@@ -28,9 +27,7 @@ class LyricsPlayerActivity : ComponentActivity() {
                 val font = rememberDynamicFont()
                 val targetFps by AppPreferences.targetFps.collectAsState()
 
-                LaunchedEffect(targetFps) {
-                    applyWindowFrameRate(this@LyricsPlayerActivity, targetFps.fps)
-                }
+                BindFrameRateLock(targetFps)
 
                 LiquidGlassLyricsPlayerScreen(
                     font = font,

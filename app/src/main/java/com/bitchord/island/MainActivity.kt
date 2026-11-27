@@ -59,6 +59,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
         AppPreferences.init(this)
+        applyWindowFrameRate(this, AppPreferences.targetFps.value.fps)
 
         // 1. Chiede subito il permesso notifiche all'avvio su Android 13-16
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -75,8 +76,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 val font = rememberDynamicFont()
+                val targetFps by AppPreferences.targetFps.collectAsState()
                 var stage by remember { mutableStateOf(AppStage.SPLASH) }
                 val refreshTick by permissionRefreshTick
+
+                BindFrameRateLock(targetFps)
 
                 // Se l'app era stata chiusa dai recenti, ritenta velocemente il rebind finché parte
                 LaunchedEffect(refreshTick) {
@@ -133,6 +137,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        applyWindowFrameRate(this, AppPreferences.targetFps.value.fps)
         permissionRefreshTick.intValue++
         if (allRequiredPermissionsReady()) {
             BitChordListenerService.ensureConnected(this, forceRepublish = true)
