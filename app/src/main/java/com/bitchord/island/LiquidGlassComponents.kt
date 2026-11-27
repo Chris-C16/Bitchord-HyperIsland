@@ -1412,7 +1412,8 @@ fun LiquidGlassLyricsPlayerScreen(
                 .padding(top = 80.dp, end = 16.dp)
         ) {
             val granted = BitChordListenerService.isNotificationAccessGranted(context)
-            val activeNow = granted && BitChordListenerService.isRunning()
+            val serviceConnected by BitChordListenerService.isServiceConnected.collectAsState()
+            val activeNow = granted && serviceConnected
 
             Column(
                 modifier = Modifier
@@ -1439,11 +1440,16 @@ fun LiquidGlassLyricsPlayerScreen(
                         .clickable {
                             menuExpanded = false
                             val ok = BitChordListenerService.isNotificationAccessGranted(context)
-                            if (ok) {
-                                BitChordListenerService.ensureConnected(context, forceRepublish = true)
-                                statusBannerText = "Servizio attivo • ${targetFps.label}"
-                            } else {
-                                openNotificationListenerSettings(context)
+                            when {
+                                !ok -> openNotificationListenerSettings(context)
+                                !serviceConnected -> {
+                                    BitChordListenerService.forceHardRebind(context)
+                                    statusBannerText = "Riaggancio forzato in corso…"
+                                }
+                                else -> {
+                                    BitChordListenerService.ensureConnected(context, forceRepublish = true)
+                                    statusBannerText = "Servizio attivo • ${targetFps.label}"
+                                }
                             }
                         }
                         .padding(horizontal = 12.dp, vertical = 11.dp)
@@ -1713,7 +1719,7 @@ private fun LiquidSettingsModal(
 
     val notifGranted = BitChordListenerService.isNotificationAccessGranted(context)
     val postNotifOk = BitChordListenerService.areNotificationsEnabled(context)
-    val serviceAlive = BitChordListenerService.isRunning()
+    val serviceAlive by BitChordListenerService.isServiceConnected.collectAsState()
 
     Box(
         modifier = Modifier
@@ -1797,7 +1803,13 @@ private fun LiquidSettingsModal(
                 status = if (serviceAlive) "Attivo" else "Riaggancia",
                 ok = serviceAlive,
                 font = font,
-                onClick = { BitChordListenerService.ensureConnected(context, forceRepublish = true) }
+                onClick = {
+                    if (serviceAlive) {
+                        BitChordListenerService.ensureConnected(context, forceRepublish = true)
+                    } else {
+                        BitChordListenerService.forceHardRebind(context)
+                    }
+                }
             )
             Spacer(Modifier.height(8.dp))
             DiagnosticRow(

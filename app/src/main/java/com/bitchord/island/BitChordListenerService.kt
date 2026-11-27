@@ -6,6 +6,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -20,6 +21,7 @@ import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.view.KeyEvent
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
 
 class BitChordListenerService : NotificationListenerService() {
 
@@ -30,11 +32,19 @@ class BitChordListenerService : NotificationListenerService() {
         private const val BACKWARD_JITTER_GUARD_MS = 1400L
         private const val FORWARD_JITTER_GUARD_MS = 220L
         private const val LINE_HYSTERESIS_MS = 1500L
+        private const val HARD_REBIND_COOLDOWN_MS = 2500L
 
         @Volatile
         private var instance: BitChordListenerService? = null
 
-        fun isRunning(): Boolean = instance != null
+        @Volatile
+        private var lastHardRebindMs = 0L
+
+        val isServiceConnected = MutableStateFlow(false)
+
+        private val companionHandler = Handler(Looper.getMainLooper())
+
+        fun isRunning(): Boolean = instance != null && isServiceConnected.value
 
         fun isNotificationAccessGranted(context: Context): Boolean {
             val enabled = Settings.Secure.getString(
@@ -56,11 +66,60 @@ class BitChordListenerService : NotificationListenerService() {
             }
         }
 
+        fun forceHardRebind(context: Context) {
+            val appCtx = context.applicationContext
+            if (!isNotificationAccessGranted(appCtx)) return
+            val now = SystemClock.elapsedRealtime()
+            if (lastHardRebindMs != 0L && now - lastHardRebindMs < HARD_REBIND_COOLDOWN_MS) return
+            lastHardRebindMs = now
+
+            val component = ComponentName(appCtx, BitChordListenerService::class.java)
+            val pm = appCtx.packageManager
+            try {
+                pm.setComponentEnabledSetting(
+                    component,
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                    PackageManager.DONT_KILL_APP
+                )
+            } catch (_: Throwable) {
+            }
+
+            companionHandler.postDelayed({
+                try {
+                    pm.setComponentEnabledSetting(
+                        component,
+                        PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                        PackageManager.DONT_KILL_APP
+                    )
+                } catch (_: Throwable) {
+                }
+                try {
+                    requestRebind(component)
+                } catch (_: Throwable) {
+                }
+            }, 180L)
+        }
+
         fun ensureConnected(context: Context, forceRepublish: Boolean = false) {
-            AppPreferences.init(context)
-            if (!isNotificationAccessGranted(context)) return
+            val appCtx = context.applicationContext
+            AppPreferences.init(appCtx)
+            if (!isNotificationAccessGranted(appCtx)) return
+
+            val component = ComponentName(appCtx, BitChordListenerService::class.java)
+            val pm = appCtx.packageManager
+            try {
+                if (pm.getComponentEnabledSetting(component) == PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
+                    pm.setComponentEnabledSetting(
+                        component,
+                        PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                        PackageManager.DONT_KILL_APP
+                    )
+                }
+            } catch (_: Throwable) {
+            }
+
             val current = instance
-            if (current != null) {
+            if (current != null && isServiceConnected.value) {
                 if (forceRepublish) {
                     current.forceRepublishPill()
                 } else {
@@ -68,18 +127,24 @@ class BitChordListenerService : NotificationListenerService() {
                 }
             } else {
                 try {
-                    requestRebind(ComponentName(context, BitChordListenerService::class.java))
+                    requestRebind(component)
                 } catch (_: Throwable) {
                 }
+                companionHandler.postDelayed({
+                    if (!isRunning()) {
+                        forceHardRebind(appCtx)
+                    }
+                }, 450L)
             }
         }
 
         fun triggerPlayPreferred(context: Context) {
             AppPreferences.init(context)
             val current = instance
-            if (current != null) {
+            if (current != null && isServiceConnected.value) {
                 current.handlePlayPauseCommand()
             } else {
+                ensureConnected(context, forceRepublish = true)
                 launchOrResumePreferredApp(context)
             }
         }
@@ -306,6 +371,7 @@ class BitChordListenerService : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         instance = this
+        isServiceConnected.value = true
         forceRepublishPill()
     }
 
@@ -328,14 +394,22 @@ class BitChordListenerService : NotificationListenerService() {
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
+        isServiceConnected.value = false
         isSessionsRegistered = false
         try {
             sessionManager.removeOnActiveSessionsChangedListener(sessionsListener)
         } catch (_: Exception) {
         }
-        try {
-            requestRebind(ComponentName(this, BitChordListenerService::class.java))
-        } catch (_: Throwable) {
+        forceHardRebind(applicationContext)
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (isNotificationAccessGranted(this)) {
+            try {
+                requestRebind(ComponentName(this, BitChordListenerService::class.java))
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -751,6 +825,7 @@ class BitChordListenerService : NotificationListenerService() {
     }
 
     override fun onDestroy() {
+        isServiceConnected.value = false
         if (instance === this) instance = null
         stopTicker()
         fetchJob?.cancel()
