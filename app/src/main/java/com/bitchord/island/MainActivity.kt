@@ -57,15 +57,21 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
         )
         super.onCreate(savedInstanceState)
-        window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
+        try {
+            window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
+        } catch (_: Throwable) {
+        }
         AppPreferences.init(this)
         applyWindowFrameRate(this, AppPreferences.targetFps.value.fps)
 
         // 1. Chiede subito il permesso notifiche all'avvio su Android 13-16
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            postNotifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) {
+                postNotifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        } catch (_: Throwable) {
         }
 
         // 2. Risveglia subito la pillola senza aspettare la fine dello splash

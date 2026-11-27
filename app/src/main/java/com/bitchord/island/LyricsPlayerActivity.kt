@@ -18,7 +18,10 @@ class LyricsPlayerActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
         )
         super.onCreate(savedInstanceState)
-        window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
+        try {
+            window.setBackgroundDrawable(ColorDrawable(0xFF07070C.toInt()))
+        } catch (_: Throwable) {
+        }
         AppPreferences.init(this)
         applyWindowFrameRate(this, AppPreferences.targetFps.value.fps)
 

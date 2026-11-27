@@ -3,6 +3,8 @@ package com.bitchord.island
 import android.content.Context
 import android.content.SharedPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
+import java.io.PrintWriter
+import java.io.StringWriter
 
 enum class TargetFps(val fps: Int, val label: String) {
     FPS_30(30, "30 FPS"),
@@ -49,19 +51,25 @@ object AppPreferences {
     private const val KEY_LAST_ACTIVE_PKG = "last_active_music_pkg"
     private const val KEY_LAST_PKG_PREFIX = "last_pkg_"
     private const val KEY_TARGET_FPS = "target_fps"
+    private const val KEY_LAST_CRASH = "last_uncaught_crash"
 
     const val FACTORY_DEFAULT_OFFSET_MS = 600L
 
     @Volatile
     private var prefs: SharedPreferences? = null
 
+    @Volatile
+    private var crashHandlerInstalled = false
+
     val preferredPlayer = MutableStateFlow(PreferredPlayer.AUTO)
     val defaultSyncOffsetMs = MutableStateFlow(FACTORY_DEFAULT_OFFSET_MS)
     val appInfoStepDone = MutableStateFlow(false)
     val lastActiveMusicPackage = MutableStateFlow("")
     val targetFps = MutableStateFlow(TargetFps.FPS_60)
+    val lastUncaughtCrash = MutableStateFlow("")
 
     fun init(context: Context) {
+        installCrashLogger(context)
         if (prefs != null) return
         val sp = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs = sp
@@ -70,7 +78,37 @@ object AppPreferences {
         appInfoStepDone.value = sp.getBoolean(KEY_APP_INFO_DONE, false)
         lastActiveMusicPackage.value = sp.getString(KEY_LAST_ACTIVE_PKG, "").orEmpty()
         targetFps.value = TargetFps.fromFps(sp.getInt(KEY_TARGET_FPS, TargetFps.FPS_60.fps))
+        lastUncaughtCrash.value = sp.getString(KEY_LAST_CRASH, "").orEmpty()
         LyricsPlaybackStore.syncOffsetMs.value = defaultSyncOffsetMs.value
+    }
+
+    fun installCrashLogger(context: Context) {
+        if (crashHandlerInstalled) return
+        crashHandlerInstalled = true
+        val appCtx = context.applicationContext
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                val sw = StringWriter()
+                val pw = PrintWriter(sw)
+                throwable.printStackTrace(pw)
+                pw.flush()
+                val summary = "[${thread.name}] ${sw.toString().trim().take(1800)}"
+                appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_LAST_CRASH, summary)
+                    .commit()
+                lastUncaughtCrash.value = summary
+            } catch (_: Throwable) {
+            }
+            previous?.uncaughtException(thread, throwable)
+        }
+    }
+
+    fun clearLastCrash(context: Context) {
+        init(context)
+        lastUncaughtCrash.value = ""
+        prefs?.edit()?.remove(KEY_LAST_CRASH)?.apply()
     }
 
     fun setPreferredPlayer(context: Context, player: PreferredPlayer) {

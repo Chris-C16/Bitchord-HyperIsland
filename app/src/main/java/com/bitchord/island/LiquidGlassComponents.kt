@@ -132,6 +132,12 @@ import kotlin.math.sin
 
 private object LiquidGlassDiagnostics {
     val shaderStatus = MutableStateFlow("AGSL non inizializzato")
+
+    fun updateStatus(status: String) {
+        if (shaderStatus.value != status) {
+            shaderStatus.value = status
+        }
+    }
 }
 
 private object FrameRateReflection {
@@ -216,119 +222,136 @@ private object AppFrameRateTracker {
 }
 
 private fun selectDesiredDisplayMode(display: Display?, targetFps: Int): Display.Mode? {
-    val currentMode = display?.mode ?: return null
-    val modes = display.supportedModes ?: return null
-    if (modes.isEmpty()) return null
+    return try {
+        val currentMode = display?.mode ?: return null
+        val modes = display.supportedModes ?: return null
+        if (modes.isEmpty()) return null
 
-    val sameRes = modes.filter {
-        it.physicalWidth == currentMode.physicalWidth &&
-            it.physicalHeight == currentMode.physicalHeight
-    }
-    val pool = sameRes.ifEmpty { modes.toList() }
-    return if (targetFps <= 30) {
-        val closest30 = pool.minByOrNull { abs(it.refreshRate - 30f) }
-        if (closest30 != null && closest30.refreshRate <= 35f) {
-            closest30
-        } else {
-            // 60 Hz è divisore esatto di 30 FPS (mai 120 Hz)
-            pool.minByOrNull { abs(it.refreshRate - 60f) }
+        val sameRes = modes.filter {
+            it.physicalWidth == currentMode.physicalWidth &&
+                it.physicalHeight == currentMode.physicalHeight
         }
-    } else {
-        pool.minByOrNull { abs(it.refreshRate - targetFps.toFloat()) }
+        val pool = sameRes.ifEmpty { modes.toList() }
+        if (targetFps <= 30) {
+            val closest30 = pool.minByOrNull { abs(it.refreshRate - 30f) }
+            if (closest30 != null && closest30.refreshRate <= 35f) {
+                closest30
+            } else {
+                // 60 Hz è divisore esatto di 30 FPS (mai 120 Hz)
+                pool.minByOrNull { abs(it.refreshRate - 60f) }
+            }
+        } else {
+            pool.minByOrNull { abs(it.refreshRate - targetFps.toFloat()) }
+        }
+    } catch (_: Throwable) {
+        null
     }
 }
 
 @SuppressLint("NewApi")
 private fun applyWindowLayoutParamsFrameRate(activity: Activity, targetFps: Int) {
-    val window = activity.window ?: return
-    val lp = window.attributes
+    try {
+        val window = activity.window ?: return
+        val lp = window.attributes ?: return
 
-    val desiredMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        try {
-            selectDesiredDisplayMode(activity.display, targetFps)
-        } catch (_: Throwable) {
+        val desiredMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                selectDesiredDisplayMode(activity.display, targetFps)
+            } catch (_: Throwable) {
+                null
+            }
+        } else {
             null
         }
-    } else {
-        null
-    }
 
-    if (desiredMode != null) {
-        lp.preferredDisplayModeId = desiredMode.modeId
-    }
-    lp.preferredRefreshRate = when {
-        targetFps <= 30 -> if (desiredMode != null && desiredMode.refreshRate <= 35f) desiredMode.refreshRate else 30f
-        desiredMode != null -> desiredMode.refreshRate
-        else -> targetFps.toFloat()
-    }
+        if (desiredMode != null) {
+            lp.preferredDisplayModeId = desiredMode.modeId
+        }
+        lp.preferredRefreshRate = when {
+            targetFps <= 30 -> if (desiredMode != null && desiredMode.refreshRate <= 35f) desiredMode.refreshRate else 30f
+            desiredMode != null -> desiredMode.refreshRate
+            else -> targetFps.toFloat()
+        }
 
-    val allowTouchBoost = targetFps >= 120
-    if (Build.VERSION.SDK_INT >= 35) {
-        try {
-            lp.setFrameRateBoostOnTouchEnabled(allowTouchBoost)
-        } catch (t: Throwable) {
+        val allowTouchBoost = targetFps >= 120
+        if (Build.VERSION.SDK_INT >= 35) {
+            try {
+                lp.setFrameRateBoostOnTouchEnabled(allowTouchBoost)
+            } catch (t: Throwable) {
+                try {
+                    FrameRateReflection.layoutParamsBoostMethod?.invoke(lp, allowTouchBoost)
+                } catch (_: Throwable) {
+                    Log.w("LiquidGlassFPS", "LayoutParams touchBoost fallback skipped: ${t.message}")
+                }
+            }
+        } else {
             try {
                 FrameRateReflection.layoutParamsBoostMethod?.invoke(lp, allowTouchBoost)
             } catch (_: Throwable) {
-                Log.w("LiquidGlassFPS", "LayoutParams touchBoost fallback skipped: ${t.message}")
             }
         }
-    } else {
+
+        window.attributes = lp
+
+        // Verifica anche eventuale mirror su Window (OEM / Android 15+)
         try {
-            FrameRateReflection.layoutParamsBoostMethod?.invoke(lp, allowTouchBoost)
+            FrameRateReflection.windowBoostMethod?.invoke(window, allowTouchBoost)
         } catch (_: Throwable) {
         }
-    }
-
-    window.attributes = lp
-
-    // Verifica anche eventuale mirror su Window (OEM / Android 15+)
-    try {
-        FrameRateReflection.windowBoostMethod?.invoke(window, allowTouchBoost)
     } catch (_: Throwable) {
     }
 }
 
 @SuppressLint("NewApi")
 fun applyFrameRateRecursive(view: View, fps: Float) {
-    if (Build.VERSION.SDK_INT >= 35) {
-        try {
-            val current = view.getRequestedFrameRate()
-            if (current.isNaN() || abs(current - fps) > 0.1f) {
-                view.setRequestedFrameRate(fps)
-            }
-        } catch (_: Throwable) {
+    if (fps.isNaN() || fps <= 0f) return
+    try {
+        if (Build.VERSION.SDK_INT >= 35) {
             try {
-                val setter = FrameRateReflection.setRequestedFrameRateMethod
-                val getter = FrameRateReflection.getRequestedFrameRateMethod
-                val current = getter?.invoke(view) as? Float
-                if (current == null || current.isNaN() || abs(current - fps) > 0.1f) {
-                    setter?.invoke(view, fps)
+                val current = view.getRequestedFrameRate()
+                if (current.isNaN() || abs(current - fps) > 0.1f) {
+                    view.setRequestedFrameRate(fps)
                 }
             } catch (_: Throwable) {
+                try {
+                    val setter = FrameRateReflection.setRequestedFrameRateMethod
+                    val getter = FrameRateReflection.getRequestedFrameRateMethod
+                    val current = getter?.invoke(view) as? Float
+                    if (current == null || current.isNaN() || abs(current - fps) > 0.1f) {
+                        setter?.invoke(view, fps)
+                    }
+                } catch (_: Throwable) {
+                }
             }
         }
-    }
-    if (view is ViewGroup) {
-        for (i in 0 until view.childCount) {
-            applyFrameRateRecursive(view.getChildAt(i), fps)
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                view.getChildAt(i)?.let { child -> applyFrameRateRecursive(child, fps) }
+            }
         }
+    } catch (_: Throwable) {
     }
 }
 
 fun applyWindowFrameRate(activity: Activity, targetFps: Int) {
-    applyWindowLayoutParamsFrameRate(activity, targetFps)
-    if (Build.VERSION.SDK_INT >= 35) {
-        activity.window?.decorView?.let { decor ->
-            applyFrameRateRecursive(decor, targetFps.toFloat())
+    try {
+        applyWindowLayoutParamsFrameRate(activity, targetFps)
+        if (Build.VERSION.SDK_INT >= 35) {
+            activity.window?.peekDecorView()?.let { decor ->
+                applyFrameRateRecursive(decor, targetFps.toFloat())
+            }
         }
+    } catch (_: Throwable) {
     }
 }
 
 fun applyFrameRateToComposeView(composeView: View, activity: Activity, targetFps: Int) {
-    applyWindowFrameRate(activity, targetFps)
-    if (Build.VERSION.SDK_INT >= 35) {
-        applyFrameRateRecursive(composeView, targetFps.toFloat())
+    try {
+        applyWindowFrameRate(activity, targetFps)
+        if (Build.VERSION.SDK_INT >= 35) {
+            applyFrameRateRecursive(composeView, targetFps.toFloat())
+        }
+    } catch (_: Throwable) {
     }
 }
 
@@ -345,17 +368,26 @@ fun BindFrameRateLock(targetFps: TargetFps) {
 
     LaunchedEffect(activity, composeView, targetFps) {
         if (activity != null) {
-            applyFrameRateToComposeView(composeView, activity, targetFps.fps)
-            composeView.post {
+            try {
                 applyFrameRateToComposeView(composeView, activity, targetFps.fps)
+                composeView.post {
+                    try {
+                        applyFrameRateToComposeView(composeView, activity, targetFps.fps)
+                    } catch (_: Throwable) {
+                    }
+                }
+            } catch (_: Throwable) {
             }
         }
     }
 
     SideEffect {
         if (activity != null && Build.VERSION.SDK_INT >= 35) {
-            applyFrameRateRecursive(composeView, targetFps.fps.toFloat())
-            activity.window?.decorView?.let { applyFrameRateRecursive(it, targetFps.fps.toFloat()) }
+            try {
+                applyFrameRateRecursive(composeView, targetFps.fps.toFloat())
+                activity.window?.peekDecorView()?.let { applyFrameRateRecursive(it, targetFps.fps.toFloat()) }
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -367,10 +399,16 @@ fun BindFrameRateLock(targetFps: TargetFps) {
         val owner = context as? LifecycleOwner
         val lifecycleObserver = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                applyFrameRateToComposeView(composeView, activity, AppPreferences.targetFps.value.fps)
+                try {
+                    applyFrameRateToComposeView(composeView, activity, AppPreferences.targetFps.value.fps)
+                } catch (_: Throwable) {
+                }
             }
         }
-        owner?.lifecycle?.addObserver(lifecycleObserver)
+        try {
+            owner?.lifecycle?.addObserver(lifecycleObserver)
+        } catch (_: Throwable) {
+        }
 
         val minDrawIntervalNs = when (targetFps) {
             TargetFps.FPS_30 -> 27_500_000L // ~30 FPS (su 60 Hz o 120 Hz)
@@ -383,10 +421,13 @@ fun BindFrameRateLock(targetFps: TargetFps) {
             private var skippedConsecutive = 0
 
             override fun onPreDraw(): Boolean {
-                if (Build.VERSION.SDK_INT >= 35) {
-                    val rate = targetFps.fps.toFloat()
-                    applyFrameRateRecursive(composeView, rate)
-                    activity.window?.decorView?.let { applyFrameRateRecursive(it, rate) }
+                try {
+                    if (Build.VERSION.SDK_INT >= 35) {
+                        val rate = targetFps.fps.toFloat()
+                        applyFrameRateRecursive(composeView, rate)
+                        activity.window?.peekDecorView()?.let { applyFrameRateRecursive(it, rate) }
+                    }
+                } catch (_: Throwable) {
                 }
 
                 val nowNs = System.nanoTime()
@@ -404,15 +445,24 @@ fun BindFrameRateLock(targetFps: TargetFps) {
             }
         }
 
-        val vto = composeView.viewTreeObserver
-        if (vto.isAlive) {
-            vto.addOnPreDrawListener(preDrawListener)
+        try {
+            val vto = composeView.viewTreeObserver
+            if (vto.isAlive) {
+                vto.addOnPreDrawListener(preDrawListener)
+            }
+        } catch (_: Throwable) {
         }
 
         onDispose {
-            owner?.lifecycle?.removeObserver(lifecycleObserver)
-            if (composeView.viewTreeObserver.isAlive) {
-                composeView.viewTreeObserver.removeOnPreDrawListener(preDrawListener)
+            try {
+                owner?.lifecycle?.removeObserver(lifecycleObserver)
+            } catch (_: Throwable) {
+            }
+            try {
+                if (composeView.viewTreeObserver.isAlive) {
+                    composeView.viewTreeObserver.removeOnPreDrawListener(preDrawListener)
+                }
+            } catch (_: Throwable) {
             }
         }
     }
@@ -447,7 +497,11 @@ fun rememberFrameRateTelemetry(targetFps: TargetFps): Pair<Int, Int> {
     var displayHz by remember { mutableIntStateOf(readActiveDisplayHz(context)) }
 
     DisposableEffect(context) {
-        val dm = context.getSystemService(DisplayManager::class.java)
+        val dm = try {
+            context.getSystemService(DisplayManager::class.java)
+        } catch (_: Throwable) {
+            null
+        }
         val displayListener = object : DisplayManager.DisplayListener {
             override fun onDisplayAdded(displayId: Int) {
                 displayHz = readActiveDisplayHz(context)
@@ -459,8 +513,16 @@ fun rememberFrameRateTelemetry(targetFps: TargetFps): Pair<Int, Int> {
                 displayHz = readActiveDisplayHz(context)
             }
         }
-        dm?.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
-        onDispose { dm?.unregisterDisplayListener(displayListener) }
+        try {
+            dm?.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+        } catch (_: Throwable) {
+        }
+        onDispose {
+            try {
+                dm?.unregisterDisplayListener(displayListener)
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     LaunchedEffect(composeView, targetFps) {
@@ -468,7 +530,10 @@ fun rememberFrameRateTelemetry(targetFps: TargetFps): Pair<Int, Int> {
         while (isActive) {
             withFrameNanos {
                 // Mantiene attivo il flusso di controllo preDraw senza ricomposizioni Compose
-                composeView.invalidate()
+                try {
+                    composeView.invalidate()
+                } catch (_: Throwable) {
+                }
             }
             val nowMs = SystemClock.uptimeMillis()
             if (nowMs - lastReportMs >= 450L) {
@@ -547,18 +612,21 @@ float evalDropShadow(float2 fragCoord, float4 r, float rad, float style, float d
     float sd = sdRoundBox(fragCoord - c, h, cr);
     float spread = style >= 1.85 ? 18.0 * dpx : 12.0 * dpx;
     float strength = style >= 1.85 ? 0.34 : 0.22;
-    return (1.0 - smoothstep(0.0, spread, max(sd, 0.0))) * strength;
+    return (1.0 - smoothstep(0.0, max(spread, 1.0), max(sd, 0.0))) * strength;
 }
 
 half4 main(float2 fragCoord) {
     float dpx = max(density, 0.5);
+    float pad = 22.0 * dpx;
     float bestD = 1000000.0;
     float4 bestRect = float4(0.0, 0.0, 0.0, 0.0);
     float bestRad = 1.0;
     float bestStyle = 0.0;
     float shadowAcc = 0.0;
 
-    if (style0 > 0.01 && rect0.z > rect0.x + 2.0 && rect0.w > rect0.y + 2.0) {
+    if (style0 > 0.01 && rect0.z > rect0.x + 2.0 && rect0.w > rect0.y + 2.0 &&
+        fragCoord.x >= rect0.x - pad && fragCoord.x <= rect0.z + pad &&
+        fragCoord.y >= rect0.y - pad && fragCoord.y <= rect0.w + pad) {
         float d = evalShapeSdf(fragCoord, rect0, radius0);
         shadowAcc = max(shadowAcc, evalDropShadow(fragCoord, rect0, radius0, style0, dpx));
         if (d < bestD) {
@@ -568,7 +636,9 @@ half4 main(float2 fragCoord) {
             bestStyle = style0;
         }
     }
-    if (style1 > 0.01 && rect1.z > rect1.x + 2.0 && rect1.w > rect1.y + 2.0) {
+    if (style1 > 0.01 && rect1.z > rect1.x + 2.0 && rect1.w > rect1.y + 2.0 &&
+        fragCoord.x >= rect1.x - pad && fragCoord.x <= rect1.z + pad &&
+        fragCoord.y >= rect1.y - pad && fragCoord.y <= rect1.w + pad) {
         float d = evalShapeSdf(fragCoord, rect1, radius1);
         shadowAcc = max(shadowAcc, evalDropShadow(fragCoord, rect1, radius1, style1, dpx));
         if (d < bestD) {
@@ -578,7 +648,9 @@ half4 main(float2 fragCoord) {
             bestStyle = style1;
         }
     }
-    if (style2 > 0.01 && rect2.z > rect2.x + 2.0 && rect2.w > rect2.y + 2.0) {
+    if (style2 > 0.01 && rect2.z > rect2.x + 2.0 && rect2.w > rect2.y + 2.0 &&
+        fragCoord.x >= rect2.x - pad && fragCoord.x <= rect2.z + pad &&
+        fragCoord.y >= rect2.y - pad && fragCoord.y <= rect2.w + pad) {
         float d = evalShapeSdf(fragCoord, rect2, radius2);
         shadowAcc = max(shadowAcc, evalDropShadow(fragCoord, rect2, radius2, style2, dpx));
         if (d < bestD) {
@@ -588,7 +660,9 @@ half4 main(float2 fragCoord) {
             bestStyle = style2;
         }
     }
-    if (style3 > 0.01 && rect3.z > rect3.x + 2.0 && rect3.w > rect3.y + 2.0) {
+    if (style3 > 0.01 && rect3.z > rect3.x + 2.0 && rect3.w > rect3.y + 2.0 &&
+        fragCoord.x >= rect3.x - pad && fragCoord.x <= rect3.z + pad &&
+        fragCoord.y >= rect3.y - pad && fragCoord.y <= rect3.w + pad) {
         float d = evalShapeSdf(fragCoord, rect3, radius3);
         shadowAcc = max(shadowAcc, evalDropShadow(fragCoord, rect3, radius3, style3, dpx));
         if (d < bestD) {
@@ -598,7 +672,9 @@ half4 main(float2 fragCoord) {
             bestStyle = style3;
         }
     }
-    if (style4 > 0.01 && rect4.z > rect4.x + 2.0 && rect4.w > rect4.y + 2.0) {
+    if (style4 > 0.01 && rect4.z > rect4.x + 2.0 && rect4.w > rect4.y + 2.0 &&
+        fragCoord.x >= rect4.x - pad && fragCoord.x <= rect4.z + pad &&
+        fragCoord.y >= rect4.y - pad && fragCoord.y <= rect4.w + pad) {
         float d = evalShapeSdf(fragCoord, rect4, radius4);
         shadowAcc = max(shadowAcc, evalDropShadow(fragCoord, rect4, radius4, style4, dpx));
         if (d < bestD) {
@@ -608,7 +684,9 @@ half4 main(float2 fragCoord) {
             bestStyle = style4;
         }
     }
-    if (style5 > 0.01 && rect5.z > rect5.x + 2.0 && rect5.w > rect5.y + 2.0) {
+    if (style5 > 0.01 && rect5.z > rect5.x + 2.0 && rect5.w > rect5.y + 2.0 &&
+        fragCoord.x >= rect5.x - pad && fragCoord.x <= rect5.z + pad &&
+        fragCoord.y >= rect5.y - pad && fragCoord.y <= rect5.w + pad) {
         float d = evalShapeSdf(fragCoord, rect5, radius5);
         shadowAcc = max(shadowAcc, evalDropShadow(fragCoord, rect5, radius5, style5, dpx));
         if (d <= 0.75 || d < bestD) {
@@ -644,7 +722,9 @@ half4 main(float2 fragCoord) {
 
     float minHalf = min(halfSize.x, halfSize.y);
     float distIn = max(-bestD, 0.0);
-    float bezel = clamp(17.0 * dpx, 2.0 * dpx, minHalf * 0.85);
+    float maxBezel = max(minHalf * 0.85, 1.0);
+    float minBezel = min(2.0 * dpx, maxBezel);
+    float bezel = clamp(17.0 * dpx, minBezel, maxBezel);
     float t = clamp(distIn / bezel, 0.0, 1.0);
     float u = 1.0 - t;
     float sinA = clamp(pow(max(u, 0.0001), 1.65), 0.0, 0.985);
@@ -656,9 +736,9 @@ half4 main(float2 fragCoord) {
     float isPopover = (bestStyle >= 1.8 && bestStyle < 2.5) ? 1.0 : 0.0;
     float isModal = bestStyle >= 2.5 ? 1.0 : 0.0;
 
-    float blurRad = mix(4.5, 2.2, pressBoost) * dpx;
-    if (isPopover > 0.5) blurRad = 6.5 * dpx;
-    if (isModal > 0.5) blurRad = 7.5 * dpx;
+    float blurRad = mix(4.2, 2.0, pressBoost) * dpx;
+    if (isPopover > 0.5) blurRad = 6.2 * dpx;
+    if (isModal > 0.5) blurRad = 7.2 * dpx;
 
     float zoomAmt = mix(2.4, 4.2, pressBoost) * dpx;
     if (isModal > 0.5 || isPopover > 0.5) zoomAmt = 1.8 * dpx;
@@ -668,24 +748,38 @@ half4 main(float2 fragCoord) {
     float2 centerLens = -localNorm * zoomAmt * z;
     float2 posG = fragCoord + centerLens + snellShift(n, sinA, z, 1.0 / 1.52) * refractAmt;
 
-    // Campionamento blur morbido Vogel Disk a 16 tap ruotato da IGN (zero ghosting/double image)
-    float seedAngle = ign(fragCoord) * 6.2831853;
-    float c0 = cos(seedAngle);
-    float s0 = sin(seedAngle);
-    float3 acc = float3(0.0, 0.0, 0.0);
-    float wSum = 0.0;
-    for (int i = 0; i < 16; i++) {
-        float fi = float(i) + 0.5;
-        float r = sqrt(fi / 16.0) * blurRad;
-        float a = fi * 2.39996323;
-        float2 dir = float2(cos(a), sin(a));
-        float2 rot = float2(dir.x * c0 - dir.y * s0, dir.x * s0 + dir.y * c0);
-        half4 samp = composable.eval(posG + rot * r);
-        float w = float(samp.a);
-        acc += float3(samp.rgb) * w;
-        wSum += w;
+    // Campionamento blur morbido a 7 tap ruotati da IGN (srotolato, zero loop dinamici su Vulkan/Skia)
+    float3 rgb;
+    if (blurRad <= 0.6) {
+        rgb = float3(composable.eval(posG).rgb);
+    } else {
+        float seedAngle = ign(fragCoord) * 6.2831853;
+        float c0 = cos(seedAngle);
+        float s0 = sin(seedAngle);
+        float2 d1 = float2(c0, s0);
+        float2 d2 = float2(0.5 * c0 - 0.8660254 * s0, 0.5 * s0 + 0.8660254 * c0);
+        float2 d3 = float2(-0.5 * c0 - 0.8660254 * s0, -0.5 * s0 + 0.8660254 * c0);
+        float rOuter = blurRad;
+        float rInner = blurRad * 0.52;
+
+        half4 sc = composable.eval(posG);
+        half4 s1 = composable.eval(posG + d1 * rOuter);
+        half4 s2 = composable.eval(posG - d1 * rOuter);
+        half4 s3 = composable.eval(posG + d2 * rInner);
+        half4 s4 = composable.eval(posG - d2 * rInner);
+        half4 s5 = composable.eval(posG + d3 * rOuter);
+        half4 s6 = composable.eval(posG - d3 * rOuter);
+
+        float wSum = 1.4 * float(sc.a)
+            + float(s1.a) + float(s2.a)
+            + 1.2 * float(s3.a) + 1.2 * float(s4.a)
+            + float(s5.a) + float(s6.a);
+        float3 acc = 1.4 * float3(sc.rgb)
+            + float3(s1.rgb) + float3(s2.rgb)
+            + 1.2 * float3(s3.rgb) + 1.2 * float3(s4.rgb)
+            + float3(s5.rgb) + float3(s6.rgb);
+        rgb = wSum > 0.01 ? (acc / wSum) : float3(sc.rgb);
     }
-    float3 rgb = wSum > 0.01 ? (acc / wSum) : float3(composable.eval(posG).rgb);
 
     // Dispersione prismatica RGB lungo il menisco perimetrale curvo
     if (t < 0.76) {
@@ -755,6 +849,20 @@ private data class GlassShapeSpec(
     val style: Float = 0f
 )
 
+private fun GlassShapeSpec.isRenderable(): Boolean {
+    return style > 0.01f && !rect.isEmpty && (rect.right - rect.left) > 2f && (rect.bottom - rect.top) > 2f
+}
+
+private fun safeBlurRenderEffect(radiusPx: Float): androidx.compose.ui.graphics.RenderEffect? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || radiusPx <= 0.5f) return null
+    return try {
+        RenderEffect.createBlurEffect(radiusPx, radiusPx, Shader.TileMode.CLAMP).asComposeRenderEffect()
+    } catch (t: Throwable) {
+        Log.e("LiquidGlass", "createBlurEffect failed: ${t.message}", t)
+        null
+    }
+}
+
 @Composable
 private fun rememberLiquidGlassRenderEffect(
     shape0: GlassShapeSpec = GlassShapeSpec(),
@@ -767,31 +875,35 @@ private fun rememberLiquidGlassRenderEffect(
 ): androidx.compose.ui.graphics.RenderEffect? {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
         SideEffect {
-            LiquidGlassDiagnostics.shaderStatus.value = "Richiede Android 13+"
+            LiquidGlassDiagnostics.updateStatus("Richiede Android 13+")
         }
         return null
     }
 
-    val compiledShader = remember {
+    val compiledPair = remember {
         try {
-            RuntimeShader(IOS_LIQUID_GLASS_AGSL).also {
-                LiquidGlassDiagnostics.shaderStatus.value = "AGSL OK"
-            }
+            RuntimeShader(IOS_LIQUID_GLASS_AGSL) to "AGSL OK"
         } catch (t: Throwable) {
-            val msg = t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
-            Log.e("LiquidGlass", "RuntimeShader compilation failed: $msg", t)
-            LiquidGlassDiagnostics.shaderStatus.value = "Errore compilazione: $msg"
-            null
+            val detail = "${t.javaClass.simpleName}: ${t.message ?: "errore sconosciuto"}"
+            Log.e("LiquidGlass", "RuntimeShader compilation failed: $detail", t)
+            null to detail
         }
     }
 
-    return remember(compiledShader, shape0, shape1, shape2, shape3, shape4, shape5, densityPx) {
+    val compiledShader = compiledPair.first
+    val anyActive = shape0.isRenderable() ||
+        shape1.isRenderable() ||
+        shape2.isRenderable() ||
+        shape3.isRenderable() ||
+        shape4.isRenderable() ||
+        shape5.isRenderable()
+
+    val resultPair = remember(compiledShader, shape0, shape1, shape2, shape3, shape4, shape5, densityPx, anyActive) {
         if (compiledShader == null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && shape5.style >= 2.5f) {
-                RenderEffect.createBlurEffect(20f, 20f, Shader.TileMode.CLAMP).asComposeRenderEffect()
-            } else {
-                null
-            }
+            val fallback = if (shape5.style >= 2.5f) safeBlurRenderEffect(20f) else null
+            fallback to compiledPair.second
+        } else if (!anyActive) {
+            null to "AGSL OK"
         } else {
             try {
                 compiledShader.setFloatUniform("rect0", shape0.rect.left, shape0.rect.top, shape0.rect.right, shape0.rect.bottom)
@@ -800,33 +912,36 @@ private fun rememberLiquidGlassRenderEffect(
                 compiledShader.setFloatUniform("rect3", shape3.rect.left, shape3.rect.top, shape3.rect.right, shape3.rect.bottom)
                 compiledShader.setFloatUniform("rect4", shape4.rect.left, shape4.rect.top, shape4.rect.right, shape4.rect.bottom)
                 compiledShader.setFloatUniform("rect5", shape5.rect.left, shape5.rect.top, shape5.rect.right, shape5.rect.bottom)
-                compiledShader.setFloatUniform("radius0", shape0.cornerRadiusPx)
-                compiledShader.setFloatUniform("radius1", shape1.cornerRadiusPx)
-                compiledShader.setFloatUniform("radius2", shape2.cornerRadiusPx)
-                compiledShader.setFloatUniform("radius3", shape3.cornerRadiusPx)
-                compiledShader.setFloatUniform("radius4", shape4.cornerRadiusPx)
-                compiledShader.setFloatUniform("radius5", shape5.cornerRadiusPx)
+                compiledShader.setFloatUniform("radius0", shape0.cornerRadiusPx.coerceAtLeast(1f))
+                compiledShader.setFloatUniform("radius1", shape1.cornerRadiusPx.coerceAtLeast(1f))
+                compiledShader.setFloatUniform("radius2", shape2.cornerRadiusPx.coerceAtLeast(1f))
+                compiledShader.setFloatUniform("radius3", shape3.cornerRadiusPx.coerceAtLeast(1f))
+                compiledShader.setFloatUniform("radius4", shape4.cornerRadiusPx.coerceAtLeast(1f))
+                compiledShader.setFloatUniform("radius5", shape5.cornerRadiusPx.coerceAtLeast(1f))
                 compiledShader.setFloatUniform("style0", shape0.style)
                 compiledShader.setFloatUniform("style1", shape1.style)
                 compiledShader.setFloatUniform("style2", shape2.style)
                 compiledShader.setFloatUniform("style3", shape3.style)
                 compiledShader.setFloatUniform("style4", shape4.style)
                 compiledShader.setFloatUniform("style5", shape5.style)
-                compiledShader.setFloatUniform("density", densityPx)
-                LiquidGlassDiagnostics.shaderStatus.value = "AGSL OK"
-                RenderEffect.createRuntimeShaderEffect(compiledShader, "composable").asComposeRenderEffect()
+                compiledShader.setFloatUniform("density", densityPx.coerceAtLeast(0.5f))
+                val effect = RenderEffect.createRuntimeShaderEffect(compiledShader, "composable").asComposeRenderEffect()
+                effect to "AGSL OK"
             } catch (t: Throwable) {
-                val msg = t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
-                Log.e("LiquidGlass", "RenderEffect update failed: $msg", t)
-                LiquidGlassDiagnostics.shaderStatus.value = "Errore RenderEffect: $msg"
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    RenderEffect.createBlurEffect(20f, 20f, Shader.TileMode.CLAMP).asComposeRenderEffect()
-                } else {
-                    null
-                }
+                val detail = "${t.javaClass.simpleName}: ${t.message ?: "errore uniform/effect"}"
+                Log.e("LiquidGlass", "RenderEffect update failed: $detail", t)
+                val fallback = if (shape5.style >= 2.5f) safeBlurRenderEffect(20f) else null
+                fallback to detail
             }
         }
     }
+
+    val statusText = resultPair.second
+    SideEffect {
+        LiquidGlassDiagnostics.updateStatus(statusText)
+    }
+
+    return resultPair.first
 }
 
 private fun Modifier.reportBoundsInRoot(onBounds: (Rect) -> Unit): Modifier =
@@ -922,6 +1037,28 @@ private fun Modifier.iosGlassFallbackSurface(
 // ------------------------------------------------------------
 // 4. Font stile Apple SF Pro Display (sf_pro.ttf locale o Inter)
 // ------------------------------------------------------------
+private fun isValidFontFile(file: File): Boolean {
+    return try {
+        if (!file.exists() || file.length() < 40_000L) return false
+        val header = ByteArray(4)
+        file.inputStream().use { input ->
+            if (input.read(header) != 4) return false
+        }
+        val isSfnt = header[0] == 0x00.toByte() &&
+            header[1] == 0x01.toByte() &&
+            header[2] == 0x00.toByte() &&
+            header[3] == 0x00.toByte()
+        val tag = String(header, Charsets.US_ASCII)
+        if (!isSfnt && tag != "OTTO" && tag != "true" && tag != "ttcf") {
+            return false
+        }
+        val tf = android.graphics.Typeface.createFromFile(file)
+        tf != null && tf != android.graphics.Typeface.DEFAULT
+    } catch (_: Throwable) {
+        false
+    }
+}
+
 @OptIn(ExperimentalTextApi::class)
 @Composable
 fun rememberDynamicFont(): FontFamily {
@@ -931,17 +1068,26 @@ fun rememberDynamicFont(): FontFamily {
             try {
                 val localSfProId = context.resources.getIdentifier("sf_pro", "font", context.packageName)
                 if (localSfProId != 0) {
-                    return@withContext FontFamily(
-                        Font(localSfProId, weight = FontWeight.Normal, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(400))),
-                        Font(localSfProId, weight = FontWeight.Medium, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(500))),
-                        Font(localSfProId, weight = FontWeight.SemiBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(600))),
-                        Font(localSfProId, weight = FontWeight.Bold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(700))),
-                        Font(localSfProId, weight = FontWeight.ExtraBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(800)))
-                    )
+                    try {
+                        return@withContext FontFamily(
+                            Font(localSfProId, weight = FontWeight.Normal, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(400))),
+                            Font(localSfProId, weight = FontWeight.Medium, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(500))),
+                            Font(localSfProId, weight = FontWeight.SemiBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(600))),
+                            Font(localSfProId, weight = FontWeight.Bold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(700))),
+                            Font(localSfProId, weight = FontWeight.ExtraBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(800)))
+                        )
+                    } catch (_: Throwable) {
+                    }
                 }
 
                 val dir = File(context.filesDir, "fonts")
                 val file = File(dir, "InterAppleStyle.ttf")
+                if (file.exists() && !isValidFontFile(file)) {
+                    try {
+                        file.delete()
+                    } catch (_: Throwable) {
+                    }
+                }
                 if (!file.exists() || file.length() < 40_000L) {
                     if (!dir.exists()) dir.mkdirs()
                     val urls = listOf(
@@ -950,8 +1096,9 @@ fun rememberDynamicFont(): FontFamily {
                         "https://github.com/rsms/inter/raw/master/docs/font-files/InterVariable.ttf"
                     )
                     for (urlStr in urls) {
+                        var conn: HttpURLConnection? = null
                         try {
-                            val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                            conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
                                 connectTimeout = 6000
                                 readTimeout = 6000
                                 instanceFollowRedirects = true
@@ -960,23 +1107,44 @@ fun rememberDynamicFont(): FontFamily {
                                 conn.inputStream.use { input ->
                                     file.outputStream().use { output -> input.copyTo(output) }
                                 }
-                                conn.disconnect()
-                                if (file.length() > 40_000L) break
-                            } else {
-                                conn.disconnect()
+                                if (isValidFontFile(file)) {
+                                    break
+                                } else {
+                                    try {
+                                        file.delete()
+                                    } catch (_: Throwable) {
+                                    }
+                                }
                             }
                         } catch (_: Throwable) {
+                            try {
+                                if (file.exists() && !isValidFontFile(file)) file.delete()
+                            } catch (_: Throwable) {
+                            }
+                        } finally {
+                            try {
+                                conn?.disconnect()
+                            } catch (_: Throwable) {
+                            }
                         }
                     }
                 }
-                if (file.exists() && file.length() > 40_000L) {
-                    FontFamily(
-                        Font(file, weight = FontWeight.Normal, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(400))),
-                        Font(file, weight = FontWeight.Medium, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(500))),
-                        Font(file, weight = FontWeight.SemiBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(600))),
-                        Font(file, weight = FontWeight.Bold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(700))),
-                        Font(file, weight = FontWeight.ExtraBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(800)))
-                    )
+                if (isValidFontFile(file)) {
+                    try {
+                        FontFamily(
+                            Font(file, weight = FontWeight.Normal, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(400))),
+                            Font(file, weight = FontWeight.Medium, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(500))),
+                            Font(file, weight = FontWeight.SemiBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(600))),
+                            Font(file, weight = FontWeight.Bold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(700))),
+                            Font(file, weight = FontWeight.ExtraBold, style = FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(800)))
+                        )
+                    } catch (_: Throwable) {
+                        try {
+                            file.delete()
+                        } catch (_: Throwable) {
+                        }
+                        null
+                    }
                 } else {
                     null
                 }
@@ -1010,11 +1178,7 @@ fun LiquidAmbientBackground(
     }
 
     val blurEffect = remember {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            RenderEffect.createBlurEffect(24f, 24f, Shader.TileMode.CLAMP).asComposeRenderEffect()
-        } else {
-            null
-        }
+        safeBlurRenderEffect(24f)
     }
 
     val baseBrush = remember(coverImg, palette) {
@@ -1056,6 +1220,10 @@ fun LiquidAmbientBackground(
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val w = size.width
                 val h = size.height
+                if (w <= 1f || h <= 1f) return@Canvas
+
+                val r1 = (w * 0.85f).coerceAtLeast(1f)
+                val r2 = (w * 0.90f).coerceAtLeast(1f)
 
                 // Bagliori radiali saturi su nero profondo (#05060C)
                 drawCircle(
@@ -1066,10 +1234,10 @@ fun LiquidAmbientBackground(
                             Color.Transparent
                         ),
                         center = Offset(w * 0.16f, h * 0.16f),
-                        radius = w * 0.85f
+                        radius = r1
                     ),
                     center = Offset(w * 0.16f, h * 0.16f),
-                    radius = w * 0.85f
+                    radius = r1
                 )
                 drawCircle(
                     brush = Brush.radialGradient(
@@ -1079,55 +1247,67 @@ fun LiquidAmbientBackground(
                             Color.Transparent
                         ),
                         center = Offset(w * 0.86f, h * 0.78f),
-                        radius = w * 0.90f
+                        radius = r2
                     ),
                     center = Offset(w * 0.86f, h * 0.78f),
-                    radius = w * 0.90f
+                    radius = r2
                 )
 
                 // Fasci luminosi diagonali definiti (massima resa della rifrazione su bordi e menisco)
                 rotate(degrees = -26f, pivot = Offset(w * 0.50f, h * 0.22f)) {
+                    val beamH = (h * 0.19f).coerceAtLeast(2f)
+                    val topY = h * 0.04f
                     drawRoundRect(
                         brush = Brush.verticalGradient(
                             0.0f to Color.Transparent,
                             0.25f to Color(0xFF38BDF8).copy(alpha = 0.42f),
                             0.50f to Color(0xFF60A5FA).copy(alpha = 0.72f),
                             0.75f to Color(0xFF6366F1).copy(alpha = 0.36f),
-                            1.0f to Color.Transparent
+                            1.0f to Color.Transparent,
+                            startY = topY,
+                            endY = topY + beamH
                         ),
-                        topLeft = Offset(-w * 0.40f, h * 0.04f),
-                        size = Size(w * 1.85f, h * 0.19f),
-                        cornerRadius = CornerRadius(h * 0.09f, h * 0.09f)
+                        topLeft = Offset(-w * 0.40f, topY),
+                        size = Size((w * 1.85f).coerceAtLeast(2f), beamH),
+                        cornerRadius = CornerRadius((h * 0.09f).coerceAtLeast(1f), (h * 0.09f).coerceAtLeast(1f))
                     )
                 }
 
                 rotate(degrees = -24f, pivot = Offset(w * 0.50f, h * 0.52f)) {
+                    val beamH = (h * 0.22f).coerceAtLeast(2f)
+                    val topY = h * 0.40f
                     drawRoundRect(
                         brush = Brush.verticalGradient(
                             0.0f to Color.Transparent,
                             0.28f to Color(0xFF8B5CF6).copy(alpha = 0.44f),
                             0.50f to Color(0xFFEC4899).copy(alpha = 0.68f),
                             0.76f to Color(0xFF6366F1).copy(alpha = 0.34f),
-                            1.0f to Color.Transparent
+                            1.0f to Color.Transparent,
+                            startY = topY,
+                            endY = topY + beamH
                         ),
-                        topLeft = Offset(-w * 0.40f, h * 0.40f),
-                        size = Size(w * 1.85f, h * 0.22f),
-                        cornerRadius = CornerRadius(h * 0.11f, h * 0.11f)
+                        topLeft = Offset(-w * 0.40f, topY),
+                        size = Size((w * 1.85f).coerceAtLeast(2f), beamH),
+                        cornerRadius = CornerRadius((h * 0.11f).coerceAtLeast(1f), (h * 0.11f).coerceAtLeast(1f))
                     )
                 }
 
                 rotate(degrees = -22f, pivot = Offset(w * 0.50f, h * 0.86f)) {
+                    val beamH = (h * 0.18f).coerceAtLeast(2f)
+                    val topY = h * 0.77f
                     drawRoundRect(
                         brush = Brush.verticalGradient(
                             0.0f to Color.Transparent,
                             0.25f to Color(0xFF3B82F6).copy(alpha = 0.48f),
                             0.52f to Color(0xFFF43F5E).copy(alpha = 0.62f),
                             0.80f to Color(0xFF8B5CF6).copy(alpha = 0.28f),
-                            1.0f to Color.Transparent
+                            1.0f to Color.Transparent,
+                            startY = topY,
+                            endY = topY + beamH
                         ),
-                        topLeft = Offset(-w * 0.40f, h * 0.77f),
-                        size = Size(w * 1.85f, h * 0.18f),
-                        cornerRadius = CornerRadius(h * 0.09f, h * 0.09f)
+                        topLeft = Offset(-w * 0.40f, topY),
+                        size = Size((w * 1.85f).coerceAtLeast(2f), beamH),
+                        cornerRadius = CornerRadius((h * 0.09f).coerceAtLeast(1f), (h * 0.09f).coerceAtLeast(1f))
                     )
                 }
             }
@@ -1159,6 +1339,7 @@ fun DynamicLyricsBubbleGlyph(
     Canvas(modifier = modifier) {
         val w = size.width
         val h = size.height
+        if (w <= 1f || h <= 1f) return@Canvas
 
         val bubbleW = w * 0.64f
         val bubbleH = h * 0.48f
@@ -1288,13 +1469,16 @@ fun DynamicLyricsSplashScreen(
                 .size(250.dp)
                 .graphicsLayer { alpha = contentAlpha * 0.78f }
                 .drawBehind {
+                    if (size.width <= 1f || size.height <= 1f) return@drawBehind
                     drawCircle(
                         brush = Brush.radialGradient(
                             colors = listOf(
                                 Color(0xFFE11D48).copy(alpha = 0.42f),
                                 Color(0xFF6366F1).copy(alpha = 0.24f),
                                 Color.Transparent
-                            )
+                            ),
+                            center = center,
+                            radius = (size.minDimension / 2f).coerceAtLeast(1f)
                         )
                     )
                 }
@@ -2891,6 +3075,7 @@ private fun LiquidSettingsModal(
     val activePkg by LyricsPlaybackStore.activePlayerPackage.collectAsState()
     val lastPkg by AppPreferences.lastActiveMusicPackage.collectAsState()
     val shaderStatus by LiquidGlassDiagnostics.shaderStatus.collectAsState()
+    val lastCrash by AppPreferences.lastUncaughtCrash.collectAsState()
 
     val notifGranted = BitChordListenerService.isNotificationAccessGranted(context)
     val postNotifOk = BitChordListenerService.areNotificationsEnabled(context)
@@ -2973,6 +3158,27 @@ private fun LiquidSettingsModal(
                 )
             }
 
+            // Eventuale crash non gestito catturato all'avvio precedente
+            if (lastCrash.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = "Ultimo crash rilevato (tocca per pulire):\n$lastCrash",
+                    fontFamily = font,
+                    fontSize = 10.5.sp,
+                    lineHeight = 14.sp,
+                    color = Color(0xFFFEE2E2),
+                    maxLines = 8,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xFFDC2626).copy(alpha = 0.28f))
+                        .border(0.8.dp, Color(0xFFF87171).copy(alpha = 0.60f), RoundedCornerShape(14.dp))
+                        .clickable { AppPreferences.clearLastCrash(context) }
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                )
+            }
+
             Spacer(Modifier.height(18.dp))
 
             // SEZIONE 1: VERIFICA SISTEMA
@@ -3038,6 +3244,14 @@ private fun LiquidSettingsModal(
                 ok = shaderStatus == "AGSL OK",
                 font = font,
                 onClick = {}
+            )
+            Spacer(Modifier.height(8.dp))
+            DiagnosticRow(
+                label = "Log crash precedente",
+                status = if (lastCrash.isBlank()) "Nessuno" else "Presente (tocca per pulire)",
+                ok = lastCrash.isBlank(),
+                font = font,
+                onClick = { AppPreferences.clearLastCrash(context) }
             )
 
             Spacer(Modifier.height(22.dp))
