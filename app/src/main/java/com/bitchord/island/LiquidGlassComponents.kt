@@ -15,11 +15,12 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
-import android.view.Choreographer
+import android.util.Log
 import android.view.Display
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
+import android.view.Window
 import android.view.WindowManager
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -63,12 +64,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shadow
@@ -79,7 +82,9 @@ import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -103,6 +108,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -110,8 +117,11 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.lang.reflect.Method
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
@@ -122,14 +132,93 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 // ------------------------------------------------------------
-// 1. Blocco Frame Rate Reale (30 / 60 / 120 FPS — Default 60 FPS)
-// - Chiamate API 35 dirette e verificate a compile-time:
-//   * WindowManager.LayoutParams.setFrameRateBoostOnTouchEnabled(targetFps >= 120)
-//   * View.getRequestedFrameRate() / View.setRequestedFrameRate(float)
-// - Selezione coerente Display.Mode alla stessa risoluzione fisica
-// - Enforcement continuo su DecorView + AndroidComposeView (LocalView.current)
-// - Contatore FPS reali tramite Choreographer + Frequenza display attiva
+// 1. Diagnostica & Blocco Frame Rate Reale (30 / 60 / 120 FPS — Default 60)
 // ------------------------------------------------------------
+
+private object LiquidGlassDiagnostics {
+    val lastShaderError = MutableStateFlow<String?>(null)
+}
+
+private object FrameRateReflection {
+    val layoutParamsBoostMethod: Method? by lazy {
+        try {
+            WindowManager.LayoutParams::class.java.getMethod(
+                "setFrameRateBoostOnTouchEnabled",
+                Boolean::class.javaPrimitiveType
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    val windowBoostMethod: Method? by lazy {
+        try {
+            Window::class.java.getMethod(
+                "setFrameRateBoostOnTouchEnabled",
+                Boolean::class.javaPrimitiveType
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    val setRequestedFrameRateMethod: Method? by lazy {
+        try {
+            View::class.java.getMethod(
+                "setRequestedFrameRate",
+                Float::class.javaPrimitiveType
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    val getRequestedFrameRateMethod: Method? by lazy {
+        try {
+            View::class.java.getMethod("getRequestedFrameRate")
+        } catch (_: Throwable) {
+            null
+        }
+    }
+}
+
+private object AppFrameRateTracker {
+    private const val CAPACITY = 180
+    private val timestampsNs = LongArray(CAPACITY)
+    private var head = 0
+    private var count = 0
+
+    @Synchronized
+    fun recordFrame(nowNs: Long) {
+        timestampsNs[head] = nowNs
+        head = (head + 1) % CAPACITY
+        if (count < CAPACITY) count++
+    }
+
+    @Synchronized
+    fun measureAppFps(nowNs: Long = System.nanoTime()): Int {
+        if (count < 2) return 0
+        val cutoffNs = nowNs - 1_000_000_000L
+        var framesInWindow = 0
+        var oldestNs = Long.MAX_VALUE
+        var newestNs = 0L
+
+        for (i in 0 until count) {
+            val ts = timestampsNs[i]
+            if (ts >= cutoffNs) {
+                framesInWindow++
+                if (ts < oldestNs) oldestNs = ts
+                if (ts > newestNs) newestNs = ts
+            }
+        }
+        if (framesInWindow < 2) return 0
+        val spanNs = newestNs - oldestNs
+        if (spanNs <= 50_000_000L) return 0
+        return (((framesInWindow - 1) * 1_000_000_000.0) / spanNs)
+            .roundToInt()
+            .coerceAtLeast(1)
+    }
+}
 
 private fun selectDesiredDisplayMode(display: Display?, targetFps: Int): Display.Mode? {
     val currentMode = display?.mode ?: return null
@@ -146,7 +235,7 @@ private fun selectDesiredDisplayMode(display: Display?, targetFps: Int): Display
         if (closest30 != null && closest30.refreshRate <= 35f) {
             closest30
         } else {
-            // 60 Hz è divisore intero esatto di 30 FPS (mai 120 Hz)
+            // 60 Hz è divisore esatto di 30 FPS (mai 120 Hz)
             pool.minByOrNull { abs(it.refreshRate - 60f) }
         }
     } else {
@@ -158,25 +247,51 @@ private fun selectDesiredDisplayMode(display: Display?, targetFps: Int): Display
 private fun applyWindowLayoutParamsFrameRate(activity: Activity, targetFps: Int) {
     val window = activity.window ?: return
     val lp = window.attributes
-    lp.preferredRefreshRate = targetFps.toFloat()
 
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+    val desiredMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         try {
-            selectDesiredDisplayMode(activity.display, targetFps)?.let { mode ->
-                lp.preferredDisplayModeId = mode.modeId
-            }
+            selectDesiredDisplayMode(activity.display, targetFps)
         } catch (_: Throwable) {
+            null
         }
+    } else {
+        null
     }
 
+    if (desiredMode != null) {
+        lp.preferredDisplayModeId = desiredMode.modeId
+    }
+    lp.preferredRefreshRate = when {
+        targetFps <= 30 -> if (desiredMode != null && desiredMode.refreshRate <= 35f) desiredMode.refreshRate else 30f
+        desiredMode != null -> desiredMode.refreshRate
+        else -> targetFps.toFloat()
+    }
+
+    val allowTouchBoost = targetFps >= 120
     if (Build.VERSION.SDK_INT >= 35) {
         try {
-            // Fondamentale su Android 15/16: è su WindowManager.LayoutParams, NON su Window
-            lp.setFrameRateBoostOnTouchEnabled(targetFps >= 120)
+            lp.setFrameRateBoostOnTouchEnabled(allowTouchBoost)
+        } catch (t: Throwable) {
+            try {
+                FrameRateReflection.layoutParamsBoostMethod?.invoke(lp, allowTouchBoost)
+            } catch (_: Throwable) {
+                Log.w("LiquidGlassFPS", "LayoutParams touchBoost fallback skipped: ${t.message}")
+            }
+        }
+    } else {
+        try {
+            FrameRateReflection.layoutParamsBoostMethod?.invoke(lp, allowTouchBoost)
         } catch (_: Throwable) {
         }
     }
+
     window.attributes = lp
+
+    // Verifica anche eventuale mirror su Window (OEM / Android 15+)
+    try {
+        FrameRateReflection.windowBoostMethod?.invoke(window, allowTouchBoost)
+    } catch (_: Throwable) {
+    }
 }
 
 @SuppressLint("NewApi")
@@ -188,6 +303,15 @@ fun applyFrameRateRecursive(view: View, fps: Float) {
                 view.setRequestedFrameRate(fps)
             }
         } catch (_: Throwable) {
+            try {
+                val setter = FrameRateReflection.setRequestedFrameRateMethod
+                val getter = FrameRateReflection.getRequestedFrameRateMethod
+                val current = getter?.invoke(view) as? Float
+                if (current == null || current.isNaN() || abs(current - fps) > 0.1f) {
+                    setter?.invoke(view, fps)
+                }
+            } catch (_: Throwable) {
+            }
         }
     }
     if (view is ViewGroup) {
@@ -214,8 +338,9 @@ fun applyFrameRateToComposeView(composeView: View, activity: Activity, targetFps
 }
 
 /**
- * Aggancia il voto FPS a Window, DecorView e AndroidComposeView (LocalView.current),
- * impedendo a Compose o al touch-boost di riportare la frequenza a 120 Hz durante scroll e animazioni.
+ * Aggancia sia il blocco ARR Android 15/16 sia un vero Frame Pacer lato app in OnPreDrawListener:
+ * anche se HyperOS forza il pannello a 120 Hz fissi, 30 FPS e 60 FPS limitano realmente i draw
+ * e il carico GPU/CPU al tetto scelto, tracciando gli FPS effettivi resi dall'app.
  */
 @Composable
 fun BindFrameRateLock(targetFps: TargetFps) {
@@ -252,24 +377,46 @@ fun BindFrameRateLock(targetFps: TargetFps) {
         }
         owner?.lifecycle?.addObserver(lifecycleObserver)
 
-        val preDrawListener = if (Build.VERSION.SDK_INT >= 35) {
-            ViewTreeObserver.OnPreDrawListener {
-                val rate = targetFps.fps.toFloat()
-                applyFrameRateRecursive(composeView, rate)
-                activity.window?.decorView?.let { applyFrameRateRecursive(it, rate) }
-                true
-            }
-        } else {
-            null
+        val minDrawIntervalNs = when (targetFps) {
+            TargetFps.FPS_30 -> 27_500_000L // ~30 FPS (su 60 Hz o 120 Hz)
+            TargetFps.FPS_60 -> 13_500_000L // ~60 FPS (su 120 Hz)
+            TargetFps.FPS_120 -> 0L
         }
+
+        val preDrawListener = object : ViewTreeObserver.OnPreDrawListener {
+            private var lastDrawNs = 0L
+            private var skippedConsecutive = 0
+
+            override fun onPreDraw(): Boolean {
+                if (Build.VERSION.SDK_INT >= 35) {
+                    val rate = targetFps.fps.toFloat()
+                    applyFrameRateRecursive(composeView, rate)
+                    activity.window?.decorView?.let { applyFrameRateRecursive(it, rate) }
+                }
+
+                val nowNs = System.nanoTime()
+                if (minDrawIntervalNs > 0L && lastDrawNs > 0L) {
+                    val elapsedNs = nowNs - lastDrawNs
+                    if (elapsedNs < minDrawIntervalNs && skippedConsecutive < 5) {
+                        skippedConsecutive++
+                        return false
+                    }
+                }
+                skippedConsecutive = 0
+                lastDrawNs = nowNs
+                AppFrameRateTracker.recordFrame(nowNs)
+                return true
+            }
+        }
+
         val vto = composeView.viewTreeObserver
-        if (preDrawListener != null && vto.isAlive) {
+        if (vto.isAlive) {
             vto.addOnPreDrawListener(preDrawListener)
         }
 
         onDispose {
             owner?.lifecycle?.removeObserver(lifecycleObserver)
-            if (preDrawListener != null && composeView.viewTreeObserver.isAlive) {
+            if (composeView.viewTreeObserver.isAlive) {
                 composeView.viewTreeObserver.removeOnPreDrawListener(preDrawListener)
             }
         }
@@ -292,13 +439,16 @@ private fun readActiveDisplayHz(context: Context): Int {
 }
 
 /**
- * Misura gli FPS effettivi consegnati dal Choreographer di sistema ogni ~0.5s.
- * Inoltre riallinea periodicamente il DisplayHz attivo in caso di cambio dinamico LTPO.
+ * Telemetria in tempo reale per `Impostazioni & Stato`:
+ * mantiene vivo un ciclo leggero di invalidazione View (solo mentre il modale è visibile)
+ * così `AppFrameRateTracker` misura gli FPS effettivamente renderizzati dall'app sotto il pacer
+ * e `displayHz` legge la frequenza hardware attiva del pannello.
  */
 @Composable
-fun rememberFrameRateTelemetry(): Pair<Int, Int> {
+fun rememberFrameRateTelemetry(targetFps: TargetFps): Pair<Int, Int> {
     val context = LocalContext.current
-    var measuredFps by remember { mutableIntStateOf(0) }
+    val composeView = LocalView.current
+    var appFps by remember { mutableIntStateOf(0) }
     var displayHz by remember { mutableIntStateOf(readActiveDisplayHz(context)) }
 
     DisposableEffect(context) {
@@ -315,624 +465,391 @@ fun rememberFrameRateTelemetry(): Pair<Int, Int> {
             }
         }
         dm?.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+        onDispose { dm?.unregisterDisplayListener(displayListener) }
+    }
 
-        val choreographer = Choreographer.getInstance()
-        var active = true
-        var frameCount = 0
-        var windowStartNs = 0L
-
-        val callback = object : Choreographer.FrameCallback {
-            override fun doFrame(frameTimeNanos: Long) {
-                if (!active) return
-                if (windowStartNs == 0L) {
-                    windowStartNs = frameTimeNanos
-                    frameCount = 0
-                } else {
-                    frameCount++
-                    val elapsedNs = frameTimeNanos - windowStartNs
-                    if (elapsedNs >= 500_000_000L) {
-                        measuredFps = ((frameCount * 1_000_000_000.0) / elapsedNs)
-                            .roundToInt()
-                            .coerceAtLeast(1)
-                        displayHz = readActiveDisplayHz(context)
-                        frameCount = 0
-                        windowStartNs = frameTimeNanos
-                    }
-                }
-                choreographer.postFrameCallback(this)
+    LaunchedEffect(composeView, targetFps) {
+        var lastReportMs = SystemClock.uptimeMillis()
+        while (isActive) {
+            withFrameNanos {
+                // Mantiene attivo il flusso di controllo preDraw senza ricomposizioni Compose
+                composeView.invalidate()
+            }
+            val nowMs = SystemClock.uptimeMillis()
+            if (nowMs - lastReportMs >= 450L) {
+                appFps = AppFrameRateTracker.measureAppFps()
+                displayHz = readActiveDisplayHz(context)
+                lastReportMs = nowMs
             }
         }
-        choreographer.postFrameCallback(callback)
-
-        onDispose {
-            active = false
-            choreographer.removeFrameCallback(callback)
-            dm?.unregisterDisplayListener(displayListener)
-        }
     }
-    return measuredFps to displayHz
+
+    return appFps to displayHz
 }
 
 // ------------------------------------------------------------
-// 2. Motore Liquid Glass iOS 26 a Doppia Pipeline Ottica
-//
-// PIPELINE A (IOS_FROSTED_GLASS_AGSL):
-//   Concatenata tramite RenderEffect.createChainEffect(...) DOPO
-//   RenderEffect.createBlurEffect(..., CLAMP) hardware di Skia.
-//   -> Zero ghosting o sdoppiamento testi dietro Top Bar / Dock / Modali!
-//   -> Menisco curvo Snell lungo i bordi + tinta scura traslucida calibrata
-//      (~22% barre/capsule, ~45–48% modali) + bordo speculare razor-sharp ~0.9dp.
-//
-// PIPELINE B (IOS_LIQUID_DROP_AGSL):
-//   Eseguita direttamente sul backdrop NITIDO non sfocato.
-//   -> Attivata dinamicamente sul pulsante premuto o sullo scrubber trascinato:
-//      centro cristallino con magnificazione convessa + menisco sferico Snell
-//      + dispersione cromatica RGB prismatica sui bordi + rim speculare vivo.
+// 2. Motore Liquid Glass iOS 26 (Per-Capsula su GraphicsLayer condiviso)
+// - Sfondo + Testi registrati UNA SOLA VOLTA in backdropLayer (Compose >= 1.7)
+// - Ogni capsula / cerchio disegna backdropLayer traslato nella propria bounds,
+//   concatenato con:
+//     RenderEffect.createChainEffect(IOS_CAPSULE_GLASS_AGSL, createBlurEffect(CLAMP))
+// - Sintassi Skia AGSL rigorosa (edge0 < edge1 in tutti gli smoothstep, cast espliciti)
+// - Errori loggati con Log.e("LiquidGlass", ...) + avviso visibile in Impostazioni
 // ------------------------------------------------------------
 
-private const val IOS_FROSTED_GLASS_AGSL = """
+private const val IOS_CAPSULE_GLASS_AGSL = """
 uniform shader composable;
-uniform float4 r0;
-uniform float4 r1;
-uniform float4 r2;
-uniform float4 r3;
-uniform float4 r4;
-uniform float4 r5;
-uniform float4 r6;
-uniform float4 r7;
-uniform float4 radA;
-uniform float4 radB;
-uniform float overlayMode;
+uniform float2 size;
+uniform float cornerRadius;
 uniform float density;
+uniform float tintAlpha;
+uniform float lensStrength;
 
 float sdRoundBox(float2 p, float2 b, float r) {
-    float2 q = abs(p) - b + float2(r);
-    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+    float2 q = abs(p) - b + float2(r, r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, float2(0.0, 0.0))) - r;
 }
 
-float4 evalShape(float2 fragCoord, float4 rect, float radius) {
-    if (rect.z <= rect.x + 2.0 || rect.w <= rect.y + 2.0) {
-        return float4(10000.0, 0.0, -1.0, 0.0);
-    }
-    float2 center = 0.5 * (rect.xy + rect.zw);
-    float2 halfSize = 0.5 * (rect.zw - rect.xy);
-    float rad = min(radius, min(halfSize.x, halfSize.y));
-    float2 p = fragCoord - center;
-    float d = sdRoundBox(p, halfSize, rad);
+float2 snellShift(float2 n, float sinA, float cosA, float eta) {
+    float sin2T = eta * eta * sinA * sinA;
+    float cosT = sqrt(max(1.0 - sin2T, 0.0001));
+    float k = eta * cosA - cosT;
+    float tz = max(eta - k * cosA, 0.25);
+    return n * ((k * sinA) / tz);
+}
 
+half4 main(float2 fragCoord) {
+    float2 safeSize = max(size, float2(4.0, 4.0));
+    float2 halfSize = 0.5 * safeSize;
+    float rad = clamp(cornerRadius, 1.0, min(halfSize.x, halfSize.y));
+    float2 p = fragCoord - halfSize;
+
+    float d = sdRoundBox(p, halfSize, rad);
     float eps = 1.25;
     float gx = sdRoundBox(p + float2(eps, 0.0), halfSize, rad) - sdRoundBox(p - float2(eps, 0.0), halfSize, rad);
     float gy = sdRoundBox(p + float2(0.0, eps), halfSize, rad) - sdRoundBox(p - float2(0.0, eps), halfSize, rad);
     float len = length(float2(gx, gy));
     float2 n = len > 0.0001 ? float2(gx, gy) / len : float2(0.0, -1.0);
-    float normY = clamp(p.y / max(halfSize.y, 1.0), -1.0, 1.0);
-    return float4(d, n.x, n.y, normY);
-}
 
-float2 snellShift(float2 n, float sinA, float cosA, float eta) {
-    float sin2T = eta * eta * sinA * sinA;
-    float cosT = sqrt(max(1.0 - sin2T, 0.0001));
-    float k = eta * cosA - cosT;
-    float tz = max(eta - k * cosA, 0.25);
-    return n * ((k * sinA) / tz);
-}
-
-half4 main(float2 fragCoord) {
-    float4 best = evalShape(fragCoord, r0, radA.x);
-    int activeId = 0;
-    float4 activeRect = r0;
-    float activeRad = radA.x;
-
-    float4 g1 = evalShape(fragCoord, r1, radA.y);
-    if (g1.x < best.x) { best = g1; activeId = 1; activeRect = r1; activeRad = radA.y; }
-
-    float4 g2 = evalShape(fragCoord, r2, radA.z);
-    if (g2.x < best.x) { best = g2; activeId = 2; activeRect = r2; activeRad = radA.z; }
-
-    float4 g3 = evalShape(fragCoord, r3, radA.w);
-    if (g3.x < best.x) { best = g3; activeId = 3; activeRect = r3; activeRad = radA.w; }
-
-    float4 g4 = evalShape(fragCoord, r4, radB.x);
-    if (g4.x < best.x) { best = g4; activeId = 4; activeRect = r4; activeRad = radB.x; }
-
-    float4 g5 = evalShape(fragCoord, r5, radB.y);
-    if (g5.x < best.x) { best = g5; activeId = 5; activeRect = r5; activeRad = radB.y; }
-
-    float4 g6 = evalShape(fragCoord, r6, radB.z);
-    if (g6.x < best.x) { best = g6; activeId = 6; activeRect = r6; activeRad = radB.z; }
-
-    float4 g7 = evalShape(fragCoord, r7, radB.w);
-    if (g7.x < best.x || (overlayMode > 0.5 && g7.x <= 1.2)) {
-        best = g7;
-        activeId = 7;
-        activeRect = r7;
-        activeRad = radB.w;
-    }
-
-    float d = best.x;
-    if (d > 26.0 * density) {
-        return half4(0.0);
-    }
-
-    float isOverlay = (activeId == 7 && overlayMode > 0.5) ? 1.0 : 0.0;
-    float isSheet = (activeId == 7 && overlayMode > 1.5) ? 1.0 : 0.0;
-
-    // Ombra ambientale morbida spostata verso il basso (premultiplied alpha)
-    float2 shPos = fragCoord - float2(0.0, 4.5 * density);
-    float dSh = evalShape(shPos, activeRect, activeRad).x;
-    float shStrength = isOverlay > 0.5 ? 0.34 : 0.24;
-    float shAlpha = dSh < 24.0 * density ? exp(-max(dSh, 0.0) / (9.5 * density)) * shStrength : 0.0;
-
-    if (d > 0.85) {
-        return half4(0.0, 0.0, 0.0, half(shAlpha));
-    }
-
-    float2 n = best.yz;
-    float normY = best.w;
-    float2 center = 0.5 * (activeRect.xy + activeRect.zw);
-    float2 halfSize = max(0.5 * (activeRect.zw - activeRect.xy), float2(1.0));
-    float2 localNorm = (fragCoord - center) / halfSize;
     float minHalf = min(halfSize.x, halfSize.y);
-
     float distIn = max(-d, 0.0);
-    float bezelTarget = isSheet > 0.5 ? 24.0 : (isOverlay > 0.5 ? 20.0 : 15.0);
-    float bezel = max(min(bezelTarget * density, minHalf * 0.72), 1.0);
+    float bezel = max(min(18.0 * density, minHalf * 0.78), 1.0);
     float t = clamp(distIn / bezel, 0.0, 1.0);
     float sinA = 1.0 - t;
     float z = sqrt(max(1.0 - sinA * sinA, 0.0001));
 
-    // Rifrazione a menisco lungo il perimetro sul backdrop già hardware-blurred
-    float edgeRefractPx = (isOverlay > 0.5 ? 8.0 : 10.5) * density;
-    float2 centerComp = -localNorm * (float2(1.0, 1.6) * density) * z;
-    float2 refractedPos = fragCoord + centerComp + snellShift(n, sinA, z, 1.0 / 1.52) * edgeRefractPx;
+    // Magnificazione convessa al centro + rifrazione fisica di Snell sul menisco curvo
+    float2 localNorm = p / max(halfSize, float2(1.0, 1.0));
+    float zoomAmt = mix(1.0, 3.2, lensStrength) * density;
+    float refractAmt = mix(9.5, 14.5, lensStrength) * density;
+    float2 centerLens = -localNorm * zoomAmt * z;
+    float2 posG = fragCoord + centerLens + snellShift(n, sinA, z, 1.0 / 1.52) * refractAmt;
+    posG = clamp(posG, float2(0.5, 0.5), safeSize - float2(0.5, 0.5));
 
-    half3 glassRgb = composable.eval(refractedPos).rgb;
+    half4 baseSample = composable.eval(posG);
+    half3 rgb = baseSample.rgb;
 
-    // Sottile dispersione cromatica sul bordo curvo del contenitore
-    if (t < 0.72) {
-        float2 posR = fragCoord + centerComp + snellShift(n, sinA, z, 1.0 / 1.43) * edgeRefractPx;
-        float2 posB = fragCoord + centerComp + snellShift(n, sinA, z, 1.0 / 1.64) * edgeRefractPx;
+    // Dispersione cromatica RGB prismatica sui bordi curvi
+    if (t < 0.80) {
+        float2 posR = fragCoord + centerLens + snellShift(n, sinA, z, 1.0 / 1.40) * refractAmt;
+        float2 posB = fragCoord + centerLens + snellShift(n, sinA, z, 1.0 / 1.66) * refractAmt;
+        posR = clamp(posR, float2(0.5, 0.5), safeSize - float2(0.5, 0.5));
+        posB = clamp(posB, float2(0.5, 0.5), safeSize - float2(0.5, 0.5));
         half rEdge = composable.eval(posR).r;
         half bEdge = composable.eval(posB).b;
-        float chromaMix = smoothstep(0.72, 0.05, t) * (isOverlay > 0.5 ? 0.35 : 0.52);
-        glassRgb.r = mix(glassRgb.r, rEdge, half(chromaMix));
-        glassRgb.b = mix(glassRgb.b, bEdge, half(chromaMix));
+        float chromaFade = 1.0 - smoothstep(0.04, 0.80, t);
+        float chromaMix = chromaFade * mix(0.46, 0.92, lensStrength);
+        rgb.r = mix(rgb.r, rEdge, half(chromaMix));
+        rgb.b = mix(rgb.b, bEdge, half(chromaMix));
     }
 
-    // Vibrancy iOS 26 + Tinta scura traslucida calibrata (22% capsule, 44-48% modali)
-    half luma = dot(glassRgb, half3(0.299, 0.587, 0.114));
-    glassRgb = mix(half3(luma), glassRgb, half(isOverlay > 0.5 ? 1.28 : 1.38));
-    half3 darkTint = half3(0.042, 0.046, 0.072);
-    float tintStrength = isSheet > 0.5 ? 0.48 : (isOverlay > 0.5 ? 0.44 : 0.22);
-    glassRgb = mix(glassRgb, darkTint, half(tintStrength));
+    // Vibrancy iOS 26 + Tinta scura traslucida calibrata
+    half luma = dot(rgb, half3(0.299, 0.587, 0.114));
+    rgb = mix(half3(luma, luma, luma), rgb, half(mix(1.32, 1.48, lensStrength)));
+    half3 darkTint = half3(0.045, 0.050, 0.082);
+    rgb = mix(rgb, darkTint, half(clamp(tintAlpha, 0.0, 0.85)));
 
-    // Luce interna superiore e rimbalzo inferiore della lente 3D
-    float topGlaze = smoothstep(0.35, -1.0, normY) * (isOverlay > 0.5 ? 0.045 : 0.068);
-    float bottomBounce = smoothstep(0.55, 1.0, normY) * 0.025;
-    glassRgb += half3(half(topGlaze + bottomBounce));
+    // Lucido lente superiore & caustica inferiore (tutti smoothstep con edge0 < edge1)
+    float normY = clamp(p.y / max(halfSize.y, 1.0), -1.0, 1.0);
+    float topFactor = 1.0 - smoothstep(-1.0, 0.35, normY);
+    float botFactor = smoothstep(0.50, 1.0, normY);
+    float glaze = topFactor * mix(0.055, 0.105, lensStrength) + botFactor * mix(0.02, 0.045, lensStrength);
+    rgb += half3(half(glaze), half(glaze), half(glaze));
 
-    // Ombra interna sottile di spessore vetro
-    float innerGroove = smoothstep(0.8 * density, 2.4 * density, distIn) *
-                        smoothstep(5.5 * density, 2.4 * density, distIn) * 0.045;
-    glassRgb *= half(1.0 - innerGroove);
+    // Sottile ombra interna di spessore vetro
+    float grooveUp = smoothstep(0.8 * density, 2.4 * density, distIn);
+    float grooveDn = 1.0 - smoothstep(2.4 * density, 5.5 * density, distIn);
+    rgb *= half(1.0 - grooveUp * grooveDn * 0.045);
 
-    // Bordo speculare razor-sharp (~0.9dp) + dual-rim Fresnel (alto-sx + basso-dx)
+    // Riflesso speculare Fresnel razor-sharp (~0.95dp, dual-rim alto-sx + basso-dx)
     float2 keyLight = normalize(float2(-0.55, -0.84));
     float2 rimLight = normalize(float2(0.55, 0.84));
-    float fresnel = pow(max(1.0 - z, 0.0001), 2.1);
-    float specKey = pow(max(dot(n, keyLight), 0.0001), 2.3);
-    float specBack = pow(max(dot(n, rimLight), 0.0001), 3.2) * 0.50;
+    float fresnel = pow(max(1.0 - z, 0.0001), 2.0);
+    float specKey = pow(max(dot(n, keyLight), 0.0001), 2.2);
+    float specBack = pow(max(dot(n, rimLight), 0.0001), 3.0) * 0.52;
     float dirWeight = specKey + specBack;
 
-    float hairlineRim = smoothstep(0.95 * density, 0.0, distIn);
-    float softCaustic = smoothstep(4.5 * density, 0.0, distIn) * (0.06 + 0.12 * fresnel);
+    float hairlineRim = 1.0 - smoothstep(0.0, 0.95 * density, distIn);
+    float softCaustic = (1.0 - smoothstep(0.0, 4.8 * density, distIn)) * (0.06 + 0.14 * fresnel);
+    float rimGain = hairlineRim * (0.18 + mix(0.75, 0.96, lensStrength) * dirWeight) +
+                    softCaustic * (0.20 + 0.80 * specKey);
 
-    float rimBase = isOverlay > 0.5 ? 0.14 : 0.19;
-    float rimPeak = isOverlay > 0.5 ? 0.68 : 0.82;
-    float specular = hairlineRim * (rimBase + rimPeak * dirWeight) +
-                     softCaustic * (0.20 + 0.80 * specKey);
-
-    glassRgb = clamp(glassRgb + half3(half(specular)), half3(0.0), half3(1.0));
-
-    float insideMask = smoothstep(0.85, -0.85, d);
-    float outAlpha = insideMask + shAlpha * (1.0 - insideMask);
-    return half4(glassRgb * half(insideMask), half(outAlpha));
+    rgb = clamp(rgb + half3(half(rimGain), half(rimGain), half(rimGain)), half3(0.0, 0.0, 0.0), half3(1.0, 1.0, 1.0));
+    return half4(rgb * baseSample.a, baseSample.a);
 }
 """
 
-private const val IOS_LIQUID_DROP_AGSL = """
-uniform shader composable;
-uniform float4 dropRect;
-uniform float dropRadius;
-uniform float strength;
-uniform float density;
-
-float sdRoundBox(float2 p, float2 b, float r) {
-    float2 q = abs(p) - b + float2(r);
-    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
-}
-
-float4 evalDrop(float2 fragCoord, float4 rect, float radius) {
-    if (rect.z <= rect.x + 2.0 || rect.w <= rect.y + 2.0) {
-        return float4(10000.0, 0.0, -1.0, 0.0);
-    }
-    float2 center = 0.5 * (rect.xy + rect.zw);
-    float2 halfSize = 0.5 * (rect.zw - rect.xy);
-    float rad = min(radius, min(halfSize.x, halfSize.y));
-    float2 p = fragCoord - center;
-    float d = sdRoundBox(p, halfSize, rad);
-
-    float eps = 1.20;
-    float gx = sdRoundBox(p + float2(eps, 0.0), halfSize, rad) - sdRoundBox(p - float2(eps, 0.0), halfSize, rad);
-    float gy = sdRoundBox(p + float2(0.0, eps), halfSize, rad) - sdRoundBox(p - float2(0.0, eps), halfSize, rad);
-    float len = length(float2(gx, gy));
-    float2 n = len > 0.0001 ? float2(gx, gy) / len : float2(0.0, -1.0);
-    float normY = clamp(p.y / max(halfSize.y, 1.0), -1.0, 1.0);
-    return float4(d, n.x, n.y, normY);
-}
-
-float2 snellShift(float2 n, float sinA, float cosA, float eta) {
-    float sin2T = eta * eta * sinA * sinA;
-    float cosT = sqrt(max(1.0 - sin2T, 0.0001));
-    float k = eta * cosA - cosT;
-    float tz = max(eta - k * cosA, 0.25);
-    return n * ((k * sinA) / tz);
-}
-
-half4 main(float2 fragCoord) {
-    if (strength <= 0.01) {
-        return half4(0.0);
-    }
-
-    float4 g = evalDrop(fragCoord, dropRect, dropRadius);
-    float d = g.x;
-    if (d > 24.0 * density) {
-        return half4(0.0);
-    }
-
-    // Ombra ambientale di sollevamento sotto la goccia liquida
-    float2 shPos = fragCoord - float2(0.0, 5.0 * density);
-    float dSh = evalDrop(shPos, dropRect, dropRadius).x;
-    float shAlpha = dSh < 22.0 * density ? exp(-max(dSh, 0.0) / (8.5 * density)) * 0.30 * strength : 0.0;
-
-    if (d > 0.85) {
-        return half4(0.0, 0.0, 0.0, half(shAlpha));
-    }
-
-    float2 n = g.yz;
-    float normY = g.w;
-    float2 center = 0.5 * (dropRect.xy + dropRect.zw);
-    float2 halfSize = max(0.5 * (dropRect.zw - dropRect.xy), float2(1.0));
-    float2 localNorm = (fragCoord - center) / halfSize;
-    float minHalf = min(halfSize.x, halfSize.y);
-
-    float distIn = max(-d, 0.0);
-    float bezel = max(min(20.0 * density, minHalf * 0.84), 1.0);
-    float t = clamp(distIn / bezel, 0.0, 1.0);
-    float sinA = 1.0 - t;
-    float z = sqrt(max(1.0 - sinA * sinA, 0.0001));
-
-    // Lente convessa cristallina + forte menisco Snell lungo il bordo
-    float2 centerZoom = -localNorm * (float2(3.0, 3.6) * density * strength) * z;
-    float refractDepthPx = 13.5 * density * strength;
-    float etaR = 1.0 / 1.38;
-    float etaG = 1.0 / 1.52;
-    float etaB = 1.0 / 1.72;
-
-    float2 refractedPos = fragCoord + centerZoom + snellShift(n, sinA, z, etaG) * refractDepthPx;
-    half3 glassRgb = composable.eval(refractedPos).rgb;
-
-    // Dispersione cromatica RGB prismatica sui bordi curvi della goccia
-    if (t < 0.86) {
-        float2 posR = fragCoord + centerZoom + snellShift(n, sinA, z, etaR) * refractDepthPx;
-        float2 posB = fragCoord + centerZoom + snellShift(n, sinA, z, etaB) * refractDepthPx;
-        half rEdge = composable.eval(posR).r;
-        half bEdge = composable.eval(posB).b;
-        float chromaMix = smoothstep(0.86, 0.04, t) * 0.92 * strength;
-        glassRgb.r = mix(glassRgb.r, rEdge, half(chromaMix));
-        glassRgb.b = mix(glassRgb.b, bEdge, half(chromaMix));
-    }
-
-    // Centro quasi cristallino con alta vibrancy e luminanza adattiva
-    half luma = dot(glassRgb, half3(0.299, 0.587, 0.114));
-    glassRgb = mix(half3(luma), glassRgb, half(1.48));
-    float adaptiveGain = mix(1.12, 0.94, smoothstep(0.45, 0.85, float(luma)));
-    glassRgb *= half(adaptiveGain);
-    glassRgb += half3(0.022, 0.028, 0.038);
-
-    // Riflessi interni da goccia di vetro sferica + rim speculare vivo
-    float topGlaze = smoothstep(0.25, -1.0, normY) * 0.105;
-    float bottomBounce = smoothstep(0.55, 1.0, normY) * 0.048;
-    glassRgb += half3(half(topGlaze + bottomBounce));
-
-    float2 keyLight = normalize(float2(-0.54, -0.84));
-    float2 rimLight = normalize(float2(0.54, 0.84));
-    float fresnel = pow(max(1.0 - z, 0.0001), 1.9);
-    float specKey = pow(max(dot(n, keyLight), 0.0001), 2.1);
-    float specBack = pow(max(dot(n, rimLight), 0.0001), 3.0) * 0.55;
-
-    float hairlineRim = smoothstep(1.05 * density, 0.0, distIn);
-    float softCaustic = smoothstep(5.5 * density, 0.0, distIn) * (0.10 + 0.20 * fresnel);
-    float specular = hairlineRim * (0.24 + 0.96 * (specKey + specBack)) +
-                     softCaustic * (0.22 + 0.78 * specKey);
-
-    glassRgb = clamp(glassRgb + half3(half(specular)), half3(0.0), half3(1.0));
-
-    float insideAlpha = smoothstep(0.85, -0.85, d) * strength;
-    float outAlpha = insideAlpha + shAlpha * (1.0 - insideAlpha);
-    return half4(glassRgb * half(insideAlpha), half(outAlpha));
-}
-"""
-
-@Immutable
-data class GlassRectSlots(
-    val r0: Rect = Rect.Zero,
-    val rad0: Float = 0f,
-    val r1: Rect = Rect.Zero,
-    val rad1: Float = 0f,
-    val r2: Rect = Rect.Zero,
-    val rad2: Float = 0f,
-    val r3: Rect = Rect.Zero,
-    val rad3: Float = 0f,
-    val r4: Rect = Rect.Zero,
-    val rad4: Float = 0f,
-    val r5: Rect = Rect.Zero,
-    val rad5: Float = 0f,
-    val r6: Rect = Rect.Zero,
-    val rad6: Float = 0f,
-    val r7: Rect = Rect.Zero,
-    val rad7: Float = 0f,
-    val overlayMode: Int = 0
-) {
-    fun hasAnyRect(): Boolean {
-        return !r0.isEmpty || !r1.isEmpty || !r2.isEmpty || !r3.isEmpty ||
-            !r4.isEmpty || !r5.isEmpty || !r6.isEmpty || !r7.isEmpty
-    }
-}
-
-private fun buildFrostedBackdropEffect(
-    slots: GlassRectSlots,
-    blurRadiusPx: Float,
-    densityPx: Float
-): androidx.compose.ui.graphics.RenderEffect? {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || !slots.hasAnyRect()) return null
-    return try {
-        val shader = RuntimeShader(IOS_FROSTED_GLASS_AGSL).apply {
-            setFloatUniform("r0", slots.r0.left, slots.r0.top, slots.r0.right, slots.r0.bottom)
-            setFloatUniform("r1", slots.r1.left, slots.r1.top, slots.r1.right, slots.r1.bottom)
-            setFloatUniform("r2", slots.r2.left, slots.r2.top, slots.r2.right, slots.r2.bottom)
-            setFloatUniform("r3", slots.r3.left, slots.r3.top, slots.r3.right, slots.r3.bottom)
-            setFloatUniform("r4", slots.r4.left, slots.r4.top, slots.r4.right, slots.r4.bottom)
-            setFloatUniform("r5", slots.r5.left, slots.r5.top, slots.r5.right, slots.r5.bottom)
-            setFloatUniform("r6", slots.r6.left, slots.r6.top, slots.r6.right, slots.r6.bottom)
-            setFloatUniform("r7", slots.r7.left, slots.r7.top, slots.r7.right, slots.r7.bottom)
-            setFloatUniform("radA", slots.rad0, slots.rad1, slots.rad2, slots.rad3)
-            setFloatUniform("radB", slots.rad4, slots.rad5, slots.rad6, slots.rad7)
-            setFloatUniform("overlayMode", slots.overlayMode.toFloat())
-            setFloatUniform("density", densityPx)
-        }
-        val blurEffect = RenderEffect.createBlurEffect(
-            blurRadiusPx.coerceAtLeast(1f),
-            blurRadiusPx.coerceAtLeast(1f),
-            Shader.TileMode.CLAMP
-        )
-        val glassShaderEffect = RenderEffect.createRuntimeShaderEffect(shader, "composable")
-        RenderEffect.createChainEffect(glassShaderEffect, blurEffect).asComposeRenderEffect()
-    } catch (_: Throwable) {
-        null
-    }
-}
-
-private fun buildLiquidDropEffect(
-    dropRect: Rect,
-    dropRadiusPx: Float,
-    strength: Float,
-    densityPx: Float
+private fun buildCapsuleGlassRenderEffect(
+    boxSize: IntSize,
+    cornerRadiusPx: Float,
+    blurPx: Float,
+    densityPx: Float,
+    tintAlpha: Float,
+    lensStrength: Float
 ): androidx.compose.ui.graphics.RenderEffect? {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
-    if (strength <= 0.01f || dropRect.isEmpty) return null
+    if (boxSize.width <= 2 || boxSize.height <= 2) return null
+
     return try {
-        val expandPx = 2.5f * densityPx * strength
-        val expanded = Rect(
-            left = dropRect.left - expandPx,
-            top = dropRect.top - expandPx,
-            right = dropRect.right + expandPx,
-            bottom = dropRect.bottom + expandPx
-        )
-        val shader = RuntimeShader(IOS_LIQUID_DROP_AGSL).apply {
-            setFloatUniform("dropRect", expanded.left, expanded.top, expanded.right, expanded.bottom)
-            setFloatUniform("dropRadius", dropRadiusPx + expandPx)
-            setFloatUniform("strength", strength.coerceIn(0f, 1f))
+        val shader = RuntimeShader(IOS_CAPSULE_GLASS_AGSL).apply {
+            setFloatUniform("size", boxSize.width.toFloat(), boxSize.height.toFloat())
+            setFloatUniform("cornerRadius", cornerRadiusPx)
             setFloatUniform("density", densityPx)
+            setFloatUniform("tintAlpha", tintAlpha)
+            setFloatUniform("lensStrength", lensStrength.coerceIn(0f, 1f))
         }
-        RenderEffect.createRuntimeShaderEffect(shader, "composable").asComposeRenderEffect()
-    } catch (_: Throwable) {
+        val lensEffect = RenderEffect.createRuntimeShaderEffect(shader, "composable")
+        val finalEffect = if (blurPx >= 1.2f) {
+            val blurEffect = RenderEffect.createBlurEffect(
+                blurPx,
+                blurPx,
+                Shader.TileMode.CLAMP
+            )
+            RenderEffect.createChainEffect(lensEffect, blurEffect)
+        } else {
+            lensEffect
+        }
+        LiquidGlassDiagnostics.lastShaderError.value = null
+        finalEffect.asComposeRenderEffect()
+    } catch (t: Throwable) {
+        Log.e("LiquidGlass", "RuntimeShader/RenderEffect failed", t)
+        LiquidGlassDiagnostics.lastShaderError.value = t.message ?: t::class.java.simpleName
         null
     }
 }
 
 /**
- * Stato condiviso per tracciare quale controllo è premuto/trascinato e alimentare
- * la lente cristallina "Goccia Liquida" (Pipeline B) in tempo reale sul contenuto sottostante.
- */
-@Stable
-class LiquidGlassDropletController {
-    var activeRect by mutableStateOf(Rect.Zero)
-    var activeRadiusPx by mutableFloatStateOf(0f)
-    var isActive by mutableStateOf(false)
-
-    fun press(rect: Rect, radiusPx: Float) {
-        if (!rect.isEmpty) {
-            activeRect = rect
-            activeRadiusPx = radiusPx
-            isActive = true
-        }
-    }
-
-    fun updateGeometryIfOwned(oldRect: Rect, newRect: Rect, radiusPx: Float) {
-        if (isActive && activeRect == oldRect && !newRect.isEmpty) {
-            activeRect = newRect
-            activeRadiusPx = radiusPx
-        }
-    }
-
-    fun releaseIfOwned(rect: Rect) {
-        if (activeRect == rect) {
-            isActive = false
-        }
-    }
-
-    fun releaseAny() {
-        isActive = false
-    }
-}
-
-/**
- * Host unificato della doppia pipeline Liquid Glass con pacing GPU rispettoso del TargetFps:
- * - Registra una sola volta il backdrop (sfondo + testi) in `backdropLayer`
- * - Pipeline A: applica `frostedEffect` (Gaussian Blur hardware + menisco + rim speculare)
- * - Pipeline B: applica `dropletEffect` (Lente Liquida cristallina nitida) sull'area premuta
+ * Superficie Liquid Glass per-capsula:
+ * disegna `backdropLayer` traslato esattamente sulle proprie coordinate rispetto allo schermo
+ * filtrato da `createChainEffect(IOS_CAPSULE_GLASS_AGSL, createBlurEffect(CLAMP))`.
+ * Quando `pressed == true`, riduce dinamicamente la sfocatura per trasformarsi in "Goccia Liquida"
+ * cristallina a rifrazione convessa e dispersione prismatica sui bordi.
  */
 @Composable
-fun LiquidGlassBackdropHost(
-    glassSlots: GlassRectSlots,
-    frostedBlurDp: Dp,
-    dropletController: LiquidGlassDropletController,
-    targetFps: TargetFps,
-    backdropDimAlpha: Float = 0f,
-    onRootPositioned: (Offset) -> Unit,
-    backdropContent: @Composable BoxScope.() -> Unit,
-    foregroundContent: @Composable BoxScope.() -> Unit
+private fun LiquidGlassCapsuleBox(
+    backdropLayer: GraphicsLayer,
+    backdropTopLeft: Offset,
+    shape: Shape,
+    cornerRadiusDp: Dp,
+    blurDp: Dp,
+    tintAlpha: Float,
+    pressed: Boolean = false,
+    elevated: Boolean = false,
+    backdropInvalidator: () -> Any = { Unit },
+    modifier: Modifier = Modifier,
+    content: @Composable BoxScope.() -> Unit
 ) {
     val density = LocalDensity.current
-    val composeView = LocalView.current
     val densityPx = density.density
-    val frostedBlurPx = with(density) { frostedBlurDp.toPx() }
+    var myTopLeft by remember { mutableStateOf(Offset.Zero) }
+    var mySize by remember { mutableStateOf(IntSize.Zero) }
 
-    val dropletStrength by animateFloatAsState(
-        targetValue = if (dropletController.isActive && !dropletController.activeRect.isEmpty) 1f else 0f,
-        animationSpec = spring(dampingRatio = 0.58f, stiffness = 460f),
-        label = "liquidDropletStrength"
+    val pressFraction by animateFloatAsState(
+        targetValue = if (pressed) 1f else 0f,
+        animationSpec = spring(dampingRatio = 0.54f, stiffness = 460f),
+        label = "capsulePress"
     )
 
-    val frostedEffect = remember(glassSlots, frostedBlurPx, densityPx) {
-        buildFrostedBackdropEffect(glassSlots, frostedBlurPx, densityPx)
-    }
+    val scale = 1f + 0.065f * pressFraction
+    val effectiveBlurDp = if (blurDp <= 2.dp) blurDp.value else blurDp.value * (1f - 0.88f * pressFraction)
+    val effectiveTint = tintAlpha * (1f - 0.65f * pressFraction)
+    val lensStrength = (if (blurDp <= 2.dp) 0.95f else 0.36f + 0.64f * pressFraction)
+    val cornerRadiusPx = with(density) { cornerRadiusDp.toPx() }
+    val blurPx = with(density) { effectiveBlurDp.dp.toPx() }
 
-    val dropletEffect = remember(
-        dropletController.activeRect,
-        dropletController.activeRadiusPx,
-        dropletStrength,
-        densityPx
+    val renderEffect = remember(
+        mySize,
+        cornerRadiusPx,
+        blurPx,
+        densityPx,
+        effectiveTint,
+        lensStrength
     ) {
-        buildLiquidDropEffect(
-            dropRect = dropletController.activeRect,
-            dropRadiusPx = dropletController.activeRadiusPx,
-            strength = dropletStrength,
-            densityPx = densityPx
+        buildCapsuleGlassRenderEffect(
+            boxSize = mySize,
+            cornerRadiusPx = cornerRadiusPx,
+            blurPx = blurPx,
+            densityPx = densityPx,
+            tintAlpha = effectiveTint,
+            lensStrength = lensStrength
         )
     }
 
-    val backdropLayer = rememberGraphicsLayer()
-    val frostedLayer = rememberGraphicsLayer()
-    val dropletLayer = rememberGraphicsLayer()
-
-    // Pacing GPU: evita di ri-eseguire il blur hardware oltre 30/60 FPS su pannelli a 120 Hz fissi,
-    // garantendo comunque l'ultimo frame assestato tramite un solo redraw differito.
-    val pacingState = remember {
-        object {
-            var lastFrostedUpdateNs = 0L
-            var hasCachedFrosted = false
-            var lastEffectIdentity: Any? = null
-            var lastBackdropDim = -1f
-            var deferredRunnable: Runnable? = null
-        }
-    }
-
-    DisposableEffect(composeView) {
-        onDispose {
-            pacingState.deferredRunnable?.let { composeView.removeCallbacks(it) }
-            pacingState.deferredRunnable = null
-        }
-    }
-
-    val minGpuIntervalNs = when (targetFps) {
-        TargetFps.FPS_30 -> 28_000_000L
-        TargetFps.FPS_60 -> 13_500_000L
-        TargetFps.FPS_120 -> 0L
-    }
+    val relOffset = myTopLeft - backdropTopLeft
 
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .onGloballyPositioned { onRootPositioned(it.boundsInRoot().topLeft) }
+        modifier = modifier
+            .onGloballyPositioned { coords ->
+                val bounds = coords.boundsInRoot()
+                myTopLeft = bounds.topLeft
+                mySize = coords.size
+            }
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .shadow(
+                elevation = if (elevated || pressed) 14.dp else 9.dp,
+                shape = shape,
+                ambientColor = Color.Black.copy(alpha = 0.45f),
+                spotColor = Color.Black.copy(alpha = 0.55f),
+                clip = false
+            )
     ) {
         Box(
             modifier = Modifier
-                .fillMaxSize()
-                .drawWithContent {
-                    backdropLayer.record {
-                        this@drawWithContent.drawContent()
+                .matchParentSize()
+                .graphicsLayer {
+                    clip = true
+                    this.shape = shape
+                    this.renderEffect = renderEffect
+                }
+                .then(
+                    if (renderEffect == null) {
+                        Modifier.background(
+                            Color(0xFF0E1018).copy(alpha = (effectiveTint + 0.34f).coerceIn(0.28f, 0.78f))
+                        )
+                    } else {
+                        Modifier
                     }
-                    drawLayer(backdropLayer)
-
-                    if (backdropDimAlpha > 0.005f) {
-                        drawRect(color = Color.Black.copy(alpha = backdropDimAlpha))
-                    }
-
-                    if (frostedEffect != null) {
-                        val nowNs = System.nanoTime()
-                        val elapsedNs = nowNs - pacingState.lastFrostedUpdateNs
-                        val effectChanged = pacingState.lastEffectIdentity !== glassSlots ||
-                            abs(pacingState.lastBackdropDim - backdropDimAlpha) > 0.01f
-
-                        if (!pacingState.hasCachedFrosted || effectChanged || elapsedNs >= minGpuIntervalNs) {
-                            pacingState.deferredRunnable?.let { composeView.removeCallbacks(it) }
-                            pacingState.deferredRunnable = null
-
-                            frostedLayer.renderEffect = frostedEffect
-                            frostedLayer.record {
-                                drawLayer(backdropLayer)
-                            }
-                            pacingState.lastFrostedUpdateNs = nowNs
-                            pacingState.hasCachedFrosted = true
-                            pacingState.lastEffectIdentity = glassSlots
-                            pacingState.lastBackdropDim = backdropDimAlpha
-                        } else if (pacingState.deferredRunnable == null) {
-                            val remainMs = ((minGpuIntervalNs - elapsedNs) / 1_000_000L).coerceIn(2L, 34L)
-                            val task = Runnable {
-                                pacingState.deferredRunnable = null
-                                composeView.invalidate()
-                            }
-                            pacingState.deferredRunnable = task
-                            composeView.postDelayed(task, remainMs)
-                        }
-                        drawLayer(frostedLayer)
-                    }
-
-                    if (dropletEffect != null) {
-                        dropletLayer.renderEffect = dropletEffect
-                        dropletLayer.record {
+                )
+                .drawBehind {
+                    backdropInvalidator()
+                    if (mySize.width > 0 && mySize.height > 0) {
+                        translate(left = -relOffset.x, top = -relOffset.y) {
                             drawLayer(backdropLayer)
                         }
-                        drawLayer(dropletLayer)
                     }
                 }
-        ) {
-            backdropContent()
+        )
+
+        if (renderEffect == null) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .border(0.85.dp, Color.White.copy(alpha = 0.34f), shape)
+            )
         }
 
-        foregroundContent()
+        content()
+    }
+}
+
+/**
+ * Overlay "Goccia Liquida" trasparente usato SOLO sopra i controlli interni (es. Play/Pause, chip)
+ * quando premuti: a riposo è a costo zero, al tocco campiona il backdrop NITIDO con lente convessa.
+ */
+@Composable
+private fun LiquidDropletOverlay(
+    backdropLayer: GraphicsLayer,
+    backdropTopLeft: Offset,
+    shape: Shape,
+    cornerRadiusDp: Dp,
+    pressed: Boolean,
+    tintColor: Color = Color.Transparent,
+    backdropInvalidator: () -> Any = { Unit },
+    modifier: Modifier = Modifier,
+    content: @Composable BoxScope.() -> Unit
+) {
+    val density = LocalDensity.current
+    val densityPx = density.density
+    var myTopLeft by remember { mutableStateOf(Offset.Zero) }
+    var mySize by remember { mutableStateOf(IntSize.Zero) }
+
+    val pressFraction by animateFloatAsState(
+        targetValue = if (pressed) 1f else 0f,
+        animationSpec = spring(dampingRatio = 0.50f, stiffness = 460f),
+        label = "innerDroplet"
+    )
+    val scale = 1f + 0.085f * pressFraction
+    val cornerRadiusPx = with(density) { cornerRadiusDp.toPx() }
+
+    val dropEffect = remember(mySize, cornerRadiusPx, pressFraction, densityPx) {
+        if (pressFraction <= 0.02f) {
+            null
+        } else {
+            buildCapsuleGlassRenderEffect(
+                boxSize = mySize,
+                cornerRadiusPx = cornerRadiusPx,
+                blurPx = 0f, // nitidissimo, lente convessa pura!
+                densityPx = densityPx,
+                tintAlpha = 0.04f,
+                lensStrength = pressFraction
+            )
+        }
+    }
+
+    val relOffset = myTopLeft - backdropTopLeft
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .onGloballyPositioned { coords ->
+                myTopLeft = coords.boundsInRoot().topLeft
+                mySize = coords.size
+            }
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+    ) {
+        if (pressFraction > 0.02f) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .graphicsLayer {
+                        clip = true
+                        this.shape = shape
+                        alpha = pressFraction
+                        this.renderEffect = dropEffect
+                    }
+                    .drawBehind {
+                        backdropInvalidator()
+                        if (mySize.width > 0 && mySize.height > 0) {
+                            translate(left = -relOffset.x, top = -relOffset.y) {
+                                drawLayer(backdropLayer)
+                            }
+                        }
+                    }
+            )
+        } else if (tintColor != Color.Transparent) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .clip(shape)
+                    .background(tintColor)
+            )
+        }
+        content()
     }
 }
 
 // ------------------------------------------------------------
-// 3. Controlli Liquid Glass Interattivi con "Goccia Liquida" al Tocco
+// 3. Stili Testo & Modificatore Pulsanti Crystal Glass
 // ------------------------------------------------------------
-
 private val GlassTextShadowStyle = TextStyle(
     shadow = Shadow(
-        color = Color.Black.copy(alpha = 0.42f),
+        color = Color.Black.copy(alpha = 0.44f),
         offset = Offset(0f, 1.5f),
         blurRadius = 6f
     )
@@ -941,54 +858,45 @@ private val GlassTextShadowStyle = TextStyle(
 fun Modifier.iosGlassButton(
     shape: Shape = CircleShape,
     elevated: Boolean = false,
-    pressed: Boolean = false,
-    transparentForDroplet: Boolean = false
+    pressed: Boolean = false
 ): Modifier = this
     .clip(shape)
     .background(
-        if (transparentForDroplet && pressed) {
-            Brush.verticalGradient(
-                0.0f to Color.White.copy(alpha = 0.06f),
-                1.0f to Color.Transparent
+        Brush.verticalGradient(
+            0.0f to Color.White.copy(
+                alpha = when {
+                    pressed -> 0.14f
+                    elevated -> 0.22f
+                    else -> 0.11f
+                }
+            ),
+            0.40f to Color.White.copy(
+                alpha = when {
+                    pressed -> 0.03f
+                    elevated -> 0.07f
+                    else -> 0.03f
+                }
+            ),
+            1.0f to Color.White.copy(
+                alpha = when {
+                    pressed -> 0.08f
+                    elevated -> 0.11f
+                    else -> 0.05f
+                }
             )
-        } else {
-            Brush.verticalGradient(
-                0.0f to Color.White.copy(
-                    alpha = when {
-                        pressed -> 0.14f
-                        elevated -> 0.22f
-                        else -> 0.11f
-                    }
-                ),
-                0.38f to Color.White.copy(
-                    alpha = when {
-                        pressed -> 0.03f
-                        elevated -> 0.07f
-                        else -> 0.03f
-                    }
-                ),
-                0.70f to Color.White.copy(alpha = 0.01f),
-                1.0f to Color.White.copy(
-                    alpha = when {
-                        pressed -> 0.08f
-                        elevated -> 0.11f
-                        else -> 0.05f
-                    }
-                )
-            )
-        }
+        )
     )
     .border(
         width = 0.8.dp,
         brush = Brush.linearGradient(
             0.0f to Color.White.copy(
                 alpha = when {
-                    pressed -> 0.92f
-                    elevated -> 0.72f
+                    pressed -> 0.90f
+                    elevated -> 0.70f
                     else -> 0.48f
                 }
             ),
-            0.45f to Color.White.copy(alpha = if (pressed) 0.24f else 0.08f),
+            0.45f to Color.White.copy(alpha = if (pressed) 0.22f else 0.08f),
             1.0f to Color.White.copy(
                 alpha = when {
                     pressed -> 0.65f
@@ -999,217 +907,6 @@ fun Modifier.iosGlassButton(
         ),
         shape = shape
     )
-
-@Composable
-private fun LiquidGlassDetachedCircle(
-    size: Dp,
-    enabled: Boolean = true,
-    elevated: Boolean = false,
-    rootTopLeft: Offset,
-    dropletController: LiquidGlassDropletController,
-    onRectMeasured: (Rect) -> Unit,
-    onClick: () -> Unit,
-    content: @Composable () -> Unit
-) {
-    var localRect by remember { mutableStateOf(Rect.Zero) }
-    val density = LocalDensity.current
-    val radiusPx = with(density) { (size / 2f).toPx() }
-    val interactionSource = remember { MutableInteractionSource() }
-    val pressed by interactionSource.collectIsPressedAsState()
-
-    LaunchedEffect(enabled && pressed, localRect) {
-        if (enabled && pressed && !localRect.isEmpty) {
-            dropletController.press(localRect, radiusPx)
-        } else {
-            dropletController.releaseIfOwned(localRect)
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose { dropletController.releaseIfOwned(localRect) }
-    }
-
-    val scale by animateFloatAsState(
-        targetValue = if (enabled && pressed) 1.09f else 1f,
-        animationSpec = spring(dampingRatio = 0.52f, stiffness = 460f),
-        label = "detachedCircleDrop"
-    )
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .size(size)
-            .onGloballyPositioned { coords ->
-                val old = localRect
-                val measured = coords.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                localRect = measured
-                onRectMeasured(measured)
-                dropletController.updateGeometryIfOwned(old, measured, radiusPx)
-            }
-            .graphicsLayer {
-                scaleX = scale
-                scaleY = scale
-            }
-            .clip(CircleShape)
-            .then(
-                if (elevated && !pressed) {
-                    Modifier.background(Color.White.copy(alpha = 0.12f))
-                } else {
-                    Modifier
-                }
-            )
-            .clickable(
-                enabled = enabled,
-                interactionSource = interactionSource,
-                indication = null,
-                onClick = onClick
-            )
-    ) {
-        content()
-    }
-}
-
-@Composable
-private fun LiquidGlassDetachedPill(
-    label: String,
-    font: FontFamily,
-    width: Dp,
-    height: Dp,
-    enabled: Boolean = true,
-    tintColor: Color = Color.Transparent,
-    labelColor: Color = Color.White,
-    rootTopLeft: Offset,
-    dropletController: LiquidGlassDropletController,
-    onRectMeasured: (Rect) -> Unit,
-    onClick: () -> Unit
-) {
-    var localRect by remember { mutableStateOf(Rect.Zero) }
-    val density = LocalDensity.current
-    val radiusPx = with(density) { (height / 2f).toPx() }
-    val interactionSource = remember { MutableInteractionSource() }
-    val pressed by interactionSource.collectIsPressedAsState()
-
-    LaunchedEffect(enabled && pressed, localRect) {
-        if (enabled && pressed && !localRect.isEmpty) {
-            dropletController.press(localRect, radiusPx)
-        } else {
-            dropletController.releaseIfOwned(localRect)
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose { dropletController.releaseIfOwned(localRect) }
-    }
-
-    val scale by animateFloatAsState(
-        targetValue = if (enabled && pressed) 1.07f else 1f,
-        animationSpec = spring(dampingRatio = 0.52f, stiffness = 460f),
-        label = "detachedPillDrop"
-    )
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .size(width = width, height = height)
-            .onGloballyPositioned { coords ->
-                val old = localRect
-                val measured = coords.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                localRect = measured
-                onRectMeasured(measured)
-                dropletController.updateGeometryIfOwned(old, measured, radiusPx)
-            }
-            .graphicsLayer {
-                scaleX = scale
-                scaleY = scale
-            }
-            .clip(RoundedCornerShape(50))
-            .background(if (!pressed) tintColor else Color.Transparent)
-            .clickable(
-                enabled = enabled,
-                interactionSource = interactionSource,
-                indication = null,
-                onClick = onClick
-            )
-            .padding(horizontal = 8.dp)
-    ) {
-        Text(
-            text = label,
-            fontFamily = font,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 13.sp,
-            letterSpacing = (-0.2).sp,
-            color = labelColor,
-            style = GlassTextShadowStyle,
-            maxLines = 1
-        )
-    }
-}
-
-@Composable
-private fun LiquidGlassCapsuleMediaControl(
-    width: Dp,
-    height: Dp,
-    elevated: Boolean = false,
-    enabled: Boolean = true,
-    rootTopLeft: Offset,
-    dropletController: LiquidGlassDropletController,
-    onClick: () -> Unit,
-    content: @Composable () -> Unit
-) {
-    var localRect by remember { mutableStateOf(Rect.Zero) }
-    val density = LocalDensity.current
-    val radiusPx = with(density) { (height / 2f).toPx() }
-    val interactionSource = remember { MutableInteractionSource() }
-    val pressed by interactionSource.collectIsPressedAsState()
-
-    LaunchedEffect(enabled && pressed, localRect) {
-        if (enabled && pressed && !localRect.isEmpty) {
-            dropletController.press(localRect, radiusPx)
-        } else {
-            dropletController.releaseIfOwned(localRect)
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose { dropletController.releaseIfOwned(localRect) }
-    }
-
-    val scale by animateFloatAsState(
-        targetValue = if (enabled && pressed) 1.10f else 1f,
-        animationSpec = spring(dampingRatio = 0.50f, stiffness = 460f),
-        label = "mediaCapsuleDrop"
-    )
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .size(width = width, height = height)
-            .onGloballyPositioned { coords ->
-                val old = localRect
-                val measured = coords.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                localRect = measured
-                dropletController.updateGeometryIfOwned(old, measured, radiusPx)
-            }
-            .graphicsLayer {
-                scaleX = scale
-                scaleY = scale
-            }
-            .iosGlassButton(
-                shape = RoundedCornerShape(50),
-                elevated = elevated,
-                pressed = enabled && pressed,
-                transparentForDroplet = true
-            )
-            .clickable(
-                enabled = enabled,
-                interactionSource = interactionSource,
-                indication = null,
-                onClick = onClick
-            )
-    ) {
-        content()
-    }
-}
 
 // ------------------------------------------------------------
 // 4. Font stile Apple SF Pro Display (sf_pro.ttf locale o Inter)
@@ -1568,7 +1265,7 @@ fun DynamicLyricsSplashScreen(
 }
 
 // ------------------------------------------------------------
-// 7. Schermata Avvio / Permessi Ridisegnata in Vero Liquid Glass
+// 7. Schermata Avvio / Permessi in Vero Liquid Glass Per-Capsula
 // ------------------------------------------------------------
 @Composable
 fun LiquidPermissionsScreen(
@@ -1578,8 +1275,6 @@ fun LiquidPermissionsScreen(
     onAllReady: () -> Unit
 ) {
     val context = LocalContext.current
-    val density = LocalDensity.current
-    val targetFps by AppPreferences.targetFps.collectAsState()
     val appInfoDone by AppPreferences.appInfoStepDone.collectAsState()
     var postNotifOk by remember {
         mutableStateOf(BitChordListenerService.areNotificationsEnabled(context))
@@ -1589,49 +1284,8 @@ fun LiquidPermissionsScreen(
     }
     var awaitingAppInfoReturn by remember { mutableStateOf(false) }
 
-    var rootTopLeft by remember { mutableStateOf(Offset.Zero) }
-    var badgeRect by remember { mutableStateOf(Rect.Zero) }
-    var card1Rect by remember { mutableStateOf(Rect.Zero) }
-    var card2Rect by remember { mutableStateOf(Rect.Zero) }
-    var card3Rect by remember { mutableStateOf(Rect.Zero) }
-    var btn1Rect by remember { mutableStateOf(Rect.Zero) }
-    var btn2Rect by remember { mutableStateOf(Rect.Zero) }
-    var btn3Rect by remember { mutableStateOf(Rect.Zero) }
-
-    val dropletController = remember { LiquidGlassDropletController() }
-
-    val cardRadiusPx = with(density) { 28.dp.toPx() }
-    val badgeRadiusPx = with(density) { 24.dp.toPx() }
-    val pillRadiusPx = with(density) { 20.dp.toPx() }
-
-    val glassSlots = remember(
-        badgeRect,
-        card1Rect,
-        card2Rect,
-        card3Rect,
-        btn1Rect,
-        btn2Rect,
-        btn3Rect,
-        density.density
-    ) {
-        GlassRectSlots(
-            r0 = badgeRect,
-            rad0 = badgeRadiusPx,
-            r1 = card1Rect,
-            rad1 = cardRadiusPx,
-            r2 = card2Rect,
-            rad2 = cardRadiusPx,
-            r3 = card3Rect,
-            rad3 = cardRadiusPx,
-            r4 = btn1Rect,
-            rad4 = pillRadiusPx,
-            r5 = btn2Rect,
-            rad5 = pillRadiusPx,
-            r6 = btn3Rect,
-            rad6 = pillRadiusPx,
-            overlayMode = 0
-        )
-    }
+    val backdropLayer = rememberGraphicsLayer()
+    var backdropTopLeft by remember { mutableStateOf(Offset.Zero) }
 
     fun recheck() {
         val pOk = BitChordListenerService.areNotificationsEnabled(context)
@@ -1661,117 +1315,120 @@ fun LiquidPermissionsScreen(
         onDispose { owner?.lifecycle?.removeObserver(observer) }
     }
 
-    LiquidGlassBackdropHost(
-        glassSlots = glassSlots,
-        frostedBlurDp = 18.dp,
-        dropletController = dropletController,
-        targetFps = targetFps,
-        onRootPositioned = { rootTopLeft = it },
-        backdropContent = {
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Backdrop registrato una sola volta
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .onGloballyPositioned { backdropTopLeft = it.boundsInRoot().topLeft }
+                .drawWithContent {
+                    backdropLayer.record {
+                        this@drawWithContent.drawContent()
+                    }
+                    drawLayer(backdropLayer)
+                }
+        ) {
             LiquidAmbientBackground(cover = null, palette = CoverPalette())
-        },
-        foregroundContent = {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .statusBarsPadding()
-                    .navigationBarsPadding()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 20.dp, vertical = 28.dp),
-                verticalArrangement = Arrangement.Center,
-                horizontalAlignment = Alignment.CenterHorizontally
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 28.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            LiquidGlassCapsuleBox(
+                backdropLayer = backdropLayer,
+                backdropTopLeft = backdropTopLeft,
+                shape = RoundedCornerShape(24.dp),
+                cornerRadiusDp = 24.dp,
+                blurDp = 16.dp,
+                tintAlpha = 0.22f,
+                elevated = true,
+                modifier = Modifier.size(76.dp)
             ) {
-                // Header pulito in alto con icona bolla testi dentro squircle Liquid Glass
                 Box(
                     contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .size(76.dp)
-                        .onGloballyPositioned {
-                            badgeRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                        }
-                        .clip(RoundedCornerShape(24.dp))
-                        .padding(4.dp)
+                    modifier = Modifier.fillMaxSize().padding(4.dp)
                 ) {
                     DynamicLyricsBubbleGlyph()
                 }
-
-                Spacer(Modifier.height(16.dp))
-
-                Text(
-                    text = "DynamicLyrics",
-                    fontFamily = font,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 28.sp,
-                    letterSpacing = (-0.7).sp,
-                    color = Color.White,
-                    textAlign = TextAlign.Center,
-                    style = GlassTextShadowStyle
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    text = "Attiva i permessi per avviare la pillola Live Island.",
-                    fontFamily = font,
-                    fontWeight = FontWeight.Medium,
-                    fontSize = 14.sp,
-                    letterSpacing = (-0.2).sp,
-                    color = Color.White.copy(alpha = 0.80f),
-                    textAlign = TextAlign.Center,
-                    style = GlassTextShadowStyle
-                )
-
-                Spacer(Modifier.height(28.dp))
-
-                PermissionLiquidGlassCard(
-                    stepNumber = "1",
-                    title = "Notifiche & Pillola",
-                    subtitle = "Consenti notifiche e aggiornamenti live per mostrare la pillola.",
-                    buttonLabel = if (postNotifOk) "Attivo" else "Consenti",
-                    completed = postNotifOk,
-                    font = font,
-                    rootTopLeft = rootTopLeft,
-                    dropletController = dropletController,
-                    onCardRect = { card1Rect = it },
-                    onPillRect = { btn1Rect = it },
-                    onClick = onRequestNotifications
-                )
-
-                Spacer(Modifier.height(14.dp))
-
-                PermissionLiquidGlassCard(
-                    stepNumber = "2",
-                    title = "Info App",
-                    subtitle = "Consenti impostazioni con restrizioni e nessuna limitazione batteria.",
-                    buttonLabel = if (appInfoDone) "Riapri" else "Apri",
-                    completed = appInfoDone,
-                    font = font,
-                    rootTopLeft = rootTopLeft,
-                    dropletController = dropletController,
-                    onCardRect = { card2Rect = it },
-                    onPillRect = { btn2Rect = it },
-                    onClick = {
-                        awaitingAppInfoReturn = true
-                        openAppInfoSettings(context)
-                    }
-                )
-
-                Spacer(Modifier.height(14.dp))
-
-                PermissionLiquidGlassCard(
-                    stepNumber = "3",
-                    title = "Accesso alle notifiche",
-                    subtitle = "Legge il brano in riproduzione e sincronizza i testi in tempo reale.",
-                    buttonLabel = if (listenerGranted) "Attivo" else "Attiva",
-                    completed = listenerGranted,
-                    font = font,
-                    rootTopLeft = rootTopLeft,
-                    dropletController = dropletController,
-                    onCardRect = { card3Rect = it },
-                    onPillRect = { btn3Rect = it },
-                    onClick = { openNotificationListenerSettings(context) }
-                )
             }
+
+            Spacer(Modifier.height(16.dp))
+
+            Text(
+                text = "DynamicLyrics",
+                fontFamily = font,
+                fontWeight = FontWeight.Bold,
+                fontSize = 28.sp,
+                letterSpacing = (-0.7).sp,
+                color = Color.White,
+                textAlign = TextAlign.Center,
+                style = GlassTextShadowStyle
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "Attiva i permessi per avviare la pillola Live Island.",
+                fontFamily = font,
+                fontWeight = FontWeight.Medium,
+                fontSize = 14.sp,
+                letterSpacing = (-0.2).sp,
+                color = Color.White.copy(alpha = 0.80f),
+                textAlign = TextAlign.Center,
+                style = GlassTextShadowStyle
+            )
+
+            Spacer(Modifier.height(28.dp))
+
+            PermissionLiquidGlassCard(
+                stepNumber = "1",
+                title = "Notifiche & Pillola",
+                subtitle = "Consenti notifiche e aggiornamenti live per mostrare la pillola.",
+                buttonLabel = if (postNotifOk) "Attivo" else "Consenti",
+                completed = postNotifOk,
+                font = font,
+                backdropLayer = backdropLayer,
+                backdropTopLeft = backdropTopLeft,
+                onClick = onRequestNotifications
+            )
+
+            Spacer(Modifier.height(14.dp))
+
+            PermissionLiquidGlassCard(
+                stepNumber = "2",
+                title = "Info App",
+                subtitle = "Consenti impostazioni con restrizioni e nessuna limitazione batteria.",
+                buttonLabel = if (appInfoDone) "Riapri" else "Apri",
+                completed = appInfoDone,
+                font = font,
+                backdropLayer = backdropLayer,
+                backdropTopLeft = backdropTopLeft,
+                onClick = {
+                    awaitingAppInfoReturn = true
+                    openAppInfoSettings(context)
+                }
+            )
+
+            Spacer(Modifier.height(14.dp))
+
+            PermissionLiquidGlassCard(
+                stepNumber = "3",
+                title = "Accesso alle notifiche",
+                subtitle = "Legge il brano in riproduzione e sincronizza i testi in tempo reale.",
+                buttonLabel = if (listenerGranted) "Attivo" else "Attiva",
+                completed = listenerGranted,
+                font = font,
+                backdropLayer = backdropLayer,
+                backdropTopLeft = backdropTopLeft,
+                onClick = { openNotificationListenerSettings(context) }
+            )
         }
-    )
+    }
 }
 
 @Composable
@@ -1782,94 +1439,120 @@ private fun PermissionLiquidGlassCard(
     buttonLabel: String,
     completed: Boolean,
     font: FontFamily,
-    rootTopLeft: Offset,
-    dropletController: LiquidGlassDropletController,
-    onCardRect: (Rect) -> Unit,
-    onPillRect: (Rect) -> Unit,
+    backdropLayer: GraphicsLayer,
+    backdropTopLeft: Offset,
     onClick: () -> Unit
 ) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .onGloballyPositioned {
-                onCardRect(it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y))
-            }
-            .clip(RoundedCornerShape(28.dp))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 16.dp)
+    val pillInteraction = remember { MutableInteractionSource() }
+    val pillPressed by pillInteraction.collectIsPressedAsState()
+
+    LiquidGlassCapsuleBox(
+        backdropLayer = backdropLayer,
+        backdropTopLeft = backdropTopLeft,
+        shape = RoundedCornerShape(28.dp),
+        cornerRadiusDp = 28.dp,
+        blurDp = 18.dp,
+        tintAlpha = 0.24f,
+        modifier = Modifier.fillMaxWidth()
     ) {
-        Box(
-            contentAlignment = Alignment.Center,
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
-                .size(40.dp)
-                .clip(CircleShape)
-                .background(
-                    if (completed) Color(0xFF22C55E).copy(alpha = 0.24f)
-                    else Color.White.copy(alpha = 0.10f)
-                )
-                .border(
-                    width = 0.8.dp,
-                    color = if (completed) Color(0xFF86EFAC).copy(alpha = 0.55f) else Color.White.copy(alpha = 0.34f),
-                    shape = CircleShape
-                )
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(28.dp))
+                .clickable(onClick = onClick)
+                .padding(horizontal = 16.dp, vertical = 16.dp)
         ) {
-            if (completed) {
-                CheckIcon(color = Color(0xFF4ADE80), size = 18.dp)
-            } else {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (completed) Color(0xFF22C55E).copy(alpha = 0.24f)
+                        else Color.White.copy(alpha = 0.10f)
+                    )
+                    .border(
+                        width = 0.8.dp,
+                        color = if (completed) Color(0xFF86EFAC).copy(alpha = 0.55f) else Color.White.copy(alpha = 0.34f),
+                        shape = CircleShape
+                    )
+            ) {
+                if (completed) {
+                    CheckIcon(color = Color(0xFF4ADE80), size = 18.dp)
+                } else {
+                    Text(
+                        text = stepNumber,
+                        fontFamily = font,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp,
+                        color = Color.White,
+                        style = GlassTextShadowStyle
+                    )
+                }
+            }
+
+            Spacer(Modifier.width(14.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = stepNumber,
+                    text = title,
                     fontFamily = font,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 15.sp,
+                    fontSize = 16.sp,
+                    letterSpacing = (-0.3).sp,
                     color = Color.White,
+                    style = GlassTextShadowStyle
+                )
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    text = subtitle,
+                    fontFamily = font,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    color = Color.White.copy(alpha = 0.84f),
+                    style = GlassTextShadowStyle
+                )
+            }
+
+            Spacer(Modifier.width(10.dp))
+
+            LiquidDropletOverlay(
+                backdropLayer = backdropLayer,
+                backdropTopLeft = backdropTopLeft,
+                shape = RoundedCornerShape(50),
+                cornerRadiusDp = 19.dp,
+                pressed = pillPressed,
+                tintColor = if (completed) Color(0xFF22C55E).copy(alpha = 0.24f) else Color.Transparent,
+                modifier = Modifier
+                    .size(width = 86.dp, height = 38.dp)
+                    .iosGlassButton(
+                        shape = RoundedCornerShape(50),
+                        elevated = !completed,
+                        pressed = pillPressed
+                    )
+                    .clickable(
+                        interactionSource = pillInteraction,
+                        indication = null,
+                        onClick = onClick
+                    )
+            ) {
+                Text(
+                    text = buttonLabel,
+                    fontFamily = font,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 13.sp,
+                    letterSpacing = (-0.2).sp,
+                    color = if (completed) Color(0xFF86EFAC) else Color.White,
                     style = GlassTextShadowStyle
                 )
             }
         }
-
-        Spacer(Modifier.width(14.dp))
-
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = title,
-                fontFamily = font,
-                fontWeight = FontWeight.Bold,
-                fontSize = 16.sp,
-                letterSpacing = (-0.3).sp,
-                color = Color.White,
-                style = GlassTextShadowStyle
-            )
-            Spacer(Modifier.height(3.dp))
-            Text(
-                text = subtitle,
-                fontFamily = font,
-                fontSize = 12.sp,
-                lineHeight = 16.sp,
-                color = Color.White.copy(alpha = 0.84f),
-                style = GlassTextShadowStyle
-            )
-        }
-
-        Spacer(Modifier.width(10.dp))
-
-        LiquidGlassDetachedPill(
-            label = buttonLabel,
-            font = font,
-            width = 86.dp,
-            height = 38.dp,
-            tintColor = if (completed) Color(0xFF22C55E).copy(alpha = 0.24f) else Color.Transparent,
-            labelColor = if (completed) Color(0xFF86EFAC) else Color.White,
-            rootTopLeft = rootTopLeft,
-            dropletController = dropletController,
-            onRectMeasured = onPillRect,
-            onClick = onClick
-        )
     }
 }
 
 // ------------------------------------------------------------
-// 8. Player Lyrics iOS 26 (Top Capsula + Cerchi Staccati + Dock Snello)
+// 8. Player Lyrics iOS 26 (Capsule Staccate + Maschera StatusBar DstIn)
 // ------------------------------------------------------------
 private fun findLiquidLineIndex(lines: List<LyricLine>, posMs: Long): Int {
     var low = 0
@@ -1894,7 +1577,6 @@ fun LiquidGlassLyricsPlayerScreen(
     onClose: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
-    val density = LocalDensity.current
     val title by LyricsPlaybackStore.title.collectAsState()
     val artist by LyricsPlaybackStore.artist.collectAsState()
     val cover by LyricsPlaybackStore.cover.collectAsState()
@@ -1911,85 +1593,8 @@ fun LiquidGlassLyricsPlayerScreen(
     var showSettingsSheet by remember { mutableStateOf(false) }
     var statusBannerText by remember { mutableStateOf<String?>(null) }
 
-    var rootTopLeft by remember { mutableStateOf(Offset.Zero) }
-    var topCapsuleRect by remember { mutableStateOf(Rect.Zero) }
-    var closeCircleRect by remember { mutableStateOf(Rect.Zero) }
-    var menuCircleRect by remember { mutableStateOf(Rect.Zero) }
-    var progressPillRect by remember { mutableStateOf(Rect.Zero) }
-    var syncMinusPillRect by remember { mutableStateOf(Rect.Zero) }
-    var mediaCapsuleRect by remember { mutableStateOf(Rect.Zero) }
-    var syncPlusPillRect by remember { mutableStateOf(Rect.Zero) }
-    var quickLaunchRect by remember { mutableStateOf(Rect.Zero) }
-    var overlayRect by remember { mutableStateOf(Rect.Zero) }
-    var overlayRadiusDp by remember { mutableStateOf(26.dp) }
-
-    val dropletController = remember { LiquidGlassDropletController() }
-
-    LaunchedEffect(menuExpanded, showSettingsSheet) {
-        if (!menuExpanded && !showSettingsSheet) {
-            overlayRect = Rect.Zero
-        }
-    }
-
-    LaunchedEffect(lines.isEmpty(), title) {
-        if (lines.isNotEmpty() || title.isNotBlank()) {
-            quickLaunchRect = Rect.Zero
-        }
-    }
-
-    val capsuleRadiusPx = with(density) { 29.dp.toPx() }
-    val topCircleRadiusPx = with(density) { 26.dp.toPx() }
-    val progressRadiusPx = with(density) { 19.dp.toPx() }
-    val auxSlot7Rect = when {
-        showSettingsSheet || menuExpanded -> overlayRect
-        lines.isEmpty() && title.isBlank() -> quickLaunchRect
-        else -> Rect.Zero
-    }
-    val auxSlot7RadiusPx = when {
-        showSettingsSheet || menuExpanded -> with(density) { overlayRadiusDp.toPx() }
-        else -> with(density) { 25.dp.toPx() }
-    }
-    val overlayMode = when {
-        showSettingsSheet -> 2
-        menuExpanded -> 1
-        else -> 0
-    }
-
-    val glassSlots = remember(
-        topCapsuleRect,
-        closeCircleRect,
-        menuCircleRect,
-        progressPillRect,
-        syncMinusPillRect,
-        mediaCapsuleRect,
-        syncPlusPillRect,
-        auxSlot7Rect,
-        auxSlot7RadiusPx,
-        overlayMode,
-        showCloseButton,
-        showSettingsSheet,
-        density.density
-    ) {
-        GlassRectSlots(
-            r0 = if (showSettingsSheet) Rect.Zero else topCapsuleRect,
-            rad0 = topCircleRadiusPx,
-            r1 = if (showSettingsSheet || !showCloseButton) Rect.Zero else closeCircleRect,
-            rad1 = topCircleRadiusPx,
-            r2 = if (showSettingsSheet) Rect.Zero else menuCircleRect,
-            rad2 = topCircleRadiusPx,
-            r3 = if (showSettingsSheet) Rect.Zero else progressPillRect,
-            rad3 = progressRadiusPx,
-            r4 = if (showSettingsSheet) Rect.Zero else syncMinusPillRect,
-            rad4 = capsuleRadiusPx,
-            r5 = if (showSettingsSheet) Rect.Zero else mediaCapsuleRect,
-            rad5 = capsuleRadiusPx,
-            r6 = if (showSettingsSheet) Rect.Zero else syncPlusPillRect,
-            rad6 = capsuleRadiusPx,
-            r7 = auxSlot7Rect,
-            rad7 = auxSlot7RadiusPx,
-            overlayMode = overlayMode
-        )
-    }
+    val backdropLayer = rememberGraphicsLayer()
+    var backdropTopLeft by remember { mutableStateOf(Offset.Zero) }
 
     DisposableEffect(context) {
         val owner = context as? LifecycleOwner
@@ -2017,10 +1622,11 @@ fun LiquidGlassLyricsPlayerScreen(
     val rawPosState = remember { mutableLongStateOf(LyricsPlaybackStore.rawPositionMs()) }
     var activeIndex by remember(lines) { mutableIntStateOf(-1) }
     var forceNextLineSync by remember { mutableStateOf(true) }
+    var lyricTransitionTick by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(syncOffsetMs) { forceNextLineSync = true }
 
-    // Cadenza esatta sincronizzata al blocco 30 / 60 / 120 FPS scelto dall'utente
+    // Pacing esatto per word-sync e progress in base a 30 / 60 / 120 FPS
     LaunchedEffect(isPlaying, syncOffsetMs, basePositionMs, lines, targetFps) {
         val activeFrameIntervalMs = when (targetFps) {
             TargetFps.FPS_30 -> 33L
@@ -2075,17 +1681,48 @@ fun LiquidGlassLyricsPlayerScreen(
         }
     }
 
+    // Durante i 240ms di transizione testo/alpha tiene sincronizzati i layer vetro per-capsula
+    LaunchedEffect(activeIndex, targetFps) {
+        val step = when (targetFps) {
+            TargetFps.FPS_30 -> 33L
+            TargetFps.FPS_60 -> 16L
+            TargetFps.FPS_120 -> 8L
+        }
+        val endMs = SystemClock.uptimeMillis() + 260L
+        while (SystemClock.uptimeMillis() < endMs) {
+            lyricTransitionTick++
+            delay(step)
+        }
+    }
+
+    val backdropInvalidator: () -> Any = {
+        listState.firstVisibleItemIndex +
+            listState.firstVisibleItemScrollOffset +
+            rawPosState.longValue +
+            currentPosState.longValue +
+            lyricTransitionTick +
+            activeIndex +
+            title.length +
+            artist.length +
+            (if (coverBitmap != null) 1 else 0)
+    }
+
     val statusBarTopDp = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val navBarBottomDp = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
-    LiquidGlassBackdropHost(
-        glassSlots = glassSlots,
-        frostedBlurDp = if (showSettingsSheet || menuExpanded) 21.dp else 15.dp,
-        dropletController = dropletController,
-        targetFps = targetFps,
-        backdropDimAlpha = if (showSettingsSheet) 0.34f else 0f,
-        onRootPositioned = { rootTopLeft = it },
-        backdropContent = {
+    Box(modifier = Modifier.fillMaxSize()) {
+        // STRATO 0 (BACKDROP UNICO): Sfondo + Testi con dissolvenza pulita prima di status bar / nav bar
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .onGloballyPositioned { backdropTopLeft = it.boundsInRoot().topLeft }
+                .drawWithContent {
+                    backdropLayer.record {
+                        this@drawWithContent.drawContent()
+                    }
+                    drawLayer(backdropLayer)
+                }
+        ) {
             LiquidAmbientBackground(cover = cover, palette = palette)
 
             if (lines.isEmpty()) {
@@ -2126,117 +1763,125 @@ fun LiquidGlassLyricsPlayerScreen(
                     )
                 }
             } else {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(
-                        top = statusBarTopDp + 94.dp,
-                        bottom = navBarBottomDp + 142.dp,
-                        start = 24.dp,
-                        end = 24.dp
-                    ),
-                    verticalArrangement = Arrangement.spacedBy(22.dp)
+                // Maschera Offscreen + BlendMode.DstIn: i testi sfumano prima della status bar
+                // restando nitidi e visibili dietro Top Bar e Dock inferiore
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
+                        .drawWithContent {
+                            drawContent()
+                            val h = size.height.coerceAtLeast(1f)
+                            val statusTopPx = statusBarTopDp.toPx()
+                            val topZeroY = (statusTopPx * 0.62f).coerceAtLeast(1f)
+                            val topFullY = (statusTopPx + 14.dp.toPx()).coerceAtLeast(topZeroY + 4f)
+                            val topStartStop = (topZeroY / h).coerceIn(0.001f, 0.22f)
+                            val topEndStop = (topFullY / h).coerceIn(topStartStop + 0.005f, 0.28f)
+
+                            val navBotPx = navBarBottomDp.toPx()
+                            val botFullY = (h - navBotPx - 12.dp.toPx()).coerceAtLeast(topFullY + 20f)
+                            val botZeroY = (h - navBotPx * 0.35f).coerceAtLeast(botFullY + 4f)
+                            val botStartStop = (botFullY / h).coerceIn(topEndStop + 0.05f, 0.98f)
+                            val botEndStop = (botZeroY / h).coerceIn(botStartStop + 0.005f, 0.999f)
+
+                            drawRect(
+                                brush = Brush.verticalGradient(
+                                    0.0f to Color.Transparent,
+                                    topStartStop to Color.Transparent,
+                                    topEndStop to Color.Black,
+                                    botStartStop to Color.Black,
+                                    botEndStop to Color.Transparent,
+                                    1.0f to Color.Transparent
+                                ),
+                                blendMode = BlendMode.DstIn
+                            )
+                        }
                 ) {
-                    itemsIndexed(
-                        items = lines,
-                        key = { idx, line -> "${idx}_${line.startMs}" }
-                    ) { idx, line ->
-                        LiquidLyricLineItem(
-                            line = line,
-                            isActive = idx == activeIndex,
-                            font = font,
-                            currentPosProvider = { currentPosState.longValue },
-                            onClick = {
-                                forceNextLineSync = true
-                                activeIndex = idx
-                                LyricsPlaybackStore.onSeekTo?.invoke(
-                                    (line.startMs - syncOffsetMs).coerceAtLeast(0L)
-                                )
-                            }
-                        )
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            top = statusBarTopDp + 94.dp,
+                            bottom = navBarBottomDp + 142.dp,
+                            start = 24.dp,
+                            end = 24.dp
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(22.dp)
+                    ) {
+                        itemsIndexed(
+                            items = lines,
+                            key = { idx, line -> "${idx}_${line.startMs}" }
+                        ) { idx, line ->
+                            LiquidLyricLineItem(
+                                line = line,
+                                isActive = idx == activeIndex,
+                                font = font,
+                                currentPosProvider = { currentPosState.longValue },
+                                onClick = {
+                                    forceNextLineSync = true
+                                    activeIndex = idx
+                                    LyricsPlaybackStore.onSeekTo?.invoke(
+                                        (line.startMs - syncOffsetMs).coerceAtLeast(0L)
+                                    )
+                                }
+                            )
+                        }
                     }
                 }
             }
+        }
 
-            // Sfumature pulite sotto status bar e gesture bar
+        // Dim morbido solo dietro il modale Impostazioni (senza sporcare il vetro della sheet)
+        val dimAlpha by animateFloatAsState(
+            targetValue = if (showSettingsSheet) 0.36f else 0f,
+            animationSpec = tween(180),
+            label = "sheetDim"
+        )
+        if (dimAlpha > 0.01f) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .fillMaxWidth()
-                    .windowInsetsTopHeight(WindowInsets.statusBars)
-                    .background(
-                        Brush.verticalGradient(
-                            0.0f to Color.Black.copy(alpha = 0.56f),
-                            1.0f to Color.Transparent
-                        )
-                    )
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = dimAlpha))
             )
+        }
+
+        // CTA AVVIO RAPIDO LIQUID GLASS QUANDO NON C'È MUSICA ATTIVA
+        if (lines.isEmpty() && title.isBlank() && !showSettingsSheet && !menuExpanded) {
+            val launchLabel = if (preferredPlayer == PreferredPlayer.AUTO) {
+                "Avvia Player"
+            } else {
+                "Avvia ${preferredPlayer.label}"
+            }
+            val ctaInteraction = remember { MutableInteractionSource() }
+            val ctaPressed by ctaInteraction.collectIsPressedAsState()
+
             Box(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .windowInsetsBottomHeight(WindowInsets.navigationBars)
-                    .background(
-                        Brush.verticalGradient(
-                            0.0f to Color.Transparent,
-                            1.0f to Color.Black.copy(alpha = 0.44f)
-                        )
-                    )
-            )
-        },
-        foregroundContent = {
-            // CTA AVVIO RAPIDO LIQUID GLASS QUANDO NON C'È MUSICA ATTIVA
-            if (lines.isEmpty() && title.isBlank() && !showSettingsSheet && !menuExpanded) {
-                val launchLabel = if (preferredPlayer == PreferredPlayer.AUTO) {
-                    "Avvia Player"
-                } else {
-                    "Avvia ${preferredPlayer.label}"
-                }
-                Box(
+                    .align(Alignment.Center)
+                    .padding(top = 110.dp)
+            ) {
+                LiquidGlassCapsuleBox(
+                    backdropLayer = backdropLayer,
+                    backdropTopLeft = backdropTopLeft,
+                    shape = RoundedCornerShape(50),
+                    cornerRadiusDp = 25.dp,
+                    blurDp = 16.dp,
+                    tintAlpha = 0.22f,
+                    pressed = ctaPressed,
+                    elevated = true,
+                    backdropInvalidator = backdropInvalidator,
                     modifier = Modifier
-                        .align(Alignment.Center)
-                        .padding(top = 110.dp)
+                        .height(50.dp)
+                        .clickable(
+                            interactionSource = ctaInteraction,
+                            indication = null,
+                            onClick = { BitChordListenerService.triggerPlayPreferred(context) }
+                        )
                 ) {
-                    var ctaRect by remember { mutableStateOf(Rect.Zero) }
-                    val ctaRadiusPx = with(density) { 25.dp.toPx() }
-                    val ctaInteraction = remember { MutableInteractionSource() }
-                    val ctaPressed by ctaInteraction.collectIsPressedAsState()
-
-                    LaunchedEffect(ctaPressed, ctaRect) {
-                        if (ctaPressed && !ctaRect.isEmpty) {
-                            dropletController.press(ctaRect, ctaRadiusPx)
-                        } else {
-                            dropletController.releaseIfOwned(ctaRect)
-                        }
-                    }
-
-                    val ctaScale by animateFloatAsState(
-                        targetValue = if (ctaPressed) 1.07f else 1f,
-                        animationSpec = spring(dampingRatio = 0.52f, stiffness = 460f),
-                        label = "quickLaunchDrop"
-                    )
-
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
-                            .height(50.dp)
-                            .onGloballyPositioned { coords ->
-                                val old = ctaRect
-                                val measured = coords.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                                ctaRect = measured
-                                quickLaunchRect = measured
-                                dropletController.updateGeometryIfOwned(old, measured, ctaRadiusPx)
-                            }
-                            .graphicsLayer {
-                                scaleX = ctaScale
-                                scaleY = ctaScale
-                            }
-                            .clip(RoundedCornerShape(50))
-                            .clickable(
-                                interactionSource = ctaInteraction,
-                                indication = null,
-                                onClick = { BitChordListenerService.triggerPlayPreferred(context) }
-                            )
+                            .fillMaxHeight()
                             .padding(horizontal = 22.dp)
                     ) {
                         PlayIcon(size = 16.dp)
@@ -2253,8 +1898,10 @@ fun LiquidGlassLyricsPlayerScreen(
                     }
                 }
             }
+        }
 
-            // TOP BAR A DUE MODULI STACCATI (Capsula + Cerchi fluttuanti da 10.dp di stacco)
+        // STRATO 1: TOP BAR A MODULI STACCATI (Capsula + Cerchi da 52dp con stacco 10dp)
+        if (!showSettingsSheet) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
@@ -2262,116 +1909,149 @@ fun LiquidGlassLyricsPlayerScreen(
                     .statusBarsPadding()
                     .padding(horizontal = 16.dp, vertical = 10.dp)
                     .fillMaxWidth()
-                    .graphicsLayer { alpha = if (showSettingsSheet) 0f else 1f }
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
+                LiquidGlassCapsuleBox(
+                    backdropLayer = backdropLayer,
+                    backdropTopLeft = backdropTopLeft,
+                    shape = RoundedCornerShape(50),
+                    cornerRadiusDp = 26.dp,
+                    blurDp = 16.dp,
+                    tintAlpha = 0.22f,
+                    backdropInvalidator = backdropInvalidator,
                     modifier = Modifier
                         .weight(1f)
                         .height(52.dp)
-                        .onGloballyPositioned {
-                            topCapsuleRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                        }
-                        .clip(RoundedCornerShape(50))
-                        .padding(horizontal = 8.dp)
                 ) {
-                    if (coverBitmap != null) {
-                        Image(
-                            bitmap = coverBitmap,
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(CircleShape)
-                                .border(0.75.dp, Color.White.copy(alpha = 0.48f), CircleShape)
-                        )
-                    } else {
-                        Box(
-                            contentAlignment = Alignment.Center,
-                            modifier = Modifier
-                                .size(36.dp)
-                                .iosGlassButton(CircleShape, elevated = false)
-                        ) {
-                            MiniWaveIcon(size = 17.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 8.dp)
+                    ) {
+                        if (coverBitmap != null) {
+                            Image(
+                                bitmap = coverBitmap,
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(CircleShape)
+                                    .border(0.75.dp, Color.White.copy(alpha = 0.48f), CircleShape)
+                            )
+                        } else {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .iosGlassButton(CircleShape, elevated = false)
+                            ) {
+                                MiniWaveIcon(size = 17.dp)
+                            }
                         }
-                    }
 
-                    Spacer(Modifier.width(10.dp))
+                        Spacer(Modifier.width(10.dp))
 
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = title.ifBlank { "DynamicLyrics" },
-                            fontFamily = font,
-                            color = Color.White,
-                            fontSize = 14.sp,
-                            letterSpacing = (-0.35).sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = GlassTextShadowStyle
-                        )
-                        Text(
-                            text = artist.ifBlank { "Player: ${preferredPlayer.label}" },
-                            fontFamily = font,
-                            color = Color.White.copy(alpha = 0.82f),
-                            fontSize = 11.5.sp,
-                            letterSpacing = (-0.15).sp,
-                            fontWeight = FontWeight.Medium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = GlassTextShadowStyle
-                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = title.ifBlank { "DynamicLyrics" },
+                                fontFamily = font,
+                                color = Color.White,
+                                fontSize = 14.sp,
+                                letterSpacing = (-0.35).sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = GlassTextShadowStyle
+                            )
+                            Text(
+                                text = artist.ifBlank { "Player: ${preferredPlayer.label}" },
+                                fontFamily = font,
+                                color = Color.White.copy(alpha = 0.82f),
+                                fontSize = 11.5.sp,
+                                letterSpacing = (-0.15).sp,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = GlassTextShadowStyle
+                            )
+                        }
+                        Spacer(Modifier.width(6.dp))
                     }
-                    Spacer(Modifier.width(6.dp))
                 }
 
                 if (showCloseButton && onClose != null) {
                     Spacer(Modifier.width(10.dp))
-                    LiquidGlassDetachedCircle(
-                        size = 52.dp,
-                        enabled = !showSettingsSheet,
-                        rootTopLeft = rootTopLeft,
-                        dropletController = dropletController,
-                        onRectMeasured = { closeCircleRect = it },
-                        onClick = onClose
+                    val closeInteraction = remember { MutableInteractionSource() }
+                    val closePressed by closeInteraction.collectIsPressedAsState()
+
+                    LiquidGlassCapsuleBox(
+                        backdropLayer = backdropLayer,
+                        backdropTopLeft = backdropTopLeft,
+                        shape = CircleShape,
+                        cornerRadiusDp = 26.dp,
+                        blurDp = 16.dp,
+                        tintAlpha = 0.22f,
+                        pressed = closePressed,
+                        backdropInvalidator = backdropInvalidator,
+                        modifier = Modifier
+                            .size(52.dp)
+                            .clickable(
+                                interactionSource = closeInteraction,
+                                indication = null,
+                                onClick = onClose
+                            )
                     ) {
-                        CloseIcon(size = 14.dp)
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                            CloseIcon(size = 14.dp)
+                        }
                     }
                 }
 
                 Spacer(Modifier.width(10.dp))
 
-                LiquidGlassDetachedCircle(
-                    size = 52.dp,
-                    enabled = !showSettingsSheet,
+                val menuInteraction = remember { MutableInteractionSource() }
+                val menuPressed by menuInteraction.collectIsPressedAsState()
+
+                LiquidGlassCapsuleBox(
+                    backdropLayer = backdropLayer,
+                    backdropTopLeft = backdropTopLeft,
+                    shape = CircleShape,
+                    cornerRadiusDp = 26.dp,
+                    blurDp = 16.dp,
+                    tintAlpha = 0.22f,
+                    pressed = menuPressed,
                     elevated = menuExpanded,
-                    rootTopLeft = rootTopLeft,
-                    dropletController = dropletController,
-                    onRectMeasured = { menuCircleRect = it },
-                    onClick = { menuExpanded = !menuExpanded }
+                    backdropInvalidator = backdropInvalidator,
+                    modifier = Modifier
+                        .size(52.dp)
+                        .clickable(
+                            interactionSource = menuInteraction,
+                            indication = null,
+                            onClick = { menuExpanded = !menuExpanded }
+                        )
                 ) {
-                    HamburgerIcon(size = 18.dp)
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                        HamburgerIcon(size = 18.dp)
+                    }
                 }
             }
 
-            // BOTTOM DOCK SNELLE A DUE LIVELLI (Mini-Scrubber + Capsula Controlli + Pillole Sync)
+            // STRATO 2: BOTTOM DOCK SNELLE A 2 LIVELLI (Mini-Scrubber + Capsula Media + Pillole Sync)
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
                     .padding(horizontal = 16.dp, vertical = 10.dp)
                     .fillMaxWidth()
-                    .graphicsLayer { alpha = if (showSettingsSheet) 0f else 1f }
             ) {
                 LiquidScrubberMiniPill(
                     durationMs = durationMs,
                     syncOffsetMs = syncOffsetMs,
                     font = font,
-                    enabled = !showSettingsSheet,
-                    rootTopLeft = rootTopLeft,
-                    dropletController = dropletController,
+                    backdropLayer = backdropLayer,
+                    backdropTopLeft = backdropTopLeft,
+                    backdropInvalidator = backdropInvalidator,
                     rawPosProvider = { rawPosState.longValue },
-                    onPillMeasured = { progressPillRect = it },
                     onResetSync = {
                         val defOffset = AppPreferences.defaultSyncOffsetMs.value
                         LyricsPlaybackStore.syncOffsetMs.value = defOffset
@@ -2386,135 +2066,215 @@ fun LiquidGlassLyricsPlayerScreen(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    LiquidGlassDetachedPill(
-                        label = "-0.5s",
-                        font = font,
-                        width = 64.dp,
-                        height = 58.dp,
-                        enabled = !showSettingsSheet,
-                        rootTopLeft = rootTopLeft,
-                        dropletController = dropletController,
-                        onRectMeasured = { syncMinusPillRect = it },
-                        onClick = { LyricsPlaybackStore.syncOffsetMs.value -= 500L }
-                    )
+                    val minusInteraction = remember { MutableInteractionSource() }
+                    val minusPressed by minusInteraction.collectIsPressedAsState()
 
-                    Spacer(Modifier.width(10.dp))
-
-                    Row(
+                    LiquidGlassCapsuleBox(
+                        backdropLayer = backdropLayer,
+                        backdropTopLeft = backdropTopLeft,
+                        shape = RoundedCornerShape(50),
+                        cornerRadiusDp = 29.dp,
+                        blurDp = 16.dp,
+                        tintAlpha = 0.22f,
+                        pressed = minusPressed,
+                        backdropInvalidator = backdropInvalidator,
                         modifier = Modifier
-                            .weight(1f)
-                            .height(58.dp)
-                            .onGloballyPositioned {
-                                mediaCapsuleRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                            }
-                            .clip(RoundedCornerShape(50))
-                            .padding(horizontal = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically
+                            .size(width = 64.dp, height = 58.dp)
+                            .clickable(
+                                interactionSource = minusInteraction,
+                                indication = null,
+                                onClick = { LyricsPlaybackStore.syncOffsetMs.value -= 500L }
+                            )
                     ) {
-                        LiquidGlassCapsuleMediaControl(
-                            width = 44.dp,
-                            height = 44.dp,
-                            elevated = false,
-                            enabled = !showSettingsSheet,
-                            rootTopLeft = rootTopLeft,
-                            dropletController = dropletController,
-                            onClick = { LyricsPlaybackStore.onPrevious?.invoke() }
-                        ) {
-                            SkipPrevIcon(size = 18.dp)
-                        }
-
-                        LiquidGlassCapsuleMediaControl(
-                            width = 62.dp,
-                            height = 46.dp,
-                            elevated = true,
-                            enabled = !showSettingsSheet,
-                            rootTopLeft = rootTopLeft,
-                            dropletController = dropletController,
-                            onClick = {
-                                val handler = LyricsPlaybackStore.onPlayPause
-                                if (handler != null) {
-                                    handler.invoke()
-                                } else {
-                                    BitChordListenerService.triggerPlayPreferred(context)
-                                }
-                            }
-                        ) {
-                            if (isPlaying) PauseIcon(size = 22.dp) else PlayIcon(size = 22.dp)
-                        }
-
-                        LiquidGlassCapsuleMediaControl(
-                            width = 44.dp,
-                            height = 44.dp,
-                            elevated = false,
-                            enabled = !showSettingsSheet,
-                            rootTopLeft = rootTopLeft,
-                            dropletController = dropletController,
-                            onClick = { LyricsPlaybackStore.onNext?.invoke() }
-                        ) {
-                            SkipNextIcon(size = 18.dp)
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                            Text(
+                                text = "-0.5s",
+                                fontFamily = font,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp,
+                                letterSpacing = (-0.2).sp,
+                                color = Color.White,
+                                style = GlassTextShadowStyle
+                            )
                         }
                     }
 
                     Spacer(Modifier.width(10.dp))
 
-                    LiquidGlassDetachedPill(
-                        label = "+0.5s",
-                        font = font,
-                        width = 64.dp,
-                        height = 58.dp,
-                        enabled = !showSettingsSheet,
-                        rootTopLeft = rootTopLeft,
-                        dropletController = dropletController,
-                        onRectMeasured = { syncPlusPillRect = it },
-                        onClick = { LyricsPlaybackStore.syncOffsetMs.value += 500L }
-                    )
-                }
-            }
+                    LiquidGlassCapsuleBox(
+                        backdropLayer = backdropLayer,
+                        backdropTopLeft = backdropTopLeft,
+                        shape = RoundedCornerShape(50),
+                        cornerRadiusDp = 29.dp,
+                        blurDp = 16.dp,
+                        tintAlpha = 0.22f,
+                        backdropInvalidator = backdropInvalidator,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(58.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(horizontal = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            val prevInteraction = remember { MutableInteractionSource() }
+                            val prevPressed by prevInteraction.collectIsPressedAsState()
+                            LiquidDropletOverlay(
+                                backdropLayer = backdropLayer,
+                                backdropTopLeft = backdropTopLeft,
+                                shape = CircleShape,
+                                cornerRadiusDp = 22.dp,
+                                pressed = prevPressed,
+                                backdropInvalidator = backdropInvalidator,
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .iosGlassButton(CircleShape, elevated = false, pressed = prevPressed)
+                                    .clickable(
+                                        interactionSource = prevInteraction,
+                                        indication = null,
+                                        onClick = { LyricsPlaybackStore.onPrevious?.invoke() }
+                                    )
+                            ) {
+                                SkipPrevIcon(size = 18.dp)
+                            }
 
-            // POPOVER MENU HAMBURGER
-            if (menuExpanded) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null
-                        ) { menuExpanded = false }
-                )
-            }
+                            val playInteraction = remember { MutableInteractionSource() }
+                            val playPressed by playInteraction.collectIsPressedAsState()
+                            LiquidDropletOverlay(
+                                backdropLayer = backdropLayer,
+                                backdropTopLeft = backdropTopLeft,
+                                shape = RoundedCornerShape(50),
+                                cornerRadiusDp = 23.dp,
+                                pressed = playPressed,
+                                backdropInvalidator = backdropInvalidator,
+                                modifier = Modifier
+                                    .size(width = 62.dp, height = 46.dp)
+                                    .iosGlassButton(RoundedCornerShape(50), elevated = true, pressed = playPressed)
+                                    .clickable(
+                                        interactionSource = playInteraction,
+                                        indication = null,
+                                        onClick = {
+                                            val handler = LyricsPlaybackStore.onPlayPause
+                                            if (handler != null) {
+                                                handler.invoke()
+                                            } else {
+                                                BitChordListenerService.triggerPlayPreferred(context)
+                                            }
+                                        }
+                                    )
+                            ) {
+                                if (isPlaying) PauseIcon(size = 22.dp) else PlayIcon(size = 22.dp)
+                            }
 
-            AnimatedVisibility(
-                visible = menuExpanded,
-                enter = fadeIn(tween(150)) + scaleIn(
-                    initialScale = 0.88f,
-                    transformOrigin = TransformOrigin(1f, 0f),
-                    animationSpec = spring(dampingRatio = 0.78f, stiffness = 520f)
-                ),
-                exit = fadeOut(tween(130)) + scaleOut(
-                    targetScale = 0.90f,
-                    transformOrigin = TransformOrigin(1f, 0f)
-                ),
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .statusBarsPadding()
-                    .padding(top = 72.dp, end = 16.dp)
-            ) {
-                val granted = BitChordListenerService.isNotificationAccessGranted(context)
-                val serviceConnected by BitChordListenerService.isServiceConnected.collectAsState()
-                val activeNow = granted && serviceConnected
-
-                Column(
-                    modifier = Modifier
-                        .width(236.dp)
-                        .onGloballyPositioned {
-                            if (menuExpanded) {
-                                overlayRadiusDp = 26.dp
-                                overlayRect = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
+                            val nextInteraction = remember { MutableInteractionSource() }
+                            val nextPressed by nextInteraction.collectIsPressedAsState()
+                            LiquidDropletOverlay(
+                                backdropLayer = backdropLayer,
+                                backdropTopLeft = backdropTopLeft,
+                                shape = CircleShape,
+                                cornerRadiusDp = 22.dp,
+                                pressed = nextPressed,
+                                backdropInvalidator = backdropInvalidator,
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .iosGlassButton(CircleShape, elevated = false, pressed = nextPressed)
+                                    .clickable(
+                                        interactionSource = nextInteraction,
+                                        indication = null,
+                                        onClick = { LyricsPlaybackStore.onNext?.invoke() }
+                                    )
+                            ) {
+                                SkipNextIcon(size = 18.dp)
                             }
                         }
-                        .clip(RoundedCornerShape(26.dp))
-                        .padding(8.dp),
+                    }
+
+                    Spacer(Modifier.width(10.dp))
+
+                    val plusInteraction = remember { MutableInteractionSource() }
+                    val plusPressed by plusInteraction.collectIsPressedAsState()
+
+                    LiquidGlassCapsuleBox(
+                        backdropLayer = backdropLayer,
+                        backdropTopLeft = backdropTopLeft,
+                        shape = RoundedCornerShape(50),
+                        cornerRadiusDp = 29.dp,
+                        blurDp = 16.dp,
+                        tintAlpha = 0.22f,
+                        pressed = plusPressed,
+                        backdropInvalidator = backdropInvalidator,
+                        modifier = Modifier
+                            .size(width = 64.dp, height = 58.dp)
+                            .clickable(
+                                interactionSource = plusInteraction,
+                                indication = null,
+                                onClick = { LyricsPlaybackStore.syncOffsetMs.value += 500L }
+                            )
+                    ) {
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                            Text(
+                                text = "+0.5s",
+                                fontFamily = font,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp,
+                                letterSpacing = (-0.2).sp,
+                                color = Color.White,
+                                style = GlassTextShadowStyle
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // STRATO 3: POPOVER MENU HAMBURGER
+        if (menuExpanded) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) { menuExpanded = false }
+            )
+        }
+
+        AnimatedVisibility(
+            visible = menuExpanded,
+            enter = fadeIn(tween(150)) + scaleIn(
+                initialScale = 0.88f,
+                transformOrigin = TransformOrigin(1f, 0f),
+                animationSpec = spring(dampingRatio = 0.78f, stiffness = 520f)
+            ),
+            exit = fadeOut(tween(130)) + scaleOut(
+                targetScale = 0.90f,
+                transformOrigin = TransformOrigin(1f, 0f)
+            ),
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .statusBarsPadding()
+                .padding(top = 72.dp, end = 16.dp)
+        ) {
+            val granted = BitChordListenerService.isNotificationAccessGranted(context)
+            val serviceConnected by BitChordListenerService.isServiceConnected.collectAsState()
+            val activeNow = granted && serviceConnected
+
+            LiquidGlassCapsuleBox(
+                backdropLayer = backdropLayer,
+                backdropTopLeft = backdropTopLeft,
+                shape = RoundedCornerShape(26.dp),
+                cornerRadiusDp = 26.dp,
+                blurDp = 22.dp,
+                tintAlpha = 0.45f,
+                elevated = true,
+                backdropInvalidator = backdropInvalidator,
+                modifier = Modifier.width(236.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(8.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Row(
@@ -2584,8 +2344,6 @@ fun LiquidGlassLyricsPlayerScreen(
                             .clip(RoundedCornerShape(18.dp))
                             .clickable {
                                 menuExpanded = false
-                                overlayRect = Rect.Zero
-                                dropletController.releaseAny()
                                 showSettingsSheet = true
                             }
                             .padding(horizontal = 12.dp, vertical = 11.dp)
@@ -2618,62 +2376,54 @@ fun LiquidGlassLyricsPlayerScreen(
                     }
                 }
             }
+        }
 
-            // TOAST DI CONFERMA
-            AnimatedVisibility(
-                visible = statusBannerText != null,
-                enter = fadeIn(tween(180)) + slideInVertically { -it / 2 },
-                exit = fadeOut(tween(180)) + slideOutVertically { -it / 2 },
+        // TOAST DI CONFERMA
+        AnimatedVisibility(
+            visible = statusBannerText != null,
+            enter = fadeIn(tween(180)) + slideInVertically { -it / 2 },
+            exit = fadeOut(tween(180)) + slideOutVertically { -it / 2 },
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(top = 74.dp, start = 24.dp, end = 24.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .padding(top = 74.dp, start = 24.dp, end = 24.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(Color(0xFF0A261D).copy(alpha = 0.74f))
+                    .iosGlassButton(RoundedCornerShape(50), elevated = true)
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(Color(0xFF0A261D).copy(alpha = 0.68f))
-                        .iosGlassButton(RoundedCornerShape(50), elevated = true)
-                        .padding(horizontal = 16.dp, vertical = 10.dp)
-                ) {
-                    CheckIcon(color = Color(0xFF4ADE80), size = 16.dp)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = statusBannerText.orEmpty(),
-                        fontFamily = font,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 13.sp,
-                        color = Color.White
-                    )
-                }
-            }
-
-            // PANNELLO IMPOSTAZIONI & VERIFICA STATO LIQUID GLASS
-            AnimatedVisibility(
-                visible = showSettingsSheet,
-                enter = fadeIn(tween(180)),
-                exit = fadeOut(tween(180)),
-                modifier = Modifier.fillMaxSize()
-            ) {
-                LiquidSettingsModal(
-                    font = font,
-                    rootTopLeft = rootTopLeft,
-                    dropletController = dropletController,
-                    onSheetPositioned = { rect ->
-                        if (showSettingsSheet) {
-                            overlayRadiusDp = 36.dp
-                            overlayRect = rect.translate(-rootTopLeft.x, -rootTopLeft.y)
-                        }
-                    },
-                    onDismiss = {
-                        dropletController.releaseAny()
-                        showSettingsSheet = false
-                    }
+                CheckIcon(color = Color(0xFF4ADE80), size = 16.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = statusBannerText.orEmpty(),
+                    fontFamily = font,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 13.sp,
+                    color = Color.White
                 )
             }
         }
-    )
+
+        // PANNELLO IMPOSTAZIONI & VERIFICA STATO LIQUID GLASS
+        AnimatedVisibility(
+            visible = showSettingsSheet,
+            enter = fadeIn(tween(180)),
+            exit = fadeOut(tween(180)),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            LiquidSettingsModal(
+                font = font,
+                backdropLayer = backdropLayer,
+                backdropTopLeft = backdropTopLeft,
+                backdropInvalidator = backdropInvalidator,
+                onDismiss = { showSettingsSheet = false }
+            )
+        }
+    }
 }
 
 @Composable
@@ -2681,163 +2431,166 @@ private fun LiquidScrubberMiniPill(
     durationMs: Long,
     syncOffsetMs: Long,
     font: FontFamily,
-    enabled: Boolean,
-    rootTopLeft: Offset,
-    dropletController: LiquidGlassDropletController,
+    backdropLayer: GraphicsLayer,
+    backdropTopLeft: Offset,
+    backdropInvalidator: () -> Any,
     rawPosProvider: () -> Long,
-    onPillMeasured: (Rect) -> Unit,
     onResetSync: () -> Unit
 ) {
     val density = LocalDensity.current
     val safeDuration = durationMs.coerceAtLeast(1L)
     var isDragging by remember { mutableStateOf(false) }
     var dragFraction by remember { mutableFloatStateOf(0f) }
-    var trackBounds by remember { mutableStateOf(Rect.Zero) }
+    var trackWidthPx by remember { mutableFloatStateOf(1f) }
 
     val rawPosMs = rawPosProvider()
     val liveFraction = (rawPosMs.toFloat() / safeDuration.toFloat()).coerceIn(0f, 1f)
     val shownFraction = if (isDragging) dragFraction else liveFraction
     val shownTimeMs = if (isDragging) (dragFraction * safeDuration).toLong() else rawPosMs
 
-    val dropletHalfW = with(density) { 18.dp.toPx() }
-    val dropletHalfH = with(density) { 13.dp.toPx() }
-    val dropletRadiusPx = with(density) { 13.dp.toPx() }
-
-    fun updateScrubberDroplet(fraction: Float, active: Boolean) {
-        if (!active || trackBounds.isEmpty) {
-            dropletController.releaseAny()
-            return
-        }
-        val cx = trackBounds.left + trackBounds.width * fraction.coerceIn(0f, 1f)
-        val cy = trackBounds.center.y
-        val thumbRect = Rect(
-            left = cx - dropletHalfW,
-            top = cy - dropletHalfH,
-            right = cx + dropletHalfW,
-            bottom = cy + dropletHalfH
-        )
-        dropletController.press(thumbRect, dropletRadiusPx)
-    }
-
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
+    LiquidGlassCapsuleBox(
+        backdropLayer = backdropLayer,
+        backdropTopLeft = backdropTopLeft,
+        shape = RoundedCornerShape(50),
+        cornerRadiusDp = 19.dp,
+        blurDp = 16.dp,
+        tintAlpha = 0.22f,
+        backdropInvalidator = backdropInvalidator,
         modifier = Modifier
             .fillMaxWidth()
             .height(38.dp)
-            .onGloballyPositioned {
-                onPillMeasured(it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y))
-            }
-            .clip(RoundedCornerShape(50))
-            .padding(horizontal = 14.dp)
     ) {
-        Text(
-            text = formatPlayerTime(shownTimeMs),
-            fontFamily = font,
-            fontWeight = FontWeight.Medium,
-            color = Color.White.copy(alpha = 0.88f),
-            fontSize = 11.sp,
-            style = GlassTextShadowStyle
-        )
-
-        Spacer(Modifier.width(10.dp))
-
-        Box(
-            contentAlignment = Alignment.Center,
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
-                .weight(1f)
-                .fillMaxHeight()
-                .onGloballyPositioned {
-                    trackBounds = it.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                }
-                .pointerInput(safeDuration, enabled) {
-                    if (!enabled) return@pointerInput
-                    awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        down.consume()
-                        val w = size.width.toFloat().coerceAtLeast(1f)
-                        isDragging = true
-                        dragFraction = (down.position.x / w).coerceIn(0f, 1f)
-                        updateScrubberDroplet(dragFraction, true)
-
-                        var pointerId = down.id
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull { it.id == pointerId }
-                                ?: event.changes.firstOrNull()
-                            if (change == null || !change.pressed) {
-                                change?.consume()
-                                break
-                            }
-                            pointerId = change.id
-                            if (change.positionChange() != Offset.Zero) {
-                                change.consume()
-                            }
-                            dragFraction = (change.position.x / w).coerceIn(0f, 1f)
-                            updateScrubberDroplet(dragFraction, true)
-                        }
-
-                        val targetSeekMs = (dragFraction * safeDuration).toLong().coerceIn(0L, safeDuration)
-                        updateScrubberDroplet(dragFraction, false)
-                        isDragging = false
-                        LyricsPlaybackStore.onSeekTo?.invoke(targetSeekMs)
-                    }
-                }
+                .fillMaxSize()
+                .padding(horizontal = 14.dp)
         ) {
-            Canvas(modifier = Modifier.fillMaxWidth().height(16.dp)) {
-                val trackH = if (isDragging) 6.dp.toPx() else 4.dp.toPx()
-                val cy = size.height / 2f
-                val corner = CornerRadius(trackH / 2f, trackH / 2f)
+            Text(
+                text = formatPlayerTime(shownTimeMs),
+                fontFamily = font,
+                fontWeight = FontWeight.Medium,
+                color = Color.White.copy(alpha = 0.88f),
+                fontSize = 11.sp,
+                style = GlassTextShadowStyle
+            )
 
-                drawRoundRect(
-                    color = Color.White.copy(alpha = 0.24f),
-                    topLeft = Offset(0f, cy - trackH / 2f),
-                    size = Size(size.width, trackH),
-                    cornerRadius = corner
-                )
-                val activeW = (size.width * shownFraction).coerceIn(0f, size.width)
-                if (activeW > 0.5f) {
+            Spacer(Modifier.width(10.dp))
+
+            Box(
+                contentAlignment = Alignment.CenterStart,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .onGloballyPositioned { trackWidthPx = it.size.width.toFloat().coerceAtLeast(1f) }
+                    .pointerInput(safeDuration) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            down.consume()
+                            val w = size.width.toFloat().coerceAtLeast(1f)
+                            isDragging = true
+                            dragFraction = (down.position.x / w).coerceIn(0f, 1f)
+
+                            var pointerId = down.id
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == pointerId }
+                                    ?: event.changes.firstOrNull()
+                                if (change == null || !change.pressed) {
+                                    change?.consume()
+                                    break
+                                }
+                                pointerId = change.id
+                                if (change.positionChange() != Offset.Zero) {
+                                    change.consume()
+                                }
+                                dragFraction = (change.position.x / w).coerceIn(0f, 1f)
+                            }
+
+                            val targetSeekMs = (dragFraction * safeDuration).toLong().coerceIn(0L, safeDuration)
+                            isDragging = false
+                            LyricsPlaybackStore.onSeekTo?.invoke(targetSeekMs)
+                        }
+                    }
+            ) {
+                Canvas(modifier = Modifier.fillMaxWidth().height(16.dp)) {
+                    val trackH = if (isDragging) 6.dp.toPx() else 4.dp.toPx()
+                    val cy = size.height / 2f
+                    val corner = CornerRadius(trackH / 2f, trackH / 2f)
+
                     drawRoundRect(
-                        color = Color.White,
+                        color = Color.White.copy(alpha = 0.24f),
                         topLeft = Offset(0f, cy - trackH / 2f),
-                        size = Size(activeW, trackH),
+                        size = Size(size.width, trackH),
                         cornerRadius = corner
                     )
+                    val activeW = (size.width * shownFraction).coerceIn(0f, size.width)
+                    if (activeW > 0.5f) {
+                        drawRoundRect(
+                            color = Color.White,
+                            topLeft = Offset(0f, cy - trackH / 2f),
+                            size = Size(activeW, trackH),
+                            cornerRadius = corner
+                        )
+                    }
+                    val thumbR = if (isDragging) 6.5.dp.toPx() else 4.dp.toPx()
+                    drawCircle(
+                        color = Color.White,
+                        radius = thumbR,
+                        center = Offset(activeW.coerceIn(thumbR, (size.width - thumbR).coerceAtLeast(thumbR)), cy)
+                    )
                 }
-                val thumbR = if (isDragging) 6.5.dp.toPx() else 4.dp.toPx()
-                drawCircle(
-                    color = Color.White,
-                    radius = thumbR,
-                    center = Offset(activeW.coerceIn(thumbR, (size.width - thumbR).coerceAtLeast(thumbR)), cy)
-                )
+
+                // Goccia liquida cristallina sotto il pollice durante il trascinamento
+                if (isDragging) {
+                    val dropW = 34.dp
+                    val dropWPx = with(density) { dropW.toPx() }
+                    val offsetX = (trackWidthPx * shownFraction - dropWPx / 2f)
+                        .roundToInt()
+                        .coerceIn(0, (trackWidthPx - dropWPx).roundToInt().coerceAtLeast(0))
+
+                    LiquidDropletOverlay(
+                        backdropLayer = backdropLayer,
+                        backdropTopLeft = backdropTopLeft,
+                        shape = RoundedCornerShape(50),
+                        cornerRadiusDp = 12.dp,
+                        pressed = true,
+                        backdropInvalidator = backdropInvalidator,
+                        modifier = Modifier
+                            .offset { IntOffset(offsetX, 0) }
+                            .size(width = dropW, height = 24.dp)
+                            .iosGlassButton(RoundedCornerShape(50), elevated = true, pressed = true)
+                    ) {}
+                }
             }
+
+            Spacer(Modifier.width(8.dp))
+
+            val sign = if (syncOffsetMs >= 0L) "+" else ""
+            Text(
+                text = String.format(Locale.US, "Sync %s%.1fs", sign, syncOffsetMs / 1000f),
+                fontFamily = font,
+                color = Color.White.copy(alpha = 0.92f),
+                fontSize = 10.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                style = GlassTextShadowStyle,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .clickable(onClick = onResetSync)
+                    .padding(horizontal = 4.dp, vertical = 2.dp)
+            )
+
+            Spacer(Modifier.width(8.dp))
+
+            Text(
+                text = formatPlayerTime(durationMs),
+                fontFamily = font,
+                fontWeight = FontWeight.Medium,
+                color = Color.White.copy(alpha = 0.88f),
+                fontSize = 11.sp,
+                style = GlassTextShadowStyle
+            )
         }
-
-        Spacer(Modifier.width(8.dp))
-
-        val sign = if (syncOffsetMs >= 0L) "+" else ""
-        Text(
-            text = String.format(Locale.US, "Sync %s%.1fs", sign, syncOffsetMs / 1000f),
-            fontFamily = font,
-            color = Color.White.copy(alpha = 0.92f),
-            fontSize = 10.5.sp,
-            fontWeight = FontWeight.SemiBold,
-            style = GlassTextShadowStyle,
-            modifier = Modifier
-                .clip(RoundedCornerShape(50))
-                .clickable(enabled = enabled, onClick = onResetSync)
-                .padding(horizontal = 4.dp, vertical = 2.dp)
-        )
-
-        Spacer(Modifier.width(8.dp))
-
-        Text(
-            text = formatPlayerTime(durationMs),
-            fontFamily = font,
-            fontWeight = FontWeight.Medium,
-            color = Color.White.copy(alpha = 0.88f),
-            fontSize = 11.sp,
-            style = GlassTextShadowStyle
-        )
     }
 }
 
@@ -2914,29 +2667,29 @@ private fun LiquidLyricLineItem(
 }
 
 // ------------------------------------------------------------
-// 9. Modale Impostazioni & Verifica Stato (con blocco 30/60/120 FPS + Choreographer)
+// 9. Modale Impostazioni & Verifica Stato (con Diagnostica Shader & FPS Reali)
 // ------------------------------------------------------------
 @Composable
 private fun LiquidSettingsModal(
     font: FontFamily,
-    rootTopLeft: Offset,
-    dropletController: LiquidGlassDropletController,
-    onSheetPositioned: (Rect) -> Unit,
+    backdropLayer: GraphicsLayer,
+    backdropTopLeft: Offset,
+    backdropInvalidator: () -> Any,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     val composeView = LocalView.current
-    val density = LocalDensity.current
     val preferredPlayer by AppPreferences.preferredPlayer.collectAsState()
     val defaultOffsetMs by AppPreferences.defaultSyncOffsetMs.collectAsState()
     val targetFps by AppPreferences.targetFps.collectAsState()
     val activePkg by LyricsPlaybackStore.activePlayerPackage.collectAsState()
     val lastPkg by AppPreferences.lastActiveMusicPackage.collectAsState()
+    val shaderError by LiquidGlassDiagnostics.lastShaderError.collectAsState()
 
     val notifGranted = BitChordListenerService.isNotificationAccessGranted(context)
     val postNotifOk = BitChordListenerService.areNotificationsEnabled(context)
     val serviceAlive by BitChordListenerService.isServiceConnected.collectAsState()
-    val (measuredFps, displayHz) = rememberFrameRateTelemetry()
+    val (appFps, displayHz) = rememberFrameRateTelemetry(targetFps)
 
     Box(
         modifier = Modifier
@@ -2948,393 +2701,390 @@ private fun LiquidSettingsModal(
             ),
         contentAlignment = Alignment.BottomCenter
     ) {
-        Column(
+        LiquidGlassCapsuleBox(
+            backdropLayer = backdropLayer,
+            backdropTopLeft = backdropTopLeft,
+            shape = RoundedCornerShape(36.dp),
+            cornerRadiusDp = 36.dp,
+            blurDp = 22.dp,
+            tintAlpha = 0.48f,
+            elevated = true,
+            backdropInvalidator = backdropInvalidator,
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
                 .navigationBarsPadding()
                 .padding(horizontal = 14.dp, vertical = 14.dp)
-                .onGloballyPositioned { onSheetPositioned(it.boundsInRoot()) }
-                .clip(RoundedCornerShape(36.dp))
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = {}
-                )
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 20.dp)
         ) {
-            Box(
+            Column(
                 modifier = Modifier
-                    .align(Alignment.CenterHorizontally)
-                    .padding(bottom = 12.dp)
-                    .size(width = 36.dp, height = 4.dp)
-                    .clip(RoundedCornerShape(50))
-                    .background(Color.White.copy(alpha = 0.42f))
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(36.dp))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {}
+                    )
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 20.dp)
             ) {
-                Text(
-                    text = "Impostazioni & Stato",
-                    fontFamily = font,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 20.sp,
-                    letterSpacing = (-0.5).sp,
-                    color = Color.White
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.CenterHorizontally)
+                        .padding(bottom = 12.dp)
+                        .size(width = 36.dp, height = 4.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(Color.White.copy(alpha = 0.42f))
                 )
-                GlassCircleIconButton(
-                    size = 34.dp,
-                    elevated = false,
-                    rootTopLeft = rootTopLeft,
-                    dropletController = dropletController,
-                    onClick = onDismiss
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    CloseIcon(size = 13.dp)
-                }
-            }
-
-            Spacer(Modifier.height(18.dp))
-
-            // SEZIONE 1: VERIFICA SISTEMA
-            Text(
-                text = "VERIFICA SISTEMA",
-                fontFamily = font,
-                fontWeight = FontWeight.Bold,
-                fontSize = 11.sp,
-                letterSpacing = 0.8.sp,
-                color = Color.White.copy(alpha = 0.62f)
-            )
-            Spacer(Modifier.height(10.dp))
-
-            DiagnosticRow(
-                label = "Notifiche & Pillola",
-                status = if (postNotifOk) "Attivo" else "Richiesto",
-                ok = postNotifOk,
-                font = font,
-                onClick = { openAppNotificationSettings(context) }
-            )
-            Spacer(Modifier.height(8.dp))
-            DiagnosticRow(
-                label = "Accesso alle notifiche",
-                status = if (notifGranted) "Attivo" else "Richiesto",
-                ok = notifGranted,
-                font = font,
-                onClick = { openNotificationListenerSettings(context) }
-            )
-            Spacer(Modifier.height(8.dp))
-            DiagnosticRow(
-                label = "Servizio DynamicLyrics",
-                status = if (serviceAlive) "Attivo" else "Riaggancia",
-                ok = serviceAlive,
-                font = font,
-                onClick = {
-                    if (serviceAlive) {
-                        BitChordListenerService.ensureConnected(context, forceRepublish = true)
-                    } else {
-                        BitChordListenerService.forceHardRebind(context)
-                    }
-                }
-            )
-            Spacer(Modifier.height(8.dp))
-            DiagnosticRow(
-                label = "Info App & Batteria",
-                status = "Apri impostazioni",
-                ok = AppPreferences.appInfoStepDone.collectAsState().value,
-                font = font,
-                onClick = { openAppInfoSettings(context) }
-            )
-            Spacer(Modifier.height(8.dp))
-            DiagnosticRow(
-                label = "Player rilevato",
-                status = activePkg.ifBlank { lastPkg.ifBlank { "In attesa di musica" } },
-                ok = activePkg.isNotBlank() || lastPkg.isNotBlank(),
-                font = font,
-                onClick = { BitChordListenerService.ensureConnected(context, forceRepublish = true) }
-            )
-
-            Spacer(Modifier.height(22.dp))
-
-            // SEZIONE 2: BLOCCO FRAME RATE (30 / 60 / 120 FPS)
-            Text(
-                text = "BLOCCO FRAME RATE (FPS)",
-                fontFamily = font,
-                fontWeight = FontWeight.Bold,
-                fontSize = 11.sp,
-                letterSpacing = 0.8.sp,
-                color = Color.White.copy(alpha = 0.62f)
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = "Predefinito: 60 FPS. Scegli 30 per massima batteria o 120 per fluidità massima.",
-                fontFamily = font,
-                fontSize = 12.sp,
-                color = Color.White.copy(alpha = 0.72f)
-            )
-            Spacer(Modifier.height(10.dp))
-
-            val chipRadiusPx = with(density) { 21.dp.toPx() }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                TargetFps.entries.forEach { option ->
-                    val selected = option == targetFps
-                    var chipRect by remember { mutableStateOf(Rect.Zero) }
-                    val interaction = remember { MutableInteractionSource() }
-                    val pressed by interaction.collectIsPressedAsState()
-
-                    LaunchedEffect(pressed, chipRect) {
-                        if (pressed && !chipRect.isEmpty) {
-                            dropletController.press(chipRect, chipRadiusPx)
-                        } else {
-                            dropletController.releaseIfOwned(chipRect)
-                        }
-                    }
-
-                    val chipScale by animateFloatAsState(
-                        targetValue = if (pressed) 1.06f else 1f,
-                        animationSpec = spring(dampingRatio = 0.52f, stiffness = 460f),
-                        label = "fpsChipDrop"
-                    )
-
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .weight(1f)
-                            .onGloballyPositioned { coords ->
-                                val old = chipRect
-                                val measured = coords.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                                chipRect = measured
-                                dropletController.updateGeometryIfOwned(old, measured, chipRadiusPx)
-                            }
-                            .graphicsLayer {
-                                scaleX = chipScale
-                                scaleY = chipScale
-                            }
-                            .iosGlassButton(
-                                shape = RoundedCornerShape(50),
-                                elevated = selected,
-                                pressed = pressed,
-                                transparentForDroplet = true
-                            )
-                            .background(
-                                if (selected && !pressed) Color(0xFF6366F1).copy(alpha = 0.46f)
-                                else Color.Transparent
-                            )
-                            .clickable(
-                                interactionSource = interaction,
-                                indication = null
-                            ) {
-                                AppPreferences.setTargetFps(context, option)
-                                (context as? Activity)?.let {
-                                    applyFrameRateToComposeView(composeView, it, option.fps)
-                                }
-                            }
-                            .padding(vertical = 11.dp)
-                    ) {
-                        Text(
-                            text = option.label,
-                            fontFamily = font,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                            fontSize = 13.sp,
-                            letterSpacing = (-0.2).sp,
-                            color = Color.White
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(8.dp))
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .iosGlassButton(RoundedCornerShape(14.dp), elevated = false)
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(
-                                if (measuredFps > 0 && abs(measuredFps - targetFps.fps) <= 6) Color(0xFF4ADE80)
-                                else Color(0xFF93C5FD)
-                            )
-                    )
-                    Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "Display: ${displayHz} Hz • Reali: ${if (measuredFps > 0) "$measuredFps FPS" else "…"}",
-                        fontFamily = font,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 12.sp,
-                        color = Color.White
-                    )
-                }
-                Text(
-                    text = "Target ${targetFps.fps}",
-                    fontFamily = font,
-                    fontSize = 11.sp,
-                    color = Color.White.copy(alpha = 0.74f)
-                )
-            }
-
-            Spacer(Modifier.height(22.dp))
-
-            // SEZIONE 3: PLAYER PREDEFINITO
-            Text(
-                text = "PLAYER PREDEFINITO (TASTO PLAY)",
-                fontFamily = font,
-                fontWeight = FontWeight.Bold,
-                fontSize = 11.sp,
-                letterSpacing = 0.8.sp,
-                color = Color.White.copy(alpha = 0.62f)
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = "Automatico usa sempre l'ultima app musicale avviata senza risvegliare Spotify.",
-                fontFamily = font,
-                fontSize = 12.sp,
-                color = Color.White.copy(alpha = 0.72f)
-            )
-            Spacer(Modifier.height(10.dp))
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                PreferredPlayer.entries.forEach { player ->
-                    val selected = player == preferredPlayer
-                    var playerRect by remember { mutableStateOf(Rect.Zero) }
-                    val interaction = remember { MutableInteractionSource() }
-                    val pressed by interaction.collectIsPressedAsState()
-
-                    LaunchedEffect(pressed, playerRect) {
-                        if (pressed && !playerRect.isEmpty) {
-                            dropletController.press(playerRect, chipRadiusPx)
-                        } else {
-                            dropletController.releaseIfOwned(playerRect)
-                        }
-                    }
-
-                    val chipScale by animateFloatAsState(
-                        targetValue = if (pressed) 1.06f else 1f,
-                        animationSpec = spring(dampingRatio = 0.52f, stiffness = 460f),
-                        label = "playerChipDrop"
-                    )
-
-                    Box(
-                        modifier = Modifier
-                            .onGloballyPositioned { coords ->
-                                val old = playerRect
-                                val measured = coords.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                                playerRect = measured
-                                dropletController.updateGeometryIfOwned(old, measured, chipRadiusPx)
-                            }
-                            .graphicsLayer {
-                                scaleX = chipScale
-                                scaleY = chipScale
-                            }
-                            .iosGlassButton(
-                                RoundedCornerShape(50),
-                                elevated = selected,
-                                pressed = pressed,
-                                transparentForDroplet = true
-                            )
-                            .background(
-                                if (selected && !pressed) Color(0xFF6366F1).copy(alpha = 0.46f)
-                                else Color.Transparent
-                            )
-                            .clickable(
-                                interactionSource = interaction,
-                                indication = null
-                            ) {
-                                AppPreferences.setPreferredPlayer(context, player)
-                                BitChordListenerService.ensureConnected(context, forceRepublish = true)
-                            }
-                            .padding(horizontal = 14.dp, vertical = 10.dp)
-                    ) {
-                        Text(
-                            text = player.label,
-                            fontFamily = font,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                            fontSize = 13.sp,
-                            color = Color.White
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(22.dp))
-
-            // SEZIONE 4: OFFSET PREDEFINITO
-            Text(
-                text = "OFFSET PREDEFINITO",
-                fontFamily = font,
-                fontWeight = FontWeight.Bold,
-                fontSize = 11.sp,
-                letterSpacing = 0.8.sp,
-                color = Color.White.copy(alpha = 0.62f)
-            )
-            Spacer(Modifier.height(10.dp))
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .iosGlassButton(RoundedCornerShape(22.dp), elevated = false)
-                    .padding(horizontal = 14.dp, vertical = 10.dp)
-            ) {
-                GlassPillTextButton(
-                    label = "-0.1s",
-                    font = font,
-                    rootTopLeft = rootTopLeft,
-                    dropletController = dropletController,
-                    onClick = { AppPreferences.setDefaultSyncOffsetMs(context, defaultOffsetMs - 100L) }
-                )
-
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    val sign = if (defaultOffsetMs >= 0L) "+" else ""
-                    Text(
-                        text = String.format(Locale.US, "%s%.1fs", sign, defaultOffsetMs / 1000f),
+                        text = "Impostazioni & Stato",
                         fontFamily = font,
                         fontWeight = FontWeight.Bold,
-                        fontSize = 18.sp,
-                        letterSpacing = (-0.4).sp,
+                        fontSize = 20.sp,
+                        letterSpacing = (-0.5).sp,
                         color = Color.White
                     )
-                    if (defaultOffsetMs != AppPreferences.FACTORY_DEFAULT_OFFSET_MS) {
-                        Text(
-                            text = "Ripristina +0.6s",
-                            fontFamily = font,
-                            fontSize = 11.sp,
-                            color = Color(0xFF93C5FD),
-                            modifier = Modifier.clickable {
-                                AppPreferences.setDefaultSyncOffsetMs(
-                                    context,
-                                    AppPreferences.FACTORY_DEFAULT_OFFSET_MS
-                                )
-                            }
-                        )
+                    GlassCircleIconButton(
+                        size = 34.dp,
+                        elevated = false,
+                        backdropLayer = backdropLayer,
+                        backdropTopLeft = backdropTopLeft,
+                        backdropInvalidator = backdropInvalidator,
+                        onClick = onDismiss
+                    ) {
+                        CloseIcon(size = 13.dp)
                     }
                 }
 
-                GlassPillTextButton(
-                    label = "+0.1s",
-                    font = font,
-                    rootTopLeft = rootTopLeft,
-                    dropletController = dropletController,
-                    onClick = { AppPreferences.setDefaultSyncOffsetMs(context, defaultOffsetMs + 100L) }
+                // Avviso visibile rosso se RuntimeShader o RenderEffect fallisce su questo dispositivo
+                if (shaderError != null) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = "Shader Liquid Glass non attivo: $shaderError",
+                        fontFamily = font,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFFFCA5A5),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0xFFEF4444).copy(alpha = 0.24f))
+                            .border(0.8.dp, Color(0xFFF87171).copy(alpha = 0.55f), RoundedCornerShape(14.dp))
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
+
+                Spacer(Modifier.height(18.dp))
+
+                // SEZIONE 1: VERIFICA SISTEMA
+                Text(
+                    text = "VERIFICA SISTEMA",
+                    fontFamily = font,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    letterSpacing = 0.8.sp,
+                    color = Color.White.copy(alpha = 0.62f)
                 )
+                Spacer(Modifier.height(10.dp))
+
+                DiagnosticRow(
+                    label = "Notifiche & Pillola",
+                    status = if (postNotifOk) "Attivo" else "Richiesto",
+                    ok = postNotifOk,
+                    font = font,
+                    onClick = { openAppNotificationSettings(context) }
+                )
+                Spacer(Modifier.height(8.dp))
+                DiagnosticRow(
+                    label = "Accesso alle notifiche",
+                    status = if (notifGranted) "Attivo" else "Richiesto",
+                    ok = notifGranted,
+                    font = font,
+                    onClick = { openNotificationListenerSettings(context) }
+                )
+                Spacer(Modifier.height(8.dp))
+                DiagnosticRow(
+                    label = "Servizio DynamicLyrics",
+                    status = if (serviceAlive) "Attivo" else "Riaggancia",
+                    ok = serviceAlive,
+                    font = font,
+                    onClick = {
+                        if (serviceAlive) {
+                            BitChordListenerService.ensureConnected(context, forceRepublish = true)
+                        } else {
+                            BitChordListenerService.forceHardRebind(context)
+                        }
+                    }
+                )
+                Spacer(Modifier.height(8.dp))
+                DiagnosticRow(
+                    label = "Info App & Batteria",
+                    status = "Apri impostazioni",
+                    ok = AppPreferences.appInfoStepDone.collectAsState().value,
+                    font = font,
+                    onClick = { openAppInfoSettings(context) }
+                )
+                Spacer(Modifier.height(8.dp))
+                DiagnosticRow(
+                    label = "Player rilevato",
+                    status = activePkg.ifBlank { lastPkg.ifBlank { "In attesa di musica" } },
+                    ok = activePkg.isNotBlank() || lastPkg.isNotBlank(),
+                    font = font,
+                    onClick = { BitChordListenerService.ensureConnected(context, forceRepublish = true) }
+                )
+
+                Spacer(Modifier.height(22.dp))
+
+                // SEZIONE 2: BLOCCO FRAME RATE (30 / 60 / 120 FPS)
+                Text(
+                    text = "BLOCCO FRAME RATE (FPS)",
+                    fontFamily = font,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    letterSpacing = 0.8.sp,
+                    color = Color.White.copy(alpha = 0.62f)
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Predefinito: 60 FPS. Scegli 30 per massima batteria o 120 per fluidità massima.",
+                    fontFamily = font,
+                    fontSize = 12.sp,
+                    color = Color.White.copy(alpha = 0.72f)
+                )
+                Spacer(Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    TargetFps.entries.forEach { option ->
+                        val selected = option == targetFps
+                        val interaction = remember { MutableInteractionSource() }
+                        val pressed by interaction.collectIsPressedAsState()
+
+                        LiquidDropletOverlay(
+                            backdropLayer = backdropLayer,
+                            backdropTopLeft = backdropTopLeft,
+                            shape = RoundedCornerShape(50),
+                            cornerRadiusDp = 21.dp,
+                            pressed = pressed,
+                            tintColor = if (selected) Color(0xFF6366F1).copy(alpha = 0.46f) else Color.Transparent,
+                            backdropInvalidator = backdropInvalidator,
+                            modifier = Modifier
+                                .weight(1f)
+                                .iosGlassButton(
+                                    shape = RoundedCornerShape(50),
+                                    elevated = selected,
+                                    pressed = pressed
+                                )
+                                .clickable(
+                                    interactionSource = interaction,
+                                    indication = null
+                                ) {
+                                    AppPreferences.setTargetFps(context, option)
+                                    (context as? Activity)?.let {
+                                        applyFrameRateToComposeView(composeView, it, option.fps)
+                                    }
+                                }
+                                .padding(vertical = 11.dp)
+                        ) {
+                            Text(
+                                text = option.label,
+                                fontFamily = font,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                fontSize = 13.sp,
+                                letterSpacing = (-0.2).sp,
+                                color = Color.White
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .iosGlassButton(RoundedCornerShape(14.dp), elevated = false)
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    if (appFps > 0 && abs(appFps - targetFps.fps) <= 6) Color(0xFF4ADE80)
+                                    else Color(0xFF93C5FD)
+                                )
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "Display: ${displayHz} Hz • App: ${if (appFps > 0) "$appFps FPS" else "…"}",
+                            fontFamily = font,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp,
+                            color = Color.White
+                        )
+                    }
+                    Text(
+                        text = "Target ${targetFps.fps}",
+                        fontFamily = font,
+                        fontSize = 11.sp,
+                        color = Color.White.copy(alpha = 0.74f)
+                    )
+                }
+
+                if (targetFps.fps < 120 && displayHz >= 115) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "Suggerimento: imposta frequenza su Predefinita in HyperOS per scendere anche a 60 Hz hardware.",
+                        fontFamily = font,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        color = Color(0xFFFDE68A).copy(alpha = 0.90f),
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    )
+                }
+
+                Spacer(Modifier.height(22.dp))
+
+                // SEZIONE 3: PLAYER PREDEFINITO
+                Text(
+                    text = "PLAYER PREDEFINITO (TASTO PLAY)",
+                    fontFamily = font,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    letterSpacing = 0.8.sp,
+                    color = Color.White.copy(alpha = 0.62f)
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Automatico usa sempre l'ultima app musicale avviata senza risvegliare Spotify.",
+                    fontFamily = font,
+                    fontSize = 12.sp,
+                    color = Color.White.copy(alpha = 0.72f)
+                )
+                Spacer(Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    PreferredPlayer.entries.forEach { player ->
+                        val selected = player == preferredPlayer
+                        val interaction = remember { MutableInteractionSource() }
+                        val pressed by interaction.collectIsPressedAsState()
+
+                        LiquidDropletOverlay(
+                            backdropLayer = backdropLayer,
+                            backdropTopLeft = backdropTopLeft,
+                            shape = RoundedCornerShape(50),
+                            cornerRadiusDp = 20.dp,
+                            pressed = pressed,
+                            tintColor = if (selected) Color(0xFF6366F1).copy(alpha = 0.46f) else Color.Transparent,
+                            backdropInvalidator = backdropInvalidator,
+                            modifier = Modifier
+                                .iosGlassButton(
+                                    RoundedCornerShape(50),
+                                    elevated = selected,
+                                    pressed = pressed
+                                )
+                                .clickable(
+                                    interactionSource = interaction,
+                                    indication = null
+                                ) {
+                                    AppPreferences.setPreferredPlayer(context, player)
+                                    BitChordListenerService.ensureConnected(context, forceRepublish = true)
+                                }
+                                .padding(horizontal = 14.dp, vertical = 10.dp)
+                        ) {
+                            Text(
+                                text = player.label,
+                                fontFamily = font,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                fontSize = 13.sp,
+                                color = Color.White
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(22.dp))
+
+                // SEZIONE 4: OFFSET PREDEFINITO
+                Text(
+                    text = "OFFSET PREDEFINITO",
+                    fontFamily = font,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    letterSpacing = 0.8.sp,
+                    color = Color.White.copy(alpha = 0.62f)
+                )
+                Spacer(Modifier.height(10.dp))
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .iosGlassButton(RoundedCornerShape(22.dp), elevated = false)
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                ) {
+                    GlassPillTextButton(
+                        label = "-0.1s",
+                        font = font,
+                        backdropLayer = backdropLayer,
+                        backdropTopLeft = backdropTopLeft,
+                        backdropInvalidator = backdropInvalidator,
+                        onClick = { AppPreferences.setDefaultSyncOffsetMs(context, defaultOffsetMs - 100L) }
+                    )
+
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        val sign = if (defaultOffsetMs >= 0L) "+" else ""
+                        Text(
+                            text = String.format(Locale.US, "%s%.1fs", sign, defaultOffsetMs / 1000f),
+                            fontFamily = font,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 18.sp,
+                            letterSpacing = (-0.4).sp,
+                            color = Color.White
+                        )
+                        if (defaultOffsetMs != AppPreferences.FACTORY_DEFAULT_OFFSET_MS) {
+                            Text(
+                                text = "Ripristina +0.6s",
+                                fontFamily = font,
+                                fontSize = 11.sp,
+                                color = Color(0xFF93C5FD),
+                                modifier = Modifier.clickable {
+                                    AppPreferences.setDefaultSyncOffsetMs(
+                                        context,
+                                        AppPreferences.FACTORY_DEFAULT_OFFSET_MS
+                                    )
+                                }
+                            )
+                        }
+                    }
+
+                    GlassPillTextButton(
+                        label = "+0.1s",
+                        font = font,
+                        backdropLayer = backdropLayer,
+                        backdropTopLeft = backdropTopLeft,
+                        backdropInvalidator = backdropInvalidator,
+                        onClick = { AppPreferences.setDefaultSyncOffsetMs(context, defaultOffsetMs + 100L) }
+                    )
+                }
             }
         }
     }
@@ -3393,73 +3143,69 @@ private fun DiagnosticRow(
 }
 
 // ------------------------------------------------------------
-// 10. Pulsanti Interattivi con Goccia Liquida & Icone
+// 10. Pulsanti Modale & Icone Vector
 // ------------------------------------------------------------
 @Composable
 private fun GlassPillTextButton(
     label: String,
     font: FontFamily,
-    rootTopLeft: Offset = Offset.Zero,
-    dropletController: LiquidGlassDropletController? = null,
+    backdropLayer: GraphicsLayer? = null,
+    backdropTopLeft: Offset = Offset.Zero,
+    backdropInvalidator: () -> Any = { Unit },
     onClick: () -> Unit
 ) {
-    val density = LocalDensity.current
-    var localRect by remember { mutableStateOf(Rect.Zero) }
-    val radiusPx = with(density) { 18.dp.toPx() }
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
 
-    LaunchedEffect(pressed, localRect) {
-        if (dropletController != null) {
-            if (pressed && !localRect.isEmpty) {
-                dropletController.press(localRect, radiusPx)
-            } else {
-                dropletController.releaseIfOwned(localRect)
-            }
+    if (backdropLayer != null) {
+        LiquidDropletOverlay(
+            backdropLayer = backdropLayer,
+            backdropTopLeft = backdropTopLeft,
+            shape = RoundedCornerShape(50),
+            cornerRadiusDp = 18.dp,
+            pressed = pressed,
+            backdropInvalidator = backdropInvalidator,
+            modifier = Modifier
+                .iosGlassButton(RoundedCornerShape(50), elevated = pressed, pressed = pressed)
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = null,
+                    onClick = onClick
+                )
+                .padding(horizontal = 12.dp, vertical = 9.dp)
+        ) {
+            Text(
+                text = label,
+                fontFamily = font,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 13.sp,
+                letterSpacing = (-0.2).sp,
+                color = Color.White,
+                style = GlassTextShadowStyle
+            )
         }
-    }
-
-    val scale by animateFloatAsState(
-        targetValue = if (pressed) 1.07f else 1f,
-        animationSpec = spring(dampingRatio = 0.52f, stiffness = 480f),
-        label = "pillScale"
-    )
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .onGloballyPositioned { coords ->
-                val old = localRect
-                val measured = coords.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                localRect = measured
-                dropletController?.updateGeometryIfOwned(old, measured, radiusPx)
-            }
-            .graphicsLayer {
-                scaleX = scale
-                scaleY = scale
-            }
-            .iosGlassButton(
-                RoundedCornerShape(50),
-                elevated = pressed,
-                pressed = pressed,
-                transparentForDroplet = dropletController != null
+    } else {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .iosGlassButton(RoundedCornerShape(50), elevated = pressed, pressed = pressed)
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = null,
+                    onClick = onClick
+                )
+                .padding(horizontal = 12.dp, vertical = 9.dp)
+        ) {
+            Text(
+                text = label,
+                fontFamily = font,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 13.sp,
+                letterSpacing = (-0.2).sp,
+                color = Color.White,
+                style = GlassTextShadowStyle
             )
-            .clickable(
-                interactionSource = interactionSource,
-                indication = null,
-                onClick = onClick
-            )
-            .padding(horizontal = 12.dp, vertical = 9.dp)
-    ) {
-        Text(
-            text = label,
-            fontFamily = font,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 13.sp,
-            letterSpacing = (-0.2).sp,
-            color = Color.White,
-            style = GlassTextShadowStyle
-        )
+        }
     }
 }
 
@@ -3468,61 +3214,50 @@ private fun GlassCircleIconButton(
     size: Dp,
     elevated: Boolean = false,
     enabled: Boolean = true,
-    rootTopLeft: Offset = Offset.Zero,
-    dropletController: LiquidGlassDropletController? = null,
+    backdropLayer: GraphicsLayer? = null,
+    backdropTopLeft: Offset = Offset.Zero,
+    backdropInvalidator: () -> Any = { Unit },
     onClick: () -> Unit,
     content: @Composable () -> Unit
 ) {
-    val density = LocalDensity.current
-    var localRect by remember { mutableStateOf(Rect.Zero) }
-    val radiusPx = with(density) { (size / 2f).toPx() }
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
 
-    LaunchedEffect(enabled && pressed, localRect) {
-        if (dropletController != null) {
-            if (enabled && pressed && !localRect.isEmpty) {
-                dropletController.press(localRect, radiusPx)
-            } else {
-                dropletController.releaseIfOwned(localRect)
-            }
+    if (backdropLayer != null) {
+        LiquidDropletOverlay(
+            backdropLayer = backdropLayer,
+            backdropTopLeft = backdropTopLeft,
+            shape = CircleShape,
+            cornerRadiusDp = size / 2f,
+            pressed = enabled && pressed,
+            backdropInvalidator = backdropInvalidator,
+            modifier = Modifier
+                .size(size)
+                .iosGlassButton(CircleShape, elevated = elevated || (enabled && pressed), pressed = enabled && pressed)
+                .clickable(
+                    enabled = enabled,
+                    interactionSource = interactionSource,
+                    indication = null,
+                    onClick = onClick
+                )
+        ) {
+            content()
         }
-    }
-
-    val scale by animateFloatAsState(
-        targetValue = if (enabled && pressed) 1.09f else 1f,
-        animationSpec = spring(dampingRatio = 0.52f, stiffness = 480f),
-        label = "circleScale"
-    )
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .size(size)
-            .onGloballyPositioned { coords ->
-                val old = localRect
-                val measured = coords.boundsInRoot().translate(-rootTopLeft.x, -rootTopLeft.y)
-                localRect = measured
-                dropletController?.updateGeometryIfOwned(old, measured, radiusPx)
-            }
-            .graphicsLayer {
-                scaleX = scale
-                scaleY = scale
-            }
-            .iosGlassButton(
-                shape = CircleShape,
-                elevated = elevated || (enabled && pressed),
-                pressed = enabled && pressed,
-                transparentForDroplet = dropletController != null
-            )
-            .clickable(
-                enabled = enabled,
-                interactionSource = interactionSource,
-                indication = null,
-                onClick = onClick
-            )
-    ) {
-        content()
+    } else {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(size)
+                .iosGlassButton(CircleShape, elevated = elevated || (enabled && pressed), pressed = enabled && pressed)
+                .clickable(
+                    enabled = enabled,
+                    interactionSource = interactionSource,
+                    indication = null,
+                    onClick = onClick
+                )
+        ) {
+            content()
+        }
     }
 }
 
