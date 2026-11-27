@@ -1,5 +1,6 @@
 package com.bitchord.island
 
+import android.app.Notification
 import android.app.UiModeManager
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -16,23 +17,28 @@ import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import android.view.KeyEvent
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.drop
+import kotlin.math.min
 
 class BitChordListenerService : NotificationListenerService() {
 
     companion object {
         private const val MIN_TICK_DELAY_MS = 40L
-        private const val MAX_TICK_DELAY_MS = 450L
-        private const val MIN_LINE_INTERVAL_MS = 100L
+        private const val MIN_LINE_INTERVAL_MS = 90L
+        private const val SYNC_EVENT_DURATION_MS = 2000L
         private const val BACKWARD_JITTER_GUARD_MS = 1400L
         private const val FORWARD_JITTER_GUARD_MS = 220L
         private const val LINE_HYSTERESIS_MS = 1500L
         private const val HARD_REBIND_COOLDOWN_MS = 2500L
+        private val REGEX_LOSSLESS_TAG = Regex("""\b(flac|lossless|24[\s-]?bit|hi[\s-]?res)\b""", RegexOption.IGNORE_CASE)
 
         @Volatile
         private var instance: BitChordListenerService? = null
@@ -184,6 +190,7 @@ class BitChordListenerService : NotificationListenerService() {
     private lateinit var wearBridge: WearLyricsBridge
     private lateinit var sessionManager: MediaSessionManager
     private lateinit var uiModeManager: UiModeManager
+    private lateinit var powerManager: PowerManager
 
     private var activeController: MediaController? = null
     private var fetchJob: Job? = null
@@ -191,6 +198,7 @@ class BitChordListenerService : NotificationListenerService() {
     private var isForegroundStarted = false
     private var isTicking = false
     private var isSessionsRegistered = false
+    private var isScreenInteractive = true
 
     private var currentTrackKey = ""
     private var currentTitle = ""
@@ -200,11 +208,24 @@ class BitChordListenerService : NotificationListenerService() {
     private var currentCoverSig = 0L
     private var currentPalette = CoverPalette()
     private var currentLines: List<LyricLine> = emptyList()
+    private var currentPlayerPackage = ""
+    private var currentLosslessTagged = false
+    private var currentSourceLabel = "Hi-Fi"
 
     private var lastLineIndex = -1
     private var lastRenderKey = ""
+    private var lastAutoStateKey = ""
     private var lastNotifyRealtimeMs = 0L
     private var userSeekGraceUntilMs = 0L
+    private var lastUserSyncChangeRealtimeMs = 0L
+    private var ignoredProgrammaticSyncMs: Long? = null
+
+    private val syncEventResetRunnable = Runnable {
+        if (!LyricsPlaybackStore.isPlaying.value) {
+            lastRenderKey = ""
+            syncLyrics(isPlaying = false, forceImmediate = true)
+        }
+    }
 
     private val carModeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -216,29 +237,40 @@ class BitChordListenerService : NotificationListenerService() {
                 isPlaying = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING,
                 forceImmediate = true
             )
+            if (activeController?.playbackState?.state == PlaybackState.STATE_PLAYING) {
+                scheduleNextTick()
+            }
         }
     }
 
-    private val screenOnReceiver = object : BroadcastReceiver() {
+    private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_SCREEN_ON) {
-                refreshActiveSessions()
-                val playing = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
-                if (playing) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_ON -> {
+                    isScreenInteractive = true
+                    refreshActiveSessions()
+                    val playing = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
                     lastRenderKey = ""
-                    syncLyrics(isPlaying = true, forceImmediate = true)
-                    scheduleNextTick()
+                    syncLyrics(isPlaying = playing, forceImmediate = true)
+                    if (playing) {
+                        scheduleNextTick()
+                    }
+                }
+                Intent.ACTION_SCREEN_OFF -> {
+                    isScreenInteractive = false
+                    if (!isCarModeActive()) {
+                        handler.removeCallbacks(tickRunnable)
+                        handler.removeCallbacks(syncEventResetRunnable)
+                    }
                 }
             }
         }
     }
 
-    private val tickRunnable = object : Runnable {
-        override fun run() {
-            if (!isTicking) return
-            syncLyrics(isPlaying = true, forceImmediate = false)
-            scheduleNextTick()
-        }
+    private val tickRunnable = Runnable {
+        if (!isTicking) return@Runnable
+        syncLyrics(isPlaying = true, forceImmediate = false)
+        scheduleNextTick()
     }
 
     private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener {
@@ -282,6 +314,9 @@ class BitChordListenerService : NotificationListenerService() {
         override fun onSessionDestroyed() {
             activeController?.unregisterCallback(this)
             activeController = null
+            currentPlayerPackage = ""
+            currentLosslessTagged = false
+            currentSourceLabel = "Hi-Fi"
             LyricsPlaybackStore.activePlayerPackage.value = ""
             stopTicker()
             LyricsPlaybackStore.isPlaying.value = false
@@ -298,6 +333,12 @@ class BitChordListenerService : NotificationListenerService() {
         wearBridge = WearLyricsBridge(this)
         sessionManager = getSystemService(MediaSessionManager::class.java)
         uiModeManager = getSystemService(UiModeManager::class.java)
+        powerManager = getSystemService(PowerManager::class.java)
+        isScreenInteractive = try {
+            powerManager.isInteractive
+        } catch (_: Throwable) {
+            true
+        }
 
         val carFilter = IntentFilter().apply {
             addAction(UiModeManager.ACTION_ENTER_CAR_MODE)
@@ -305,8 +346,11 @@ class BitChordListenerService : NotificationListenerService() {
         }
         registerReceiver(carModeReceiver, carFilter, RECEIVER_NOT_EXPORTED)
 
-        val screenFilter = IntentFilter(Intent.ACTION_SCREEN_ON)
-        registerReceiver(screenOnReceiver, screenFilter, RECEIVER_NOT_EXPORTED)
+        val screenFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        registerReceiver(screenReceiver, screenFilter, RECEIVER_NOT_EXPORTED)
 
         LyricsPlaybackStore.onPlayPause = { handlePlayPauseCommand() }
         LyricsPlaybackStore.onNext = {
@@ -335,6 +379,26 @@ class BitChordListenerService : NotificationListenerService() {
             )
             syncLyrics(isPlaying = playing, forceImmediate = true)
             if (playing) scheduleNextTick()
+        }
+
+        scope.launch {
+            LyricsPlaybackStore.syncOffsetMs.drop(1).collect { newOffset ->
+                if (ignoredProgrammaticSyncMs == newOffset) {
+                    ignoredProgrammaticSyncMs = null
+                    return@collect
+                }
+                ignoredProgrammaticSyncMs = null
+                lastUserSyncChangeRealtimeMs = SystemClock.elapsedRealtime()
+                lastRenderKey = ""
+                val playing = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+                syncLyrics(isPlaying = playing, forceImmediate = true)
+                handler.removeCallbacks(syncEventResetRunnable)
+                if (playing) {
+                    scheduleNextTick()
+                } else if (isScreenInteractive && !isCarModeActive()) {
+                    handler.postDelayed(syncEventResetRunnable, SYNC_EVENT_DURATION_MS + 50L)
+                }
+            }
         }
 
         refreshActiveSessions()
@@ -448,7 +512,11 @@ class BitChordListenerService : NotificationListenerService() {
             AppPreferences.rememberLastActivePackage(this, target.packageName)
         }
 
-        LyricsPlaybackStore.activePlayerPackage.value = target?.packageName.orEmpty()
+        currentPlayerPackage = target?.packageName.orEmpty()
+        LyricsPlaybackStore.activePlayerPackage.value = currentPlayerPackage
+        if (target != null) {
+            refreshSourceQuality(target.metadata)
+        }
 
         if (target?.sessionToken == activeController?.sessionToken) {
             if (target != null) {
@@ -492,10 +560,89 @@ class BitChordListenerService : NotificationListenerService() {
             syncLyrics(isPlaying = playing, forceImmediate = true)
         } else {
             stopTicker()
+            currentPlayerPackage = ""
+            currentLosslessTagged = false
+            currentSourceLabel = "Hi-Fi"
             LyricsPlaybackStore.isPlaying.value = false
             AutoLyricsBridge.clear()
             wearBridge.clearTrack()
             hidePhoneNotificationOnly()
+        }
+    }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        sbn ?: return
+        if (sbn.packageName == packageName) return
+        val pkg = currentPlayerPackage
+        if (pkg.isBlank() || sbn.packageName != pkg) return
+        if (currentLosslessTagged) return
+
+        if (containsLosslessNotificationTag(sbn)) {
+            currentLosslessTagged = true
+            refreshSourceQuality(activeController?.metadata)
+            lastRenderKey = ""
+            val playing = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+            syncLyrics(isPlaying = playing, forceImmediate = true)
+        }
+    }
+
+    private fun containsLosslessNotificationTag(sbn: StatusBarNotification): Boolean {
+        return try {
+            val extras = sbn.notification?.extras ?: return false
+            val fields = listOf(
+                extras.getCharSequence(Notification.EXTRA_TITLE),
+                extras.getCharSequence(Notification.EXTRA_TEXT),
+                extras.getCharSequence(Notification.EXTRA_SUB_TEXT),
+                extras.getCharSequence(Notification.EXTRA_INFO_TEXT),
+                extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
+            )
+            fields.any { !it.isNullOrBlank() && REGEX_LOSSLESS_TAG.containsMatchIn(it) }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun refreshSourceQuality(metadata: MediaMetadata?) {
+        val pkgLower = currentPlayerPackage.lowercase()
+        val isBitChord = pkgLower.contains("bitchord")
+        val metadataTagged = try {
+            val candidates = listOf(
+                currentTitle,
+                currentArtist,
+                metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty(),
+                metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty(),
+                metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION).orEmpty(),
+                metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE).orEmpty(),
+                metadata?.getString(MediaMetadata.METADATA_KEY_GENRE).orEmpty()
+            )
+            candidates.any { it.isNotBlank() && REGEX_LOSSLESS_TAG.containsMatchIn(it) }
+        } catch (_: Throwable) {
+            false
+        }
+
+        val notifTagged = if (!isBitChord && !metadataTagged && currentPlayerPackage.isNotBlank()) {
+            try {
+                activeNotifications
+                    ?.firstOrNull { it.packageName == currentPlayerPackage }
+                    ?.let { containsLosslessNotificationTag(it) } == true
+            } catch (_: Throwable) {
+                false
+            }
+        } else {
+            false
+        }
+
+        currentLosslessTagged = isBitChord || metadataTagged || notifTagged
+        currentSourceLabel = when {
+            currentLosslessTagged -> "FLAC"
+            pkgLower.contains("spotify") -> "Spotify"
+            pkgLower.contains("youtube.music") -> "YT Music"
+            pkgLower.contains("apple.android.music") -> "Apple Music"
+            pkgLower.contains("tidal") -> "TIDAL"
+            pkgLower.contains("amazon.mp3") -> "Amazon"
+            pkgLower.contains("deezer") -> "Deezer"
+            pkgLower.contains("soundcloud") -> "SoundCloud"
+            else -> "Hi-Fi"
         }
     }
 
@@ -595,10 +742,17 @@ class BitChordListenerService : NotificationListenerService() {
         if (durationMs > 0L) {
             currentDurationMs = durationMs
             LyricsPlaybackStore.durationMs.value = durationMs
+        } else if (isNewTrack) {
+            currentDurationMs = 0L
+            LyricsPlaybackStore.durationMs.value = 0L
         }
 
         LyricsPlaybackStore.title.value = title
         LyricsPlaybackStore.artist.value = artist
+        if (isNewTrack) {
+            currentLosslessTagged = false
+        }
+        refreshSourceQuality(metadata)
 
         val cover = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
             ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
@@ -629,7 +783,13 @@ class BitChordListenerService : NotificationListenerService() {
             currentLines = emptyList()
             lastLineIndex = -1
             LyricsPlaybackStore.lines.value = emptyList()
-            LyricsPlaybackStore.syncOffsetMs.value = AppPreferences.defaultSyncOffsetMs.value
+            val defOffset = AppPreferences.defaultSyncOffsetMs.value
+            if (LyricsPlaybackStore.syncOffsetMs.value != defOffset) {
+                ignoredProgrammaticSyncMs = defOffset
+                LyricsPlaybackStore.syncOffsetMs.value = defOffset
+            } else {
+                ignoredProgrammaticSyncMs = null
+            }
             lastRenderKey = ""
             if (isNewTrack) {
                 syncPlaybackClock(activeController?.playbackState, forceSync = true)
@@ -665,27 +825,108 @@ class BitChordListenerService : NotificationListenerService() {
 
     private fun startTicker() {
         isTicking = true
+        handler.removeCallbacks(syncEventResetRunnable)
         scheduleNextTick()
     }
 
     private fun stopTicker() {
         isTicking = false
         handler.removeCallbacks(tickRunnable)
+        handler.removeCallbacks(syncEventResetRunnable)
     }
 
     private fun scheduleNextTick() {
         handler.removeCallbacks(tickRunnable)
-        if (!isTicking) return
-        val posMs = LyricsPlaybackStore.currentPositionMs()
-        val nextIdx = findLineIndex(currentLines, posMs) + 1
-        val delayMs = if (nextIdx in currentLines.indices) {
-            val speed = LyricsPlaybackStore.speed.value.coerceAtLeast(0.25f)
-            val remainingMs = ((currentLines[nextIdx].startMs - posMs) / speed).toLong()
-            remainingMs.coerceIn(MIN_TICK_DELAY_MS, MAX_TICK_DELAY_MS)
-        } else {
-            MAX_TICK_DELAY_MS
+        if (!isTicking || !LyricsPlaybackStore.isPlaying.value) return
+        val screenOn = try {
+            powerManager.isInteractive
+        } catch (_: Throwable) {
+            isScreenInteractive
         }
-        handler.postDelayed(tickRunnable, delayMs)
+        if (!screenOn && !isCarModeActive()) return
+
+        val speed = LyricsPlaybackStore.speed.value.coerceAtLeast(0.25f)
+        val lyricPosMs = LyricsPlaybackStore.currentPositionMs()
+        val nextIdx = if (currentLines.isNotEmpty()) findLineIndex(currentLines, lyricPosMs) + 1 else -1
+        val lyricDelayMs = if (nextIdx in currentLines.indices) {
+            val delta = ((currentLines[nextIdx].startMs - lyricPosMs) / speed).toLong()
+            delta.coerceAtLeast(MIN_TICK_DELAY_MS)
+        } else {
+            Long.MAX_VALUE
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        val rawPosMs = LyricsPlaybackStore.rawPositionMs().coerceAtLeast(0L)
+        val durMs = currentDurationMs
+        val syncAgeMs = if (lastUserSyncChangeRealtimeMs > 0L) now - lastUserSyncChangeRealtimeMs else Long.MAX_VALUE
+
+        val wingDelayMs: Long = when {
+            syncAgeMs in 0L until SYNC_EVENT_DURATION_MS -> {
+                (SYNC_EVENT_DURATION_MS - syncAgeMs).coerceAtLeast(MIN_TICK_DELAY_MS)
+            }
+            rawPosMs < 6_000L -> {
+                ((6_000L - rawPosMs + 25L) / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
+            }
+            durMs > 20_000L && (durMs - rawPosMs) <= 15_000L -> {
+                val remMs = (durMs - rawPosMs).coerceAtLeast(0L)
+                val toNextSecMs = if (remMs <= 0L) 1_000L else (remMs % 1_000L).let { if (it == 0L) 1_000L else it }
+                (((toNextSecMs + 25L) / speed).toLong()).coerceAtLeast(MIN_TICK_DELAY_MS)
+            }
+            rawPosMs < 30_000L || ((rawPosMs - 30_000L) / 30_000L) % 2L == 1L -> {
+                if (durMs > 0L) {
+                    val remMs = (durMs - rawPosMs).coerceAtLeast(0L)
+                    val curStepSec = ((remMs / 1_000L) / 5L) * 5L
+                    val deltaCountdownMs = (remMs - curStepSec * 1_000L + 25L).coerceAtLeast(100L)
+
+                    val curBucket = (((rawPosMs.toDouble() / durMs.toDouble()) * 9.0) + 0.5).toInt().coerceIn(0, 9)
+                    val nextBucketPos = (((curBucket + 0.5) / 9.0) * durMs).toLong()
+                    val deltaRingMs = if (curBucket < 9 && nextBucketPos > rawPosMs) {
+                        (nextBucketPos - rawPosMs + 25L)
+                    } else {
+                        Long.MAX_VALUE
+                    }
+
+                    val nextPhasePos = if (rawPosMs < 30_000L) {
+                        30_000L
+                    } else {
+                        30_000L + (((rawPosMs - 30_000L) / 30_000L) + 1L) * 30_000L
+                    }
+                    val deltaPhaseMs = (nextPhasePos - rawPosMs + 25L).coerceAtLeast(MIN_TICK_DELAY_MS)
+
+                    val finalStartMs = if (durMs > 20_000L) (durMs - 15_000L).coerceAtLeast(0L) else Long.MAX_VALUE
+                    val deltaFinalMs = if (finalStartMs > rawPosMs && finalStartMs < Long.MAX_VALUE) {
+                        (finalStartMs - rawPosMs + 25L)
+                    } else {
+                        Long.MAX_VALUE
+                    }
+
+                    val rawWing = minOf(deltaCountdownMs, deltaRingMs, deltaPhaseMs, deltaFinalMs)
+                    (rawWing / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
+                } else if (rawPosMs < 30_000L) {
+                    ((30_000L - rawPosMs + 25L) / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
+                } else {
+                    Long.MAX_VALUE
+                }
+            }
+            else -> {
+                // Finestra A (30s Qualità/Sorgente): zero wake-up al secondo se non ci sono lyrics
+                val nextPhasePos = 30_000L + (((rawPosMs - 30_000L) / 30_000L) + 1L) * 30_000L
+                val deltaPhaseMs = (nextPhasePos - rawPosMs + 25L).coerceAtLeast(MIN_TICK_DELAY_MS)
+                val finalStartMs = if (durMs > 20_000L) (durMs - 15_000L).coerceAtLeast(0L) else Long.MAX_VALUE
+                val deltaFinalMs = if (finalStartMs > rawPosMs && finalStartMs < Long.MAX_VALUE) {
+                    (finalStartMs - rawPosMs + 25L)
+                } else {
+                    Long.MAX_VALUE
+                }
+                val rawWing = min(deltaPhaseMs, deltaFinalMs)
+                (rawWing / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
+            }
+        }
+
+        val nextDelayMs = min(lyricDelayMs, wingDelayMs)
+        if (nextDelayMs < Long.MAX_VALUE) {
+            handler.postDelayed(tickRunnable, nextDelayMs.coerceAtLeast(MIN_TICK_DELAY_MS))
+        }
     }
 
     private fun findLineIndex(lines: List<LyricLine>, posMs: Long): Int {
@@ -708,8 +949,13 @@ class BitChordListenerService : NotificationListenerService() {
         if (currentTitle.isBlank()) return
 
         val now = SystemClock.elapsedRealtime()
-        val posMs = LyricsPlaybackStore.currentPositionMs()
-        var idx = if (currentLines.isEmpty()) -1 else findLineIndex(currentLines, posMs)
+        val lyricPosMs = LyricsPlaybackStore.currentPositionMs()
+        val rawPosMs = LyricsPlaybackStore.rawPositionMs().coerceAtLeast(0L)
+        val syncOffsetMs = LyricsPlaybackStore.syncOffsetMs.value
+        val showSyncEvent = lastUserSyncChangeRealtimeMs > 0L &&
+            (now - lastUserSyncChangeRealtimeMs) in 0L until SYNC_EVENT_DURATION_MS
+
+        var idx = if (currentLines.isEmpty()) -1 else findLineIndex(currentLines, lyricPosMs)
 
         if (
             isPlaying &&
@@ -717,16 +963,25 @@ class BitChordListenerService : NotificationListenerService() {
             lastLineIndex in currentLines.indices &&
             idx < lastLineIndex
         ) {
-            val lagBelowCurrentLine = currentLines[lastLineIndex].startMs - posMs
+            val lagBelowCurrentLine = currentLines[lastLineIndex].startMs - lyricPosMs
             if (lagBelowCurrentLine in 0L..LINE_HYSTERESIS_MS) {
                 idx = lastLineIndex
             }
         }
 
         val currLine = if (idx in currentLines.indices) currentLines[idx] else null
+        val wingState = notifier.computeRightWingState(
+            artist = currentArtist,
+            isPlaying = isPlaying,
+            posMs = rawPosMs,
+            durationMs = currentDurationMs,
+            syncOffsetMs = syncOffsetMs,
+            showSyncEvent = showSyncEvent,
+            sourceLabel = currentSourceLabel
+        )
 
-        val renderKey = "$currentTrackKey|$idx|$isPlaying"
-        if (renderKey == lastRenderKey) return
+        val renderKey = "$currentTrackKey|$idx|$isPlaying|${wingState.text}|${wingState.iconKey}|$currentSourceLabel"
+        if (!forceImmediate && renderKey == lastRenderKey) return
 
         if (!forceImmediate && isForegroundStarted && now - lastNotifyRealtimeMs < MIN_LINE_INTERVAL_MS) {
             return
@@ -750,39 +1005,52 @@ class BitChordListenerService : NotificationListenerService() {
             else -> ""
         }
 
-        AutoLyricsBridge.publish(
-            AutoLyricsState(
-                trackKey = currentTrackKey,
-                lineIndex = idx,
-                title = currentTitle,
-                artist = currentArtist,
-                durationMs = currentDurationMs,
-                positionMs = posMs,
-                isPlaying = isPlaying,
-                prev2 = prev2,
-                prev1 = prev1,
-                curr = currText,
-                next1 = next1,
-                next2 = next2,
-                cover = currentCover,
-                palette = currentPalette
+        val autoKey = "$currentTrackKey|$idx|$isPlaying"
+        if (autoKey != lastAutoStateKey) {
+            lastAutoStateKey = autoKey
+            AutoLyricsBridge.publish(
+                AutoLyricsState(
+                    trackKey = currentTrackKey,
+                    lineIndex = idx,
+                    title = currentTitle,
+                    artist = currentArtist,
+                    durationMs = currentDurationMs,
+                    positionMs = lyricPosMs,
+                    isPlaying = isPlaying,
+                    prev2 = prev2,
+                    prev1 = prev1,
+                    curr = currText,
+                    next1 = next1,
+                    next2 = next2,
+                    cover = currentCover,
+                    palette = currentPalette
+                )
             )
-        )
+        }
 
         if (isCarModeActive()) {
             hidePhoneNotificationOnly()
             return
         }
 
+        val hasSyncedLyrics = currentLines.isNotEmpty()
+
         if (!isForegroundStarted) {
             val notif = notifier.buildNotification(
                 title = currentTitle,
+                artist = currentArtist,
                 prevLyric = prev1,
                 currentLine = currLine,
                 nextLyric1 = next1,
                 cover = currentCover,
                 palette = currentPalette,
-                isPlaying = isPlaying
+                isPlaying = isPlaying,
+                posMs = rawPosMs,
+                durationMs = currentDurationMs,
+                syncOffsetMs = syncOffsetMs,
+                showSyncEvent = showSyncEvent,
+                sourceLabel = currentSourceLabel,
+                hasSyncedLyrics = hasSyncedLyrics
             )
             try {
                 startForeground(
@@ -793,33 +1061,54 @@ class BitChordListenerService : NotificationListenerService() {
                 isForegroundStarted = true
                 notifier.markForegroundPosted(
                     title = currentTitle,
+                    artist = currentArtist,
                     prevLyric = prev1,
                     currentLine = currLine,
                     nextLyric1 = next1,
                     cover = currentCover,
                     palette = currentPalette,
-                    isPlaying = isPlaying
+                    isPlaying = isPlaying,
+                    posMs = rawPosMs,
+                    durationMs = currentDurationMs,
+                    syncOffsetMs = syncOffsetMs,
+                    showSyncEvent = showSyncEvent,
+                    sourceLabel = currentSourceLabel,
+                    hasSyncedLyrics = hasSyncedLyrics
                 )
             } catch (_: Exception) {
                 notifier.update(
                     title = currentTitle,
+                    artist = currentArtist,
                     prevLyric = prev1,
                     currentLine = currLine,
                     nextLyric1 = next1,
                     cover = currentCover,
                     palette = currentPalette,
-                    isPlaying = isPlaying
+                    isPlaying = isPlaying,
+                    posMs = rawPosMs,
+                    durationMs = currentDurationMs,
+                    syncOffsetMs = syncOffsetMs,
+                    showSyncEvent = showSyncEvent,
+                    sourceLabel = currentSourceLabel,
+                    hasSyncedLyrics = hasSyncedLyrics
                 )
             }
         } else {
             notifier.update(
                 title = currentTitle,
+                artist = currentArtist,
                 prevLyric = prev1,
                 currentLine = currLine,
                 nextLyric1 = next1,
                 cover = currentCover,
                 palette = currentPalette,
-                isPlaying = isPlaying
+                isPlaying = isPlaying,
+                posMs = rawPosMs,
+                durationMs = currentDurationMs,
+                syncOffsetMs = syncOffsetMs,
+                showSyncEvent = showSyncEvent,
+                sourceLabel = currentSourceLabel,
+                hasSyncedLyrics = hasSyncedLyrics
             )
         }
     }
@@ -828,6 +1117,7 @@ class BitChordListenerService : NotificationListenerService() {
         isServiceConnected.value = false
         if (instance === this) instance = null
         stopTicker()
+        handler.removeCallbacksAndMessages(null)
         fetchJob?.cancel()
         paletteJob?.cancel()
         activeController?.unregisterCallback(mediaCallback)
@@ -841,7 +1131,7 @@ class BitChordListenerService : NotificationListenerService() {
         } catch (_: Exception) {
         }
         try {
-            unregisterReceiver(screenOnReceiver)
+            unregisterReceiver(screenReceiver)
         } catch (_: Exception) {
         }
         wearBridge.release()

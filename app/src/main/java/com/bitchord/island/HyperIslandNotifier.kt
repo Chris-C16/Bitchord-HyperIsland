@@ -26,11 +26,14 @@ import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
+import android.util.Log
 import android.view.View
 import android.widget.RemoteViews
 import androidx.compose.ui.graphics.toArgb
 import org.json.JSONObject
+import java.util.Locale
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 class HyperIslandNotifier(private val context: Context) {
 
@@ -38,15 +41,23 @@ class HyperIslandNotifier(private val context: Context) {
         const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
 
-        // Soglie in larghezza visiva reale (misurate con textSize = 100f)
-        private const val NORMAL_MAX_WIDTH = 680f
-        private const val NARROW_MAX_WIDTH = 880f
+        // Soglie larghezza visiva reale (misurate con textSize = 100f)
+        private const val LEFT_WING_MAX_WIDTH = 600f
+        private const val RIGHT_WING_MAX_WIDTH = 480f
         private const val TRAILING_JUNK_CHARS = "([{-–—/:,&+.|•"
 
-        // Parametri rotazione 360° del vinile dentro RemoteViews
+        // Parametri rotazione 360° del vinile dentro RemoteViews (rispetto limite Binder ~1MB)
         private const val SPIN_FRAME_COUNT = 16
-        private const val SPIN_FRAME_SIZE = 96
+        private const val SPIN_FRAME_SIZE = 72
         private const val SPIN_INTERVAL_MS = 125L
+        private const val WING_ICON_SIZE = 96
+
+        private const val PROGRESS_BUCKET_COUNT = 10
+
+        const val PIC_DISC = "miui.focus.pic_disc"
+        const val PIC_WAVE = "miui.focus.pic_wave"
+        const val PIC_PAUSE = "miui.focus.pic_pause"
+        const val PIC_SMALL = "miui.focus.pic_icon"
 
         private val SPIN_FRAME_IDS = intArrayOf(
             R.id.iv_disc_f0, R.id.iv_disc_f1, R.id.iv_disc_f2, R.id.iv_disc_f3,
@@ -64,9 +75,10 @@ class HyperIslandNotifier(private val context: Context) {
         private val REGEX_FEAT = Regex("""\s+(feat\.|ft\.|prod\.).*$""", RegexOption.IGNORE_CASE)
     }
 
-    private data class PillLabel(
+    data class WingState(
         val text: String,
-        val useNarrowFont: Boolean
+        val iconKey: String,
+        val progressBucket: Int
     )
 
     private data class VinylAssets(
@@ -78,8 +90,10 @@ class HyperIslandNotifier(private val context: Context) {
     private val manager = context.getSystemService(NotificationManager::class.java)
     private val powerManager = context.getSystemService(PowerManager::class.java)
 
-    private val playingSmallIcon: Icon
-    private val pausedSmallIcon: Icon
+    private val smallWaveIcon: Icon
+    private val smallPauseIcon: Icon
+    private val wingWaveIcon: Icon
+    private val wingPauseIcon: Icon
     private val playButtonBitmap: Bitmap
     private val pauseButtonBitmap: Bitmap
     private val lyricsPendingIntent: PendingIntent
@@ -97,23 +111,26 @@ class HyperIslandNotifier(private val context: Context) {
     private var cachedDiscAccent: Int = 0
     private var cachedVinylAssets: VinylAssets? = null
 
+    private var cachedRingAccent: Int = 0
+    private var cachedProgressRingIcons: Array<Icon>? = null
+
     private var lastSpinStep: Int = 0
     private var cachedPausedStep: Int = -1
     private var cachedPausedBase: Bitmap? = null
     private var cachedPausedDisc: Bitmap? = null
 
-    // Cache label pillola (evita regex e measureText ad ogni cambio verso)
-    private var cachedPillTitle: String? = null
-    private var cachedPillPlaying: Boolean = false
-    private var cachedPillLabel: PillLabel? = null
+    // Cache titolo/artista semplificati per le due ali
+    private var cachedRawLeftTitle: String? = null
+    private var cachedCleanLeftTitle: String = ""
+    private var cachedRawRightArtist: String? = null
+    private var cachedCleanRightArtist: String = ""
 
     // Cache JSON HyperIsland
     private var cachedFocusJsonKey: String = ""
     private var cachedFocusJsonPair: Pair<String, String>? = null
 
-    // Deduplicazione + risparmio batteria a schermo spento
+    // Deduplicazione notifiche
     private var lastFullStateKey: String = ""
-    private var lastTrackStateKey: String = ""
 
     init {
         val channel = NotificationChannel(
@@ -129,8 +146,10 @@ class HyperIslandNotifier(private val context: Context) {
         }
         manager.createNotificationChannel(channel)
 
-        playingSmallIcon = Icon.createWithBitmap(renderStaticWaveBitmap())
-        pausedSmallIcon = Icon.createWithBitmap(renderSmallPauseBitmap())
+        smallWaveIcon = Icon.createWithBitmap(renderWaveBitmap(48))
+        smallPauseIcon = Icon.createWithBitmap(renderPauseGlyphBitmap(48))
+        wingWaveIcon = Icon.createWithBitmap(renderWaveBitmap(WING_ICON_SIZE))
+        wingPauseIcon = Icon.createWithBitmap(renderPauseGlyphBitmap(WING_ICON_SIZE))
         playButtonBitmap = renderPlayButtonBitmap()
         pauseButtonBitmap = renderPauseButtonBitmap()
 
@@ -162,8 +181,8 @@ class HyperIslandNotifier(private val context: Context) {
         return text.trimEnd { it.isWhitespace() || it in TRAILING_JUNK_CHARS }
     }
 
-    private fun simplifyTitleForPill(rawTitle: String): String {
-        val clean = cleanLine(rawTitle)
+    private fun simplifyMetadataText(raw: String): String {
+        val clean = cleanLine(raw)
             .replace(REGEX_LEADING_EXPLICIT_EMOJI, "")
             .replace(REGEX_LEADING_EXPLICIT_TAG, "")
             .trim()
@@ -177,7 +196,7 @@ class HyperIslandNotifier(private val context: Context) {
 
         var base = if (withoutParens.isNotEmpty()) withoutParens else clean
 
-        if (pillMeasurePaint.measureText(base) > NORMAL_MAX_WIDTH) {
+        if (pillMeasurePaint.measureText(base) > LEFT_WING_MAX_WIDTH) {
             val beforeDash = base.substringBefore(" - ")
                 .substringBefore(" – ")
                 .substringBefore(" — ")
@@ -191,10 +210,11 @@ class HyperIslandNotifier(private val context: Context) {
         return if (cleaned.isNotEmpty()) cleaned else clean
     }
 
-    private fun truncateToVisualWidth(text: String, maxWidth: Float): String {
+    private fun truncateToVisualWidth(text: String, maxWidth: Float, fallback: String): String {
+        if (pillMeasurePaint.measureText(text) <= maxWidth) return text
         val ellipsis = "…"
         val ellipsisWidth = pillMeasurePaint.measureText(ellipsis)
-        val targetWidth = (maxWidth - ellipsisWidth).coerceAtLeast(200f)
+        val targetWidth = (maxWidth - ellipsisWidth).coerceAtLeast(180f)
 
         var end = text.length
         while (end > 1 && pillMeasurePaint.measureText(text, 0, end) > targetWidth) {
@@ -223,38 +243,143 @@ class HyperIslandNotifier(private val context: Context) {
             }
         }
 
-        return if (candidate.isNotEmpty()) "$candidate$ellipsis" else "Lyrics"
+        return if (candidate.isNotEmpty()) "$candidate$ellipsis" else fallback
     }
 
-    private fun buildStaticPillLabel(title: String, isPlaying: Boolean): PillLabel {
-        val cached = cachedPillLabel
-        if (cached != null && cachedPillTitle == title && cachedPillPlaying == isPlaying) {
-            return cached
+    private fun buildLeftWingTitle(rawTitle: String): String {
+        if (cachedRawLeftTitle == rawTitle && cachedCleanLeftTitle.isNotEmpty()) {
+            return cachedCleanLeftTitle
+        }
+        val base = simplifyMetadataText(rawTitle)
+        val fitted = if (base.isEmpty()) {
+            "Lyrics"
+        } else {
+            truncateToVisualWidth(base, LEFT_WING_MAX_WIDTH, "Lyrics")
+        }
+        cachedRawLeftTitle = rawTitle
+        cachedCleanLeftTitle = fitted
+        return fitted
+    }
+
+    private fun buildCleanArtist(rawArtist: String, fallback: String): String {
+        val cleanedRaw = rawArtist.trim()
+        if (cleanedRaw.isEmpty()) return fallback
+        if (cachedRawRightArtist == cleanedRaw && cachedCleanRightArtist.isNotEmpty()) {
+            return cachedCleanRightArtist
+        }
+        val primary = cleanedRaw.split(",", "&", " x ", " X ")
+            .firstOrNull()?.trim().orEmpty()
+        val simplified = simplifyMetadataText(primary.ifEmpty { cleanedRaw })
+        val fitted = if (simplified.isEmpty()) {
+            fallback
+        } else {
+            truncateToVisualWidth(simplified, RIGHT_WING_MAX_WIDTH, fallback)
+        }
+        cachedRawRightArtist = cleanedRaw
+        cachedCleanRightArtist = fitted
+        return fitted
+    }
+
+    private fun formatCountdownMmSs(seconds: Long): String {
+        val safeSec = seconds.coerceAtLeast(0L)
+        val min = safeSec / 60L
+        val sec = safeSec % 60L
+        return String.format(Locale.US, "-%02d:%02d", min, sec)
+    }
+
+    private fun formatElapsedDuration(posMs: Long, durationMs: Long): String {
+        val posSec = (posMs.coerceAtLeast(0L) / 1000L)
+        val pMin = posSec / 60L
+        val pSec = posSec % 60L
+        if (durationMs <= 0L) {
+            return String.format(Locale.US, "%02d:%02d", pMin, pSec)
+        }
+        val durSec = (durationMs.coerceAtLeast(0L) / 1000L)
+        val dMin = durSec / 60L
+        val dSec = durSec % 60L
+        return String.format(Locale.US, "%02d:%02d / %02d:%02d", pMin, pSec, dMin, dSec)
+    }
+
+    private fun computeProgressBucket(posMs: Long, durationMs: Long): Int {
+        if (durationMs <= 0L) return 0
+        val fraction = (posMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+        // 10 step discreti al 10%: bucket 0..9 -> chiave miui.focus.pic_progress_10..100
+        return (fraction * (PROGRESS_BUCKET_COUNT - 1)).roundToInt().coerceIn(0, PROGRESS_BUCKET_COUNT - 1)
+    }
+
+    fun computeRightWingState(
+        artist: String,
+        isPlaying: Boolean,
+        posMs: Long,
+        durationMs: Long,
+        syncOffsetMs: Long,
+        showSyncEvent: Boolean,
+        sourceLabel: String
+    ): WingState {
+        // 1. Priorità Eventi Istantanei (Sync modificato entro 2.0s)
+        if (showSyncEvent) {
+            val sign = if (syncOffsetMs >= 0L) "+" else ""
+            val label = String.format(Locale.US, "Sync %s%.1fs", sign, syncOffsetMs / 1000f)
+            return WingState(text = label, iconKey = PIC_WAVE, progressBucket = -1)
         }
 
-        val label = if (!isPlaying) {
-            PillLabel("In pausa", useNarrowFont = false)
-        } else {
-            val base = simplifyTitleForPill(title)
-            if (base.isEmpty()) {
-                PillLabel("Lyrics", useNarrowFont = false)
+        // 2. Stato Pausa
+        if (!isPlaying) {
+            return WingState(text = "In pausa", iconKey = PIC_PAUSE, progressBucket = -1)
+        }
+
+        val safePos = posMs.coerceAtLeast(0L)
+        val cleanSource = sourceLabel.ifBlank { "Hi-Fi" }
+
+        // 3. Primi 6 secondi: Artista pulito + onda audio
+        if (safePos < 6_000L) {
+            val artistLabel = buildCleanArtist(artist, fallback = cleanSource)
+            return WingState(text = artistLabel, iconKey = PIC_WAVE, progressBucket = -1)
+        }
+
+        // 4. Ultimi 15 secondi (se durata > 20s): countdown finale al secondo + anello progresso
+        val remainingMs = if (durationMs > 0L) (durationMs - safePos).coerceAtLeast(0L) else -1L
+        if (durationMs > 20_000L && remainingMs in 0L..15_000L) {
+            val sec = (remainingMs / 1000L).coerceIn(0L, 15L)
+            val bucket = computeProgressBucket(safePos, durationMs)
+            val stepPct = (bucket + 1) * 10
+            return WingState(
+                text = formatCountdownMmSs(sec),
+                iconKey = "miui.focus.pic_progress_$stepPct",
+                progressBucket = bucket
+            )
+        }
+
+        // 5. Tra 6s e 30s: countdown a step di 5 secondi + anello progresso
+        if (safePos < 30_000L) {
+            return if (durationMs > 0L) {
+                val steppedSec = ((remainingMs / 1000L) / 5L) * 5L
+                val bucket = computeProgressBucket(safePos, durationMs)
+                val stepPct = (bucket + 1) * 10
+                WingState(
+                    text = formatCountdownMmSs(steppedSec),
+                    iconKey = "miui.focus.pic_progress_$stepPct",
+                    progressBucket = bucket
+                )
             } else {
-                val width = pillMeasurePaint.measureText(base)
-                when {
-                    width <= NORMAL_MAX_WIDTH -> PillLabel(base, useNarrowFont = false)
-                    width <= NARROW_MAX_WIDTH -> PillLabel(base, useNarrowFont = true)
-                    else -> PillLabel(
-                        text = truncateToVisualWidth(base, NARROW_MAX_WIDTH),
-                        useNarrowFont = true
-                    )
-                }
+                WingState(text = cleanSource, iconKey = PIC_WAVE, progressBucket = -1)
             }
         }
 
-        cachedPillTitle = title
-        cachedPillPlaying = isPlaying
-        cachedPillLabel = label
-        return label
+        // 6. Dopo 30s: alterna ogni 30s Qualità/Sorgente <-> Countdown a step 5s
+        val windowA = ((safePos - 30_000L) / 30_000L) % 2L == 0L
+        return if (windowA || durationMs <= 0L) {
+            WingState(text = cleanSource, iconKey = PIC_WAVE, progressBucket = -1)
+        } else {
+            val steppedSec = ((remainingMs / 1000L) / 5L) * 5L
+            val bucket = computeProgressBucket(safePos, durationMs)
+            val stepPct = (bucket + 1) * 10
+            WingState(
+                text = formatCountdownMmSs(steppedSec),
+                iconKey = "miui.focus.pic_progress_$stepPct",
+                progressBucket = bucket
+            )
+        }
     }
 
     private fun resolveDisplayLines(
@@ -262,17 +387,34 @@ class HyperIslandNotifier(private val context: Context) {
         currentLine: LyricLine?,
         nextLyric1: String,
         title: String,
+        artist: String,
+        posMs: Long,
+        durationMs: Long,
+        sourceLabel: String,
+        hasSyncedLyrics: Boolean,
         isPlaying: Boolean
     ): Triple<String, String, String> {
+        if (!hasSyncedLyrics) {
+            val cleanTitle = cleanLine(title).ifBlank { "DynamicLyrics" }
+            val cleanArtist = cleanLine(artist).ifBlank { sourceLabel.ifBlank { "Musica attiva" } }
+            val progressTime = formatElapsedDuration(posMs, durationMs)
+            val qualityBadge = if (isPlaying) {
+                "${sourceLabel.ifBlank { "Hi-Fi" }}  •  $progressTime"
+            } else {
+                "In pausa  •  ${sourceLabel.ifBlank { "Hi-Fi" }}  •  $progressTime"
+            }
+            return Triple(cleanTitle, cleanArtist, qualityBadge)
+        }
+
         val prev = cleanLine(prevLyric)
         val curr = cleanLine(currentLine?.fullText.orEmpty())
         val next = cleanLine(nextLyric1)
 
         if (!isPlaying && curr.isBlank()) {
-            return Triple("", title.ifBlank { "In pausa" }, "Riproduzione in pausa")
+            return Triple(cleanLine(title).ifBlank { "In pausa" }, cleanLine(artist), "Riproduzione in pausa")
         }
         if (curr.isBlank()) {
-            return Triple("", title.ifBlank { "In attesa del testo…" }, next)
+            return Triple(cleanLine(title).ifBlank { "In attesa del testo…" }, cleanLine(artist), next)
         }
         return Triple(prev, curr, next)
     }
@@ -280,23 +422,24 @@ class HyperIslandNotifier(private val context: Context) {
     private fun appendStyledLine(
         sb: SpannableStringBuilder,
         text: String,
-        isCurrent: Boolean,
-        accentColor: Int
+        isPrimary: Boolean,
+        color: Int,
+        scale: Float = 1.0f
     ) {
         if (text.isBlank()) return
         if (sb.isNotEmpty()) sb.append("\n")
         val start = sb.length
         sb.append(text)
         val end = sb.length
-        if (isCurrent) {
+        if (isPrimary) {
             sb.setSpan(TypefaceSpan("sans-serif-medium"), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             sb.setSpan(StyleSpan(Typeface.BOLD), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            sb.setSpan(ForegroundColorSpan(accentColor), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            sb.setSpan(RelativeSizeSpan(1.08f), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         } else {
             sb.setSpan(TypefaceSpan("sans-serif"), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            sb.setSpan(ForegroundColorSpan(Color.argb(115, 255, 255, 255)), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            sb.setSpan(RelativeSizeSpan(0.86f), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        sb.setSpan(ForegroundColorSpan(color), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        if (scale != 1.0f) {
+            sb.setSpan(RelativeSizeSpan(scale), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
     }
 
@@ -304,12 +447,19 @@ class HyperIslandNotifier(private val context: Context) {
         prev: String,
         curr: String,
         next: String,
-        accentColor: Int
+        accentColor: Int,
+        hasSyncedLyrics: Boolean
     ): CharSequence {
         val sb = SpannableStringBuilder()
-        if (prev.isNotBlank()) appendStyledLine(sb, prev, isCurrent = false, accentColor = accentColor)
-        appendStyledLine(sb, curr, isCurrent = true, accentColor = accentColor)
-        if (next.isNotBlank()) appendStyledLine(sb, next, isCurrent = false, accentColor = accentColor)
+        if (!hasSyncedLyrics) {
+            appendStyledLine(sb, prev, isPrimary = true, color = Color.WHITE, scale = 1.06f)
+            if (curr.isNotBlank()) appendStyledLine(sb, curr, isPrimary = false, color = Color.argb(190, 255, 255, 255), scale = 0.92f)
+            if (next.isNotBlank()) appendStyledLine(sb, next, isPrimary = true, color = accentColor, scale = 0.86f)
+        } else {
+            if (prev.isNotBlank()) appendStyledLine(sb, prev, isPrimary = false, color = Color.argb(115, 255, 255, 255), scale = 0.86f)
+            appendStyledLine(sb, curr, isPrimary = true, color = accentColor, scale = 1.08f)
+            if (next.isNotBlank()) appendStyledLine(sb, next, isPrimary = false, color = Color.argb(115, 255, 255, 255), scale = 0.86f)
+        }
         return sb
     }
 
@@ -319,6 +469,7 @@ class HyperIslandNotifier(private val context: Context) {
         curr: String,
         next: String,
         accentColor: Int,
+        hasSyncedLyrics: Boolean,
         isPlaying: Boolean
     ): RemoteViews {
         val rv = RemoteViews(context.packageName, R.layout.island_lyrics_expanded)
@@ -339,21 +490,58 @@ class HyperIslandNotifier(private val context: Context) {
             rv.setImageViewBitmap(R.id.iv_disc_cover, getPausedDiscBitmap(vinyl.baseDisc, lastSpinStep))
         }
 
-        if (prev.isNotBlank()) {
+        if (!hasSyncedLyrics) {
+            // Modalità senza testi sincronizzati: Vinile HD | Titolo / Artista / Badge Qualità + Avanzamento | Play/Pausa
+            val styledTitle = SpannableStringBuilder(prev).apply {
+                setSpan(TypefaceSpan("sans-serif-medium"), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                setSpan(StyleSpan(Typeface.BOLD), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                setSpan(RelativeSizeSpan(1.18f), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
             rv.setViewVisibility(R.id.tv_lyric_prev, View.VISIBLE)
-            rv.setTextViewText(R.id.tv_lyric_prev, prev)
-        } else {
-            rv.setViewVisibility(R.id.tv_lyric_prev, View.GONE)
-        }
+            rv.setTextColor(R.id.tv_lyric_prev, Color.WHITE)
+            rv.setTextViewText(R.id.tv_lyric_prev, styledTitle)
 
-        rv.setTextViewText(R.id.tv_lyric_curr, curr)
-        rv.setTextColor(R.id.tv_lyric_curr, accentColor)
+            if (curr.isNotBlank()) {
+                val styledArtist = SpannableStringBuilder(curr).apply {
+                    setSpan(RelativeSizeSpan(0.88f), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                }
+                rv.setViewVisibility(R.id.tv_lyric_curr, View.VISIBLE)
+                rv.setTextColor(R.id.tv_lyric_curr, Color.argb(205, 255, 255, 255))
+                rv.setTextViewText(R.id.tv_lyric_curr, styledArtist)
+            } else {
+                rv.setViewVisibility(R.id.tv_lyric_curr, View.GONE)
+            }
 
-        if (next.isNotBlank()) {
-            rv.setViewVisibility(R.id.tv_lyric_next, View.VISIBLE)
-            rv.setTextViewText(R.id.tv_lyric_next, next)
+            if (next.isNotBlank()) {
+                val styledBadge = SpannableStringBuilder(next).apply {
+                    setSpan(StyleSpan(Typeface.BOLD), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                }
+                rv.setViewVisibility(R.id.tv_lyric_next, View.VISIBLE)
+                rv.setTextColor(R.id.tv_lyric_next, accentColor)
+                rv.setTextViewText(R.id.tv_lyric_next, styledBadge)
+            } else {
+                rv.setViewVisibility(R.id.tv_lyric_next, View.GONE)
+            }
         } else {
-            rv.setViewVisibility(R.id.tv_lyric_next, View.GONE)
+            if (prev.isNotBlank()) {
+                rv.setViewVisibility(R.id.tv_lyric_prev, View.VISIBLE)
+                rv.setTextColor(R.id.tv_lyric_prev, Color.argb(122, 255, 255, 255))
+                rv.setTextViewText(R.id.tv_lyric_prev, prev)
+            } else {
+                rv.setViewVisibility(R.id.tv_lyric_prev, View.GONE)
+            }
+
+            rv.setViewVisibility(R.id.tv_lyric_curr, View.VISIBLE)
+            rv.setTextViewText(R.id.tv_lyric_curr, curr)
+            rv.setTextColor(R.id.tv_lyric_curr, accentColor)
+
+            if (next.isNotBlank()) {
+                rv.setViewVisibility(R.id.tv_lyric_next, View.VISIBLE)
+                rv.setTextColor(R.id.tv_lyric_next, Color.argb(122, 255, 255, 255))
+                rv.setTextViewText(R.id.tv_lyric_next, next)
+            } else {
+                rv.setViewVisibility(R.id.tv_lyric_next, View.GONE)
+            }
         }
 
         rv.setImageViewBitmap(
@@ -366,8 +554,9 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun buildIslandJson(
-        pillText: String,
-        useNarrowFont: Boolean,
+        leftText: String,
+        rightText: String,
+        rightIconKey: String,
         accentHex: String
     ): JSONObject {
         val bigIslandArea = JSONObject().apply {
@@ -379,23 +568,38 @@ class HyperIslandNotifier(private val context: Context) {
                         "picInfo",
                         JSONObject().apply {
                             put("type", 1)
-                            put("pic", "miui.focus.pic_icon")
+                            put("pic", PIC_DISC)
                         }
                     )
                     put(
                         "textInfo",
                         JSONObject().apply {
-                            put("title", "")
+                            put("title", leftText)
+                            put("narrowFont", true)
+                            put("showHighlightColor", false)
                         }
                     )
                 }
             )
             put(
-                "textInfo",
+                "imageTextInfoRight",
                 JSONObject().apply {
-                    put("title", pillText)
-                    put("narrowFont", useNarrowFont)
-                    put("showHighlightColor", false)
+                    put("type", 2)
+                    put(
+                        "picInfo",
+                        JSONObject().apply {
+                            put("type", 1)
+                            put("pic", rightIconKey)
+                        }
+                    )
+                    put(
+                        "textInfo",
+                        JSONObject().apply {
+                            put("title", rightText)
+                            put("narrowFont", true)
+                            put("showHighlightColor", false)
+                        }
+                    )
                 }
             )
         }
@@ -405,7 +609,7 @@ class HyperIslandNotifier(private val context: Context) {
                 "picInfo",
                 JSONObject().apply {
                     put("type", 1)
-                    put("pic", "miui.focus.pic_icon")
+                    put("pic", PIC_DISC)
                 }
             )
             put(
@@ -415,7 +619,7 @@ class HyperIslandNotifier(private val context: Context) {
                         "picInfo",
                         JSONObject().apply {
                             put("type", 1)
-                            put("pic", "miui.focus.pic_icon")
+                            put("pic", rightIconKey)
                         }
                     )
                 }
@@ -431,28 +635,31 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun getOrBuildFocusParamJson(
-        pillText: String,
-        useNarrowFont: Boolean,
+        leftText: String,
+        rightText: String,
+        rightIconKey: String,
         accentHex: String
     ): Pair<String, String> {
-        val key = "$pillText|$useNarrowFont|$accentHex"
+        val key = "$leftText|$rightText|$rightIconKey|$accentHex"
         val existing = cachedFocusJsonPair
         if (existing != null && cachedFocusJsonKey == key) {
             return existing
         }
 
-        val islandJson = buildIslandJson(pillText, useNarrowFont, accentHex)
+        val islandJson = buildIslandJson(leftText, rightText, rightIconKey, accentHex)
+        val combinedTicker = "$leftText • $rightText"
 
         val paramV2 = JSONObject().apply {
             put("protocol", 1)
             put("business", "bitchord_lyrics")
             put("updatable", true)
+            put("reopen", true)
             put("islandFirstFloat", false)
             put("enableFloat", false)
-            put("aodTitle", pillText)
-            put("aodPic", "miui.focus.pic_disc")
-            put("ticker", pillText)
-            put("tickerPic", "miui.focus.pic_icon")
+            put("aodTitle", combinedTicker)
+            put("aodPic", PIC_DISC)
+            put("ticker", combinedTicker)
+            put("tickerPic", rightIconKey)
             put("param_island", islandJson)
         }
 
@@ -461,11 +668,12 @@ class HyperIslandNotifier(private val context: Context) {
         }.toString()
 
         val customFocusJson = JSONObject().apply {
-            put("ticker", pillText)
-            put("tickerPic", "miui.focus.pic_icon")
-            put("aodTitle", pillText)
-            put("aodPic", "miui.focus.pic_disc")
+            put("ticker", combinedTicker)
+            put("tickerPic", rightIconKey)
+            put("aodTitle", combinedTicker)
+            put("aodPic", PIC_DISC)
             put("updatable", true)
+            put("reopen", true)
             put("enableFloat", false)
             put("islandFirstFloat", false)
             put("param_island", islandJson)
@@ -477,19 +685,35 @@ class HyperIslandNotifier(private val context: Context) {
         return pair
     }
 
+    private fun resolveRightWingIcon(
+        wingState: WingState,
+        accentColor: Int
+    ): Icon {
+        return when {
+            wingState.iconKey == PIC_PAUSE -> wingPauseIcon
+            wingState.progressBucket in 0 until PROGRESS_BUCKET_COUNT -> {
+                getOrCreateProgressRingIcons(accentColor)[wingState.progressBucket]
+            }
+            else -> wingWaveIcon
+        }
+    }
+
     private fun buildNotificationInternal(
-        pillLabel: PillLabel,
+        leftText: String,
+        wingState: WingState,
         accentColor: Int,
         prevText: String,
         currText: String,
         nextText: String,
         cover: Bitmap?,
+        hasSyncedLyrics: Boolean,
         isPlaying: Boolean
     ): Notification {
         val accentHex = String.format("#%06X", 0xFFFFFF and accentColor)
-        val expandedBody = formatStyledExpandedLyrics(prevText, currText, nextText, accentColor)
+        val expandedBody = formatStyledExpandedLyrics(prevText, currText, nextText, accentColor, hasSyncedLyrics)
         val vinyl = getOrCreateVinylAssets(cover, accentColor)
-        val smallIcon = if (isPlaying) playingSmallIcon else pausedSmallIcon
+        val smallIcon = if (isPlaying) smallWaveIcon else smallPauseIcon
+        val rightIcon = resolveRightWingIcon(wingState, accentColor)
 
         val expandedRv = buildExpandedRemoteViews(
             vinyl = vinyl,
@@ -497,17 +721,20 @@ class HyperIslandNotifier(private val context: Context) {
             curr = currText,
             next = nextText,
             accentColor = accentColor,
+            hasSyncedLyrics = hasSyncedLyrics,
             isPlaying = isPlaying
         )
         val (focusJson, customFocusJson) = getOrBuildFocusParamJson(
-            pillText = pillLabel.text,
-            useNarrowFont = pillLabel.useNarrowFont,
+            leftText = leftText,
+            rightText = wingState.text,
+            rightIconKey = wingState.iconKey,
             accentHex = accentHex
         )
 
         val focusPics = Bundle().apply {
-            putParcelable("miui.focus.pic_disc", vinyl.icon)
-            putParcelable("miui.focus.pic_icon", smallIcon)
+            putParcelable(PIC_DISC, vinyl.icon)
+            putParcelable(PIC_SMALL, smallIcon)
+            putParcelable(wingState.iconKey, rightIcon)
         }
 
         val extras = Bundle().apply {
@@ -515,13 +742,15 @@ class HyperIslandNotifier(private val context: Context) {
             putString("miui.focus.param.custom", customFocusJson)
             putBundle("miui.focus.pics", focusPics)
             putParcelable("miui.focus.rv", expandedRv)
+            putParcelable("miui.focus.rv.island.expand", expandedRv)
         }
 
         return Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(smallIcon)
             .setLargeIcon(vinyl.baseDisc)
-            .setContentTitle(pillLabel.text)
+            .setContentTitle(leftText)
             .setContentText(expandedBody)
+            .setSubText(wingState.text)
             .setColor(accentColor)
             .setColorized(false)
             .setShowWhen(false)
@@ -534,113 +763,215 @@ class HyperIslandNotifier(private val context: Context) {
             .build()
     }
 
+    private fun resolveDominantAccentColor(cover: Bitmap?, palette: CoverPalette): Int {
+        val paletteAccent = palette.accent.toArgb()
+        val defaultAccent = CoverPalette().accent.toArgb()
+        if (paletteAccent != defaultAccent || cover == null || cover.isRecycled) {
+            return boostAccentBrightness(paletteAccent)
+        }
+        val sampled = sampleDominantCoverColor(cover) ?: paletteAccent
+        return boostAccentBrightness(sampled)
+    }
+
+    private fun sampleDominantCoverColor(cover: Bitmap): Int? {
+        return try {
+            if (cover.isRecycled || cover.width <= 0 || cover.height <= 0) return null
+            val mini = Bitmap.createScaledBitmap(cover, 12, 12, true)
+            var bestColor = 0
+            var bestScore = -1f
+            for (y in 0 until mini.height) {
+                for (x in 0 until mini.width) {
+                    val px = mini.getPixel(x, y)
+                    Color.colorToHSV(px, hsvBuffer)
+                    val sat = hsvBuffer[1]
+                    val valB = hsvBuffer[2]
+                    val score = sat * 1.6f + if (valB in 0.25f..0.92f) 0.4f else 0f
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestColor = px
+                    }
+                }
+            }
+            if (mini !== cover) mini.recycle()
+            if (bestScore > 0f) bestColor else null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     fun buildNotification(
         title: String,
+        artist: String,
         prevLyric: String,
         currentLine: LyricLine?,
         nextLyric1: String,
         cover: Bitmap?,
         palette: CoverPalette,
-        isPlaying: Boolean
+        isPlaying: Boolean,
+        posMs: Long,
+        durationMs: Long,
+        syncOffsetMs: Long,
+        showSyncEvent: Boolean,
+        sourceLabel: String,
+        hasSyncedLyrics: Boolean
     ): Notification {
-        val pillLabel = buildStaticPillLabel(title, isPlaying)
-        val accentColor = boostAccentBrightness(palette.accent.toArgb())
+        val leftText = buildLeftWingTitle(title)
+        val wingState = computeRightWingState(
+            artist = artist,
+            isPlaying = isPlaying,
+            posMs = posMs,
+            durationMs = durationMs,
+            syncOffsetMs = syncOffsetMs,
+            showSyncEvent = showSyncEvent,
+            sourceLabel = sourceLabel
+        )
+        val accentColor = resolveDominantAccentColor(cover, palette)
         val (prevText, currText, nextText) = resolveDisplayLines(
             prevLyric = prevLyric,
             currentLine = currentLine,
             nextLyric1 = nextLyric1,
             title = title,
+            artist = artist,
+            posMs = posMs,
+            durationMs = durationMs,
+            sourceLabel = sourceLabel,
+            hasSyncedLyrics = hasSyncedLyrics,
             isPlaying = isPlaying
         )
 
         return buildNotificationInternal(
-            pillLabel = pillLabel,
+            leftText = leftText,
+            wingState = wingState,
             accentColor = accentColor,
             prevText = prevText,
             currText = currText,
             nextText = nextText,
             cover = cover,
+            hasSyncedLyrics = hasSyncedLyrics,
             isPlaying = isPlaying
         )
     }
 
     fun markForegroundPosted(
         title: String,
+        artist: String,
         prevLyric: String,
         currentLine: LyricLine?,
         nextLyric1: String,
         cover: Bitmap?,
         palette: CoverPalette,
-        isPlaying: Boolean
+        isPlaying: Boolean,
+        posMs: Long,
+        durationMs: Long,
+        syncOffsetMs: Long,
+        showSyncEvent: Boolean,
+        sourceLabel: String,
+        hasSyncedLyrics: Boolean
     ) {
-        val pillLabel = buildStaticPillLabel(title, isPlaying)
-        val accentColor = boostAccentBrightness(palette.accent.toArgb())
+        val leftText = buildLeftWingTitle(title)
+        val wingState = computeRightWingState(
+            artist = artist,
+            isPlaying = isPlaying,
+            posMs = posMs,
+            durationMs = durationMs,
+            syncOffsetMs = syncOffsetMs,
+            showSyncEvent = showSyncEvent,
+            sourceLabel = sourceLabel
+        )
+        val accentColor = resolveDominantAccentColor(cover, palette)
         val (prevText, currText, nextText) = resolveDisplayLines(
             prevLyric = prevLyric,
             currentLine = currentLine,
             nextLyric1 = nextLyric1,
             title = title,
+            artist = artist,
+            posMs = posMs,
+            durationMs = durationMs,
+            sourceLabel = sourceLabel,
+            hasSyncedLyrics = hasSyncedLyrics,
             isPlaying = isPlaying
         )
         val coverId = System.identityHashCode(cover)
-        val trackStateKey = "${pillLabel.text}|$isPlaying|$accentColor|$coverId"
-        lastTrackStateKey = trackStateKey
-        lastFullStateKey = "$trackStateKey|$prevText|$currText|$nextText"
+        lastFullStateKey =
+            "$leftText|${wingState.text}|${wingState.iconKey}|$isPlaying|$accentColor|$coverId|$hasSyncedLyrics|$prevText|$currText|$nextText"
     }
 
     fun resetCache() {
-        lastTrackStateKey = ""
         lastFullStateKey = ""
     }
 
     fun update(
         title: String,
+        artist: String,
         prevLyric: String,
         currentLine: LyricLine?,
         nextLyric1: String,
         cover: Bitmap?,
         palette: CoverPalette,
-        isPlaying: Boolean
+        isPlaying: Boolean,
+        posMs: Long,
+        durationMs: Long,
+        syncOffsetMs: Long,
+        showSyncEvent: Boolean,
+        sourceLabel: String,
+        hasSyncedLyrics: Boolean
     ) {
-        val pillLabel = buildStaticPillLabel(title, isPlaying)
-        val accentColor = boostAccentBrightness(palette.accent.toArgb())
+        val isScreenOn = powerManager?.isInteractive ?: true
+        if (!isScreenOn) return
+
+        val leftText = buildLeftWingTitle(title)
+        val wingState = computeRightWingState(
+            artist = artist,
+            isPlaying = isPlaying,
+            posMs = posMs,
+            durationMs = durationMs,
+            syncOffsetMs = syncOffsetMs,
+            showSyncEvent = showSyncEvent,
+            sourceLabel = sourceLabel
+        )
+        val accentColor = resolveDominantAccentColor(cover, palette)
         val (prevText, currText, nextText) = resolveDisplayLines(
             prevLyric = prevLyric,
             currentLine = currentLine,
             nextLyric1 = nextLyric1,
             title = title,
+            artist = artist,
+            posMs = posMs,
+            durationMs = durationMs,
+            sourceLabel = sourceLabel,
+            hasSyncedLyrics = hasSyncedLyrics,
             isPlaying = isPlaying
         )
 
         val coverId = System.identityHashCode(cover)
-        val trackStateKey = "${pillLabel.text}|$isPlaying|$accentColor|$coverId"
-        val fullStateKey = "$trackStateKey|$prevText|$currText|$nextText"
+        val fullStateKey =
+            "$leftText|${wingState.text}|${wingState.iconKey}|$isPlaying|$accentColor|$coverId|$hasSyncedLyrics|$prevText|$currText|$nextText"
 
         if (fullStateKey == lastFullStateKey) return
-
-        val isScreenOn = powerManager?.isInteractive ?: true
-        if (!isScreenOn && trackStateKey == lastTrackStateKey) return
-
-        lastTrackStateKey = trackStateKey
         lastFullStateKey = fullStateKey
 
-        manager.notify(
-            NOTIFICATION_ID,
-            buildNotificationInternal(
-                pillLabel = pillLabel,
-                accentColor = accentColor,
-                prevText = prevText,
-                currText = currText,
-                nextText = nextText,
-                cover = cover,
-                isPlaying = isPlaying
+        try {
+            manager.notify(
+                NOTIFICATION_ID,
+                buildNotificationInternal(
+                    leftText = leftText,
+                    wingState = wingState,
+                    accentColor = accentColor,
+                    prevText = prevText,
+                    currText = currText,
+                    nextText = nextText,
+                    cover = cover,
+                    hasSyncedLyrics = hasSyncedLyrics,
+                    isPlaying = isPlaying
+                )
             )
-        )
+        } catch (t: Throwable) {
+            Log.e("HyperIslandNotifier", "Notification update failed: ${t.message}", t)
+        }
     }
 
     fun cancel() {
         lastFullStateKey = ""
-        lastTrackStateKey = ""
         manager.cancel(NOTIFICATION_ID)
     }
 
@@ -649,9 +980,49 @@ class HyperIslandNotifier(private val context: Context) {
         if (hsvBuffer[1] < 0.14f) {
             return Color.rgb(228, 236, 255)
         }
-        hsvBuffer[2] = hsvBuffer[2].coerceAtLeast(0.92f)
-        hsvBuffer[1] = hsvBuffer[1].coerceIn(0.40f, 0.85f)
+        hsvBuffer[2] = hsvBuffer[2].coerceAtLeast(0.94f)
+        hsvBuffer[1] = hsvBuffer[1].coerceIn(0.45f, 0.90f)
         return Color.HSVToColor(255, hsvBuffer)
+    }
+
+    private fun getOrCreateProgressRingIcons(accentColor: Int): Array<Icon> {
+        val existing = cachedProgressRingIcons
+        if (existing != null && cachedRingAccent == accentColor) {
+            return existing
+        }
+
+        val generated = Array(PROGRESS_BUCKET_COUNT) { bucket ->
+            val fraction = (bucket + 1) / PROGRESS_BUCKET_COUNT.toFloat()
+            Icon.createWithBitmap(renderProgressRingBitmap(WING_ICON_SIZE, fraction, accentColor))
+        }
+        cachedRingAccent = accentColor
+        cachedProgressRingIcons = generated
+        return generated
+    }
+
+    private fun renderProgressRingBitmap(size: Int, progressFraction: Float, accentColor: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val strokeW = size * 0.115f
+        val pad = strokeW * 0.95f
+        val oval = RectF(pad, pad, size - pad, size - pad)
+
+        val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(72, 255, 255, 255)
+            style = Paint.Style.STROKE
+            strokeWidth = strokeW
+        }
+        canvas.drawOval(oval, trackPaint)
+
+        val arcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = accentColor
+            style = Paint.Style.STROKE
+            strokeWidth = strokeW
+            strokeCap = Paint.Cap.ROUND
+        }
+        val sweepDeg = (progressFraction.coerceIn(0.08f, 1f) * 360f)
+        canvas.drawArc(oval, -90f, sweepDeg, false, arcPaint)
+        return bmp
     }
 
     private fun getOrCreateVinylAssets(cover: Bitmap?, accentColor: Int): VinylAssets {
@@ -688,7 +1059,7 @@ class HyperIslandNotifier(private val context: Context) {
         val rotated = if (normalizedStep == 0) {
             baseDisc
         } else {
-            renderRotatedDisc(baseDisc, baseDisc.width, angle)
+            renderRotatedDisc(baseDisc, SPIN_FRAME_SIZE, angle)
         }
         cachedPausedBase = baseDisc
         cachedPausedStep = normalizedStep
@@ -814,16 +1185,15 @@ class HyperIslandNotifier(private val context: Context) {
         return bmp
     }
 
-    private fun renderStaticWaveBitmap(): Bitmap {
-        val size = 48
+    private fun renderWaveBitmap(size: Int): Bitmap {
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
             style = Paint.Style.FILL
         }
-        val heights = floatArrayOf(0.42f, 0.92f, 0.42f)
-        val pad = size * 0.16f
+        val heights = floatArrayOf(0.42f, 0.92f, 0.56f)
+        val pad = size * 0.18f
         val usableW = size - pad * 2f
         val usableH = size - pad * 2f
         val gap = usableW * 0.16f
@@ -839,8 +1209,7 @@ class HyperIslandNotifier(private val context: Context) {
         return bmp
     }
 
-    private fun renderSmallPauseBitmap(): Bitmap {
-        val size = 48
+    private fun renderPauseGlyphBitmap(size: Int): Bitmap {
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
