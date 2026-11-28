@@ -179,13 +179,7 @@ class BitChordListenerService : NotificationListenerService() {
                         inst.notifier.hasRealAudioSpec(inst.currentSpecBadge)
                     if (specJustCaptured && playing) {
                         val rawPos = LyricsPlaybackStore.rawPositionMs().coerceAtLeast(0L)
-                        val normalPhase3End = inst.notifier.normalPhase3EndMs(
-                            inst.currentTitle,
-                            inst.currentArtist,
-                            hasRealSpec = true
-                        )
-                        val normalPhase3Start = (normalPhase3End - QUALITY_FLASH_DURATION_MS).coerceAtLeast(0L)
-                        if (rawPos >= normalPhase3Start) {
+                        if (rawPos >= 4_500L) {
                             inst.qualityFlashTrackKey = trackKey
                             inst.qualityFlashUntilElapsedMs =
                                 SystemClock.elapsedRealtime() + QUALITY_FLASH_DURATION_MS
@@ -266,6 +260,7 @@ class BitChordListenerService : NotificationListenerService() {
 
     private var lastLineIndex = -1
     private var lastRenderKey = ""
+    private var lastWingRenderKey = ""
     private var lastAutoStateKey = ""
     private var lastNotifyRealtimeMs = 0L
     private var userSeekGraceUntilMs = 0L
@@ -1200,7 +1195,7 @@ class BitChordListenerService : NotificationListenerService() {
             hasRealSpec = hasRealSpec
         )
         val deltaPhaseMs = if (nextPhasePosMs < Long.MAX_VALUE && nextPhasePosMs > rawPosMs) {
-            ((nextPhasePosMs - rawPosMs + 25L) / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
+            ((nextPhasePosMs - rawPosMs + 15L) / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
         } else {
             Long.MAX_VALUE
         }
@@ -1276,18 +1271,24 @@ class BitChordListenerService : NotificationListenerService() {
         )
         val albumArtHash = (currentCoverSig xor (currentCoverSig ushr 32)).toInt()
 
+        val wingRenderKey = "${wingState.leftText}|${wingState.leftIconKey}|" +
+            "${wingState.rightText}|${wingState.rightIconKey}|$isPlaying|$forcePhase3Flash"
+        val wingChanged = wingRenderKey != lastWingRenderKey
+
         val renderKey = "$currentTrackKey|$idx|$isPlaying|$forcePhase3Flash|" +
             "${wingState.leftText}|${wingState.leftIconKey}|" +
             "${wingState.rightText}|${wingState.rightIconKey}|" +
             "${wingState.progressStep}|$currentCodecBadge|$currentSpecBadge|$albumArtHash"
         if (!forceImmediate && renderKey == lastRenderKey) return
 
-        if (!forceImmediate && isForegroundStarted && now - lastNotifyRealtimeMs < MIN_LINE_INTERVAL_MS) {
+        // Non scartare mai i cambi fase/pagina/flash della pillola anche se vicini a una riga lyrics
+        if (!forceImmediate && !wingChanged && isForegroundStarted && now - lastNotifyRealtimeMs < MIN_LINE_INTERVAL_MS) {
             return
         }
 
         lastLineIndex = idx
         lastRenderKey = renderKey
+        lastWingRenderKey = wingRenderKey
         lastNotifyRealtimeMs = now
 
         val prev2 = if (idx > 1) currentLines[idx - 2].fullText else ""

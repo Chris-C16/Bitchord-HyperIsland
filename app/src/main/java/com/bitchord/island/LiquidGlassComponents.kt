@@ -3121,6 +3121,7 @@ private fun LiquidSettingsModal(
     val accConnected by BitChordQualityAccessibilityService.isServiceConnected.collectAsState()
     val lastAccPkg by LyricsPlaybackStore.lastAccessibilityPackage.collectAsState()
     val lastAccMatch by LyricsPlaybackStore.lastAccessibilityRawMatch.collectAsState()
+    val currentAudioSpec by LyricsPlaybackStore.audioSpecBadge.collectAsState()
     var resumeTrigger by remember { mutableIntStateOf(0) }
     val lifecycleOwner = context as? androidx.lifecycle.LifecycleOwner
     DisposableEffect(lifecycleOwner) {
@@ -3302,9 +3303,23 @@ private fun LiquidSettingsModal(
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = "Accessibilità: ${if (bitChordAccessibilityOk) "Attiva" else "Spenta"} • " +
-                    "Pkg: ${lastAccPkg.ifBlank { activePkg.ifBlank { "nessuno" } }} • " +
-                    "Ultimo match: ${lastAccMatch.ifBlank { "nessuno" }}",
+                text = if (bitChordAccessibilityOk) {
+                    "Attivo"
+                } else {
+                    "Spento (abilita prima \"Consenti impostazioni con restrizioni\" in Info App)"
+                },
+                fontFamily = font,
+                fontSize = 10.5.sp,
+                lineHeight = 14.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                color = if (bitChordAccessibilityOk) Color(0xFF86EFAC) else Color(0xFFFDE68A),
+                modifier = Modifier.padding(horizontal = 6.dp)
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = "Pkg: ${lastAccPkg.ifBlank { activePkg.ifBlank { "nessuno" } }} • " +
+                    "Letto: ${currentAudioSpec.ifBlank { lastAccMatch.ifBlank { "nessuno" } }}",
                 fontFamily = font,
                 fontSize = 10.5.sp,
                 lineHeight = 14.sp,
@@ -3313,19 +3328,6 @@ private fun LiquidSettingsModal(
                 color = Color.White.copy(alpha = 0.72f),
                 modifier = Modifier.padding(horizontal = 6.dp)
             )
-            if (!bitChordAccessibilityOk) {
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    text = "Attiva DynamicLyrics per leggere Bit e kHz reali da BitChord",
-                    fontFamily = font,
-                    fontSize = 10.5.sp,
-                    lineHeight = 14.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    color = Color.White.copy(alpha = 0.56f),
-                    modifier = Modifier.padding(horizontal = 6.dp)
-                )
-            }
             Spacer(Modifier.height(8.dp))
             DiagnosticRow(
                 label = "Servizio DynamicLyrics",

@@ -14,20 +14,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 class BitChordQualityAccessibilityService : AccessibilityService() {
 
     companion object {
-        private const val SCAN_THROTTLE_MS = 650L
-        private const val MAX_TRAVERSE_NODES = 280
-        private const val MAX_ATTEMPTS_BEFORE_FOUND = 6
+        private const val SCAN_THROTTLE_MS = 400L
+        private const val MAX_TRAVERSE_NODES = 250
+        private const val MAX_ATTEMPTS_BEFORE_FOUND = 8
 
-        private val REGEX_CODEC = Regex("""\b(flac|alac|wav|mqa|dsd\d*|aac|opus|mp3)\b""", RegexOption.IGNORE_CASE)
-        private val REGEX_BIT_DEPTH = Regex("""(\d{2})\s*-?\s*bit\b""", RegexOption.IGNORE_CASE)
-        private val REGEX_SAMPLE_RATE = Regex("""(\d{2,3}(?:\.\d)?)\s*k?hz\b""", RegexOption.IGNORE_CASE)
+        private val REGEX_CODEC = Regex("""\b(FLAC|ALAC|WAV|MQA|DSD\d*|OPUS|AAC|MP3)\b""", RegexOption.IGNORE_CASE)
+        private val REGEX_BIT_DEPTH = Regex("""\b(16|24|32)\s*-?\s*bit\b""", RegexOption.IGNORE_CASE)
+        private val REGEX_SAMPLE_RATE = Regex("""\b(\d{2,3}(?:\.\d+)?)\s*k\s*hz\b""", RegexOption.IGNORE_CASE)
         private val REGEX_SAMPLE_RATE_HZ = Regex("""\b(384000|352800|192000|176400|96000|88200|48000|44100)\s*hz\b""", RegexOption.IGNORE_CASE)
-        private val REGEX_AUDIO_CONTEXT = Regex(
-            """(?i)(?:\b(flac|alac|wav|mqa|dsd\d*|aac|opus|mp3|stereo|mono)\b|\d+\s*-?\s*bit\b|\d+(?:\.\d)?\s*k?hz\b|\d+\s*kbps\b)"""
-        )
-        private val REGEX_RAW_SPEC_HINT = Regex(
-            """(?i)(?:\d+\s*-?\s*bit\b|\d+(?:\.\d)?\s*k?hz\b)"""
-        )
+        private val REGEX_PURE_TIME = Regex("""^\d{1,2}:\d{2}(?::\d{2})?$""")
 
         val isServiceConnected = MutableStateFlow(false)
 
@@ -99,9 +94,10 @@ class BitChordQualityAccessibilityService : AccessibilityService() {
             return
         }
 
-        if (trackKey == lastAttemptedTrackKey && attemptsForTrack >= MAX_ATTEMPTS_BEFORE_FOUND &&
-            event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-        ) {
+        val eventType = event?.eventType ?: 0
+        if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            attemptsForTrack = 0
+        } else if (trackKey == lastAttemptedTrackKey && attemptsForTrack >= MAX_ATTEMPTS_BEFORE_FOUND) {
             return
         }
 
@@ -119,25 +115,35 @@ class BitChordQualityAccessibilityService : AccessibilityService() {
             attemptsForTrack++
         }
 
-        val candidates = ArrayList<String>(16)
+        val combinedBuffer = StringBuilder(512)
+        val sampleNodes = ArrayList<String>(2)
+        var visitedTotal = 0
+
         for (root in roots) {
-            scanSubtreeRecursive(root, candidates)
-        }
-        if (candidates.isEmpty()) return
-
-        val rawMatch = candidates.firstOrNull { REGEX_RAW_SPEC_HINT.containsMatchIn(it) }
-            ?: candidates.firstOrNull()
-        if (!rawMatch.isNullOrBlank()) {
-            val combinedRaw = candidates.filter { REGEX_RAW_SPEC_HINT.containsMatchIn(it) }
-                .distinct()
-                .joinToString(" | ")
-                .ifBlank { rawMatch }
-            LyricsPlaybackStore.lastAccessibilityRawMatch.value = combinedRaw.take(64)
+            if (visitedTotal >= MAX_TRAVERSE_NODES) break
+            visitedTotal = collectWindowTexts(
+                node = root,
+                visitedStart = visitedTotal,
+                buffer = combinedBuffer,
+                sampleOut = sampleNodes
+            )
         }
 
-        val parsed = parseAudioQualityCandidates(candidates) ?: return
-        val (codec, spec) = parsed
-        if (!hasRealSpec(spec)) return
+        if (combinedBuffer.isEmpty()) return
+
+        val allText = combinedBuffer.toString()
+        val parsed = parseConcatenatedBuffer(allText)
+
+        if (parsed == null) {
+            if (sampleNodes.isNotEmpty()) {
+                LyricsPlaybackStore.lastAccessibilityRawMatch.value =
+                    sampleNodes.joinToString(" | ").take(64)
+            }
+            return
+        }
+
+        val (codec, spec, matchedSnippet) = parsed
+        LyricsPlaybackStore.lastAccessibilityRawMatch.value = matchedSnippet.ifBlank { spec }.take(64)
 
         AppPreferences.putCachedBitChordQuality(applicationContext, trackKey, codec, spec)
         LyricsPlaybackStore.audioCodecBadge.value = codec
@@ -154,14 +160,14 @@ class BitChordQualityAccessibilityService : AccessibilityService() {
 
     private fun collectMatchingWindowRoots(eventPkg: String): List<AccessibilityNodeInfo> {
         val result = ArrayList<AccessibilityNodeInfo>(4)
-        val seenHashes = HashSet<Int>(4)
+        val seenIds = HashSet<Int>(4)
 
         fun tryAddRoot(node: AccessibilityNodeInfo?) {
             if (node == null) return
             val nodePkg = node.packageName?.toString().orEmpty()
             if (isAcceptedPackage(nodePkg) || (nodePkg.isBlank() && isAcceptedPackage(eventPkg))) {
                 val id = System.identityHashCode(node)
-                if (seenHashes.add(id)) {
+                if (seenIds.add(id)) {
                     result += node
                 }
             }
@@ -190,22 +196,30 @@ class BitChordQualityAccessibilityService : AccessibilityService() {
         return result
     }
 
-    private fun scanSubtreeRecursive(node: AccessibilityNodeInfo, out: MutableList<String>) {
-        if (out.size >= 48) return
-        var visited = 0
+    private fun collectWindowTexts(
+        node: AccessibilityNodeInfo,
+        visitedStart: Int,
+        buffer: StringBuilder,
+        sampleOut: MutableList<String>
+    ): Int {
+        var visited = visitedStart
+
+        fun appendPiece(raw: CharSequence?) {
+            val clean = raw?.toString()?.trim() ?: return
+            if (clean.isEmpty() || clean.length > 220) return
+            if (buffer.isNotEmpty()) buffer.append('\n')
+            buffer.append(clean)
+            if (sampleOut.size < 2 && !REGEX_PURE_TIME.matches(clean) && !sampleOut.contains(clean)) {
+                sampleOut += clean
+            }
+        }
 
         fun visit(cur: AccessibilityNodeInfo) {
-            if (visited >= MAX_TRAVERSE_NODES || out.size >= 48) return
+            if (visited >= MAX_TRAVERSE_NODES) return
             visited++
 
-            val text = cur.text?.toString()?.trim()
-            if (!text.isNullOrEmpty() && text.length <= 180 && REGEX_AUDIO_CONTEXT.containsMatchIn(text)) {
-                out += text
-            }
-            val desc = cur.contentDescription?.toString()?.trim()
-            if (!desc.isNullOrEmpty() && desc.length <= 180 && REGEX_AUDIO_CONTEXT.containsMatchIn(desc)) {
-                out += desc
-            }
+            appendPiece(cur.text)
+            appendPiece(cur.contentDescription)
 
             val count = cur.childCount
             for (i in 0 until count) {
@@ -216,83 +230,66 @@ class BitChordQualityAccessibilityService : AccessibilityService() {
         }
 
         visit(node)
+        return visited
     }
 
     private fun hasRealSpec(spec: String): Boolean {
         return spec.contains("Bit", ignoreCase = true) || spec.contains("k", ignoreCase = true)
     }
 
-    private fun parseAudioQualityCandidates(candidates: List<String>): Pair<String, String>? {
-        var codec: String? = null
-        var bitDepth: String? = null
-        var rateKhz: String? = null
+    private data class ParsedAccessibilityAudio(
+        val codec: String,
+        val spec: String,
+        val rawMatch: String
+    )
 
-        for (text in candidates) {
-            if (codec == null) {
-                REGEX_CODEC.find(text)?.let { match ->
-                    codec = match.groupValues[1].uppercase().take(7)
-                }
+    private fun parseConcatenatedBuffer(fullText: String): ParsedAccessibilityAudio? {
+        val codec = REGEX_CODEC.find(fullText)?.groupValues?.get(1)?.uppercase()?.take(7)
+
+        val bitMatch = REGEX_BIT_DEPTH.find(fullText)
+        val bitDepth = bitMatch?.groupValues?.get(1)
+
+        var rateMatchText = ""
+        var shortRateInt: String? = null
+        val khzMatch = REGEX_SAMPLE_RATE.find(fullText)
+        if (khzMatch != null) {
+            val num = khzMatch.groupValues[1].toFloatOrNull()
+            if (num != null && num in 22f..768f) {
+                shortRateInt = num.toInt().toString()
+                rateMatchText = khzMatch.value
             }
-            if (bitDepth == null) {
-                REGEX_BIT_DEPTH.find(text)?.let { match ->
-                    val bits = match.groupValues[1].toIntOrNull()
-                    if (bits in setOf(16, 24, 32, 64)) {
-                        bitDepth = match.groupValues[1]
-                    }
-                }
-            }
-            if (rateKhz == null) {
-                REGEX_SAMPLE_RATE_HZ.find(text)?.let { match ->
-                    rateKhz = when (match.groupValues[1]) {
-                        "44100" -> "44.1"
-                        "48000" -> "48"
-                        "88200" -> "88.2"
-                        "96000" -> "96"
-                        "176400" -> "176.4"
-                        "192000" -> "192"
-                        "352800" -> "352.8"
-                        "384000" -> "384"
-                        else -> null
-                    }
-                }
-            }
-            if (rateKhz == null) {
-                REGEX_SAMPLE_RATE.find(text)?.let { match ->
-                    if (match.value.contains("k", ignoreCase = true)) {
-                        val raw = match.groupValues[1]
-                        val num = raw.toFloatOrNull()
-                        if (num != null && num in 22f..768f) {
-                            rateKhz = if (raw.endsWith(".0")) raw.removeSuffix(".0") else raw
-                        }
-                    }
+        }
+        if (shortRateInt == null) {
+            val rawHzMatch = REGEX_SAMPLE_RATE_HZ.find(fullText)
+            if (rawHzMatch != null) {
+                val hz = rawHzMatch.groupValues[1].toIntOrNull()
+                if (hz != null) {
+                    shortRateInt = (hz / 1000).toString()
+                    rateMatchText = rawHzMatch.value
                 }
             }
         }
 
-        val spec = formatCompactSpec(rateKhz, bitDepth) ?: return null
-        val resolvedCodec = codec ?: "FLAC"
-        return resolvedCodec to spec
-    }
-
-    private fun formatCompactSpec(rateKhz: String?, bitDepth: String?): String? {
-        val cleanRate = rateKhz?.let { if (it.endsWith(".0")) it.removeSuffix(".0") else it }
-        return when {
-            cleanRate != null && bitDepth != null -> {
-                val full = "${cleanRate}k ${bitDepth}Bit"
-                if (full.length <= 10) {
-                    full
-                } else {
-                    val intRate = cleanRate.substringBefore('.')
-                    val compact = "${intRate}k ${bitDepth}Bit"
-                    if (compact.length <= 10) compact else "${intRate}k ${bitDepth}b"
-                }
+        val spec = when {
+            shortRateInt != null && bitDepth != null -> {
+                val full = "${shortRateInt}k ${bitDepth}Bit"
+                if (full.length <= 10) full else "${shortRateInt}k ${bitDepth}b"
             }
             bitDepth != null -> "${bitDepth}Bit"
-            cleanRate != null -> {
-                val solo = "${cleanRate}kHz"
-                if (solo.length <= 10) solo else "${cleanRate.substringBefore('.')}kHz"
-            }
-            else -> null
+            shortRateInt != null -> "${shortRateInt}kHz"
+            else -> return null
         }
+
+        val rawSnippet = listOfNotNull(
+            codec,
+            bitMatch?.value,
+            rateMatchText.takeIf { it.isNotBlank() }
+        ).joinToString(" · ")
+
+        return ParsedAccessibilityAudio(
+            codec = codec ?: "FLAC",
+            spec = spec,
+            rawMatch = rawSnippet
+        )
     }
 }

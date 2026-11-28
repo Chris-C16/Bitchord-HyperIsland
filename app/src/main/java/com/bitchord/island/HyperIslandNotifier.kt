@@ -53,6 +53,7 @@ class HyperIslandNotifier(private val context: Context) {
         private const val PHASE_1_GIANT_STEP_MS = 2_250L
         private const val PHASE_2_STEP_MS = 2_000L
         private const val PHASE_2_SINGLE_PAGE_MS = 2_500L
+        private const val PHASE_2_MEDIUM_SINGLE_SCREEN_MS = 3_000L
         private const val PHASE_3_DURATION_MS = 4_500L
 
         private val REGEX_REAL_SPEC = Regex("""\d+\s*(?:k|khz|bit|b)\b""", RegexOption.IGNORE_CASE)
@@ -101,7 +102,8 @@ class HyperIslandNotifier(private val context: Context) {
     private data class ExpandedTwoToneTheme(
         val bgStartColor: Int,
         val bgEndColor: Int,
-        val activeLyricColor: Int
+        val activeLyricColor: Int,
+        val dominantRingColor: Int
     )
 
     private data class PhaseBounds(
@@ -110,6 +112,7 @@ class HyperIslandNotifier(private val context: Context) {
         val titlePages: List<String>,
         val artistPages: List<String>,
         val skipPhase2: Boolean,
+        val singleScreenMediumPhase2: Boolean,
         val phase2PageCount: Int,
         val phase2EndMs: Long,
         val phase3EndMs: Long
@@ -260,6 +263,44 @@ class HyperIslandNotifier(private val context: Context) {
         return finalClean
     }
 
+    fun formatCompactLeftTitle(cleanTitle: String, maxChars: Int = MAX_PAGE_CHARS): String {
+        val clean = cleanLine(cleanTitle)
+        if (clean.isEmpty()) return ""
+        if (clean.length <= maxChars) return clean
+
+        val words = clean.split(' ').filter { it.isNotEmpty() }.map { token ->
+            val trimmed = token.trimEnd(',', ';', ':')
+            trimmed.ifEmpty { token }
+        }
+        if (words.isEmpty()) return clean.take(maxChars)
+
+        val sb = StringBuilder()
+        for (word in words) {
+            if (sb.isEmpty()) {
+                if (word.length <= maxChars) {
+                    sb.append(word)
+                } else {
+                    break
+                }
+            } else if (sb.length + 1 + word.length <= maxChars) {
+                sb.append(' ').append(word)
+            } else {
+                break
+            }
+        }
+
+        val result = sb.toString()
+        if (result.length < 4) {
+            val nextCombined = if (words.size >= 2 && result.isNotEmpty()) {
+                "$result ${words[1]}"
+            } else {
+                clean
+            }
+            return nextCombined.take(maxChars).trimEnd()
+        }
+        return result
+    }
+
     fun splitIntoWordPages(text: String, maxChars: Int = MAX_PAGE_CHARS): List<String> {
         val normalized = cleanLine(text)
         if (normalized.isEmpty()) return emptyList()
@@ -363,9 +404,20 @@ class HyperIslandNotifier(private val context: Context) {
         val titlePages = splitIntoWordPages(cleanTitle, MAX_PAGE_CHARS)
         val artistPages = splitIntoWordPages(cleanArtist, MAX_PAGE_CHARS)
         val skipPhase2 = cleanTitle.length <= 9 && cleanArtist.length <= 9
-        val phase2PageCount = if (skipPhase2) 0 else max(artistPages.size, titlePages.size).coerceAtLeast(1)
+        val titleShownFullAcrossBothWingsInPhase1 =
+            cleanTitle.length in (MAX_PAGE_CHARS + 1)..(MAX_PAGE_CHARS * 2) ||
+                (cleanTitle.length > MAX_PAGE_CHARS * 2 && titlePages.size <= 2)
+        val singleScreenMediumPhase2 = !skipPhase2 &&
+            titleShownFullAcrossBothWingsInPhase1 &&
+            artistPages.size <= 1
+        val phase2PageCount = when {
+            skipPhase2 -> 0
+            singleScreenMediumPhase2 -> 1
+            else -> max(artistPages.size, titlePages.size).coerceAtLeast(1)
+        }
         val phase2DurationMs = when {
             skipPhase2 -> 0L
+            singleScreenMediumPhase2 -> PHASE_2_MEDIUM_SINGLE_SCREEN_MS
             phase2PageCount <= 1 -> PHASE_2_SINGLE_PAGE_MS
             else -> phase2PageCount * PHASE_2_STEP_MS
         }
@@ -377,6 +429,7 @@ class HyperIslandNotifier(private val context: Context) {
             titlePages = titlePages,
             artistPages = artistPages,
             skipPhase2 = skipPhase2,
+            singleScreenMediumPhase2 = singleScreenMediumPhase2,
             phase2PageCount = phase2PageCount,
             phase2EndMs = phase2EndMs,
             phase3EndMs = phase3EndMs
@@ -407,7 +460,7 @@ class HyperIslandNotifier(private val context: Context) {
             }
         }
         if (!bounds.skipPhase2 && pos < bounds.phase2EndMs) {
-            if (bounds.phase2PageCount > 1) {
+            if (!bounds.singleScreenMediumPhase2 && bounds.phase2PageCount > 1) {
                 val nextPagePos = PHASE_1_END_MS +
                     (((pos - PHASE_1_END_MS) / PHASE_2_STEP_MS) + 1L) * PHASE_2_STEP_MS
                 return min(nextPagePos, bounds.phase2EndMs)
@@ -430,12 +483,11 @@ class HyperIslandNotifier(private val context: Context) {
         audioSpecBadge: String,
         forcePhase3Flash: Boolean = false
     ): DualWingState {
-        // 1. Stato Pausa bilanciato (!isPlaying): [Vinile] + 1a pagina titolo (max 9 car.) | "In pausa" + [Pausa]
+        // 1. Stato Pausa bilanciato (!isPlaying): [Vinile] + titolo compatto (max 10 car., mai una lettera sola) | "In pausa" + [Pausa]
         if (!isPlaying) {
             val cleanPauseTitle = getCleanTitle(title).ifBlank { "Lyrics" }
-            val pauseLeftTitle = splitIntoWordPages(cleanPauseTitle, 9)
-                .firstOrNull()?.takeIf { it.isNotBlank() }
-                ?: cleanPauseTitle.take(9).ifBlank { "Lyrics" }
+            val pauseLeftTitle = formatCompactLeftTitle(cleanPauseTitle, MAX_PAGE_CHARS)
+                .ifBlank { "Lyrics" }
             return DualWingState(
                 leftText = pauseLeftTitle,
                 leftIconKey = PIC_DISC,
@@ -500,8 +552,19 @@ class HyperIslandNotifier(private val context: Context) {
             )
         }
 
-        // 3. Fase 2 — Artista (Sx) + Titolo (Dx) a Parole Intere (1 solo giro, saltata se entrambi <= 9 car.)
+        // 3. Fase 2 — Artista (Sx) + Titolo (Dx) a Parole Intere
         if (!bounds.skipPhase2 && safePos < bounds.phase2EndMs) {
+            if (bounds.singleScreenMediumPhase2) {
+                val leftArtist = bounds.artistPages.firstOrNull() ?: bounds.cleanArtist.take(MAX_PAGE_CHARS)
+                val rightCompactTitle = formatCompactLeftTitle(bounds.cleanTitle, MAX_PAGE_CHARS)
+                return DualWingState(
+                    leftText = leftArtist,
+                    leftIconKey = PIC_DISC,
+                    rightText = rightCompactTitle,
+                    rightIconKey = ringKey,
+                    progressStep = step
+                )
+            }
             val pageStep = ((safePos - PHASE_1_END_MS) / PHASE_2_STEP_MS).toInt().coerceAtLeast(0)
             val leftPage = if (bounds.artistPages.isEmpty()) {
                 bounds.cleanArtist.take(MAX_PAGE_CHARS)
@@ -681,7 +744,7 @@ class HyperIslandNotifier(private val context: Context) {
             rv.setImageViewBitmap(R.id.iv_disc_cover, getPausedDiscBitmap(vinyl.baseDisc, lastSpinStep))
         }
 
-        val secondaryLineColor = Color.argb(179, 255, 255, 255) // #B3FFFFFF nitido sul gradiente
+        val secondaryLineColor = Color.argb(140, 255, 255, 255) // #8CFFFFFF
 
         if (!hasSyncedLyrics) {
             val styledTitle = SpannableStringBuilder(prev).apply {
@@ -690,6 +753,7 @@ class HyperIslandNotifier(private val context: Context) {
                 setSpan(RelativeSizeSpan(1.18f), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
             rv.setViewVisibility(R.id.tv_lyric_prev, View.VISIBLE)
+            rv.setTextViewTextSize(R.id.tv_lyric_prev, TypedValue.COMPLEX_UNIT_SP, 12f)
             rv.setTextColor(R.id.tv_lyric_prev, Color.WHITE)
             rv.setTextViewText(R.id.tv_lyric_prev, styledTitle)
 
@@ -710,6 +774,7 @@ class HyperIslandNotifier(private val context: Context) {
                     setSpan(StyleSpan(Typeface.BOLD), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
                 rv.setViewVisibility(R.id.tv_lyric_next, View.VISIBLE)
+                rv.setTextViewTextSize(R.id.tv_lyric_next, TypedValue.COMPLEX_UNIT_SP, 12f)
                 rv.setTextColor(R.id.tv_lyric_next, theme.activeLyricColor)
                 rv.setTextViewText(R.id.tv_lyric_next, styledBadge)
             } else {
@@ -718,13 +783,18 @@ class HyperIslandNotifier(private val context: Context) {
         } else {
             if (prev.isNotBlank()) {
                 rv.setViewVisibility(R.id.tv_lyric_prev, View.VISIBLE)
+                rv.setTextViewTextSize(R.id.tv_lyric_prev, TypedValue.COMPLEX_UNIT_SP, 11f)
                 rv.setTextColor(R.id.tv_lyric_prev, secondaryLineColor)
                 rv.setTextViewText(R.id.tv_lyric_prev, prev)
             } else {
                 rv.setViewVisibility(R.id.tv_lyric_prev, View.GONE)
             }
 
-            val currSizeSp = if (curr.length > 28) 12f else 14f
+            val currSizeSp = when {
+                curr.length <= 36 -> 16.5f
+                curr.length <= 50 -> 15.0f
+                else -> 13.5f
+            }
             rv.setViewVisibility(R.id.tv_lyric_curr, View.VISIBLE)
             rv.setTextViewTextSize(R.id.tv_lyric_curr, TypedValue.COMPLEX_UNIT_SP, currSizeSp)
             rv.setTextViewText(R.id.tv_lyric_curr, curr)
@@ -732,6 +802,7 @@ class HyperIslandNotifier(private val context: Context) {
 
             if (next.isNotBlank()) {
                 rv.setViewVisibility(R.id.tv_lyric_next, View.VISIBLE)
+                rv.setTextViewTextSize(R.id.tv_lyric_next, TypedValue.COMPLEX_UNIT_SP, 11f)
                 rv.setTextColor(R.id.tv_lyric_next, secondaryLineColor)
                 rv.setTextViewText(R.id.tv_lyric_next, next)
             } else {
@@ -913,9 +984,9 @@ class HyperIslandNotifier(private val context: Context) {
         val accentColor = theme.activeLyricColor
         val accentHex = String.format("#%06X", 0xFFFFFF and accentColor)
         val expandedBody = formatStyledExpandedLyrics(prevText, currText, nextText, accentColor, hasSyncedLyrics)
-        val vinyl = getOrCreateVinylAssets(cover, accentColor)
+        val vinyl = getOrCreateVinylAssets(cover, theme.dominantRingColor)
         val smallIcon = if (isPlaying) smallWaveIcon else smallPauseIcon
-        val rightIcon = resolveRightWingIcon(wingState, albumArtHash, accentColor)
+        val rightIcon = resolveRightWingIcon(wingState, albumArtHash, theme.dominantRingColor)
 
         val expandedRv = buildExpandedRemoteViews(
             vinyl = vinyl,
@@ -979,7 +1050,8 @@ class HyperIslandNotifier(private val context: Context) {
                 return ExpandedTwoToneTheme(
                     bgStartColor = 0xFF1C2029.toInt(),
                     bgEndColor = 0xFF10131A.toInt(),
-                    activeLyricColor = Color.WHITE
+                    activeLyricColor = Color.WHITE,
+                    dominantRingColor = Color.WHITE
                 )
             }
 
@@ -1033,7 +1105,8 @@ class HyperIslandNotifier(private val context: Context) {
                     return ExpandedTwoToneTheme(
                         bgStartColor = 0xFF1C2029.toInt(),
                         bgEndColor = 0xFF10131A.toInt(),
-                        activeLyricColor = Color.WHITE
+                        activeLyricColor = Color.WHITE,
+                        dominantRingColor = Color.WHITE
                     )
                 }
                 val avg = Color.rgb(
@@ -1047,7 +1120,7 @@ class HyperIslandNotifier(private val context: Context) {
                 val bgStart = Color.HSVToColor(255, floatArrayOf(baseHue, satMuted, 0.18f))
                 val bgEnd = Color.HSVToColor(255, floatArrayOf(baseHue, satMuted, 0.09f))
                 val activeNeutral = Color.rgb(245, 247, 252)
-                return ExpandedTwoToneTheme(bgStart, bgEnd, activeNeutral)
+                return ExpandedTwoToneTheme(bgStart, bgEnd, activeNeutral, activeNeutral)
             }
 
             var dominantBin = 0
@@ -1071,6 +1144,10 @@ class HyperIslandNotifier(private val context: Context) {
 
             val bgStartColor = Color.HSVToColor(255, floatArrayOf(domHue, domSat, vStart))
             val bgEndColor = Color.HSVToColor(255, floatArrayOf(domHue, (domSat * 0.92f).coerceIn(0.40f, 0.68f), vEnd))
+            val dominantRingColor = Color.HSVToColor(
+                255,
+                floatArrayOf(domHue, domHsv[1].coerceAtLeast(0.78f), domHsv[2].coerceAtLeast(0.90f))
+            )
 
             // Seleziona colore secondario armonico distinto dal dominante
             var bestSecBin = -1
@@ -1113,13 +1190,14 @@ class HyperIslandNotifier(private val context: Context) {
                 secHsv[2] = 0.94f
             }
 
-            var activeColor = enforceContrastRatio(Color.HSVToColor(255, secHsv), bgStartColor, minRatio = 5.5)
-            ExpandedTwoToneTheme(bgStartColor, bgEndColor, activeColor)
+            val activeColor = enforceContrastRatio(Color.HSVToColor(255, secHsv), bgStartColor, minRatio = 5.5)
+            ExpandedTwoToneTheme(bgStartColor, bgEndColor, activeColor, dominantRingColor)
         } catch (_: Throwable) {
             ExpandedTwoToneTheme(
                 bgStartColor = 0xFF1C2029.toInt(),
                 bgEndColor = 0xFF10131A.toInt(),
-                activeLyricColor = Color.WHITE
+                activeLyricColor = Color.WHITE,
+                dominantRingColor = Color.WHITE
             )
         }
     }
@@ -1152,7 +1230,8 @@ class HyperIslandNotifier(private val context: Context) {
             return ExpandedTwoToneTheme(
                 bgStartColor = 0xFF1C2029.toInt(),
                 bgEndColor = 0xFF10131A.toInt(),
-                activeLyricColor = Color.WHITE
+                activeLyricColor = Color.WHITE,
+                dominantRingColor = Color.WHITE
             )
         }
         val existing = cachedTwoToneTheme
@@ -1302,7 +1381,7 @@ class HyperIslandNotifier(private val context: Context) {
         lastFullStateKey =
             "${wingState.leftText}|${wingState.leftIconKey}|" +
             "${wingState.rightText}|${wingState.rightIconKey}|" +
-            "$isPlaying|${theme.bgStartColor}|${theme.activeLyricColor}|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
+            "$isPlaying|${theme.bgStartColor}|${theme.activeLyricColor}|${theme.dominantRingColor}|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
     }
 
     fun resetCache() {
@@ -1357,7 +1436,7 @@ class HyperIslandNotifier(private val context: Context) {
         val fullStateKey =
             "${wingState.leftText}|${wingState.leftIconKey}|" +
             "${wingState.rightText}|${wingState.rightIconKey}|" +
-            "$isPlaying|${theme.bgStartColor}|${theme.activeLyricColor}|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
+            "$isPlaying|${theme.bgStartColor}|${theme.activeLyricColor}|${theme.dominantRingColor}|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
 
         if (fullStateKey == lastFullStateKey) return
         lastFullStateKey = fullStateKey
@@ -1412,51 +1491,44 @@ class HyperIslandNotifier(private val context: Context) {
     private fun renderProgressRingBitmap(size: Int, progressFraction: Float, dominantColor: Int): Bitmap {
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
-        val strokeW = size * 0.118f
-        val pad = strokeW * 1.15f
+        val strokeW = 13f
+        val pad = 12f
         val oval = RectF(pad, pad, size - pad, size - pad)
 
-        // Traccia di sfondo sottile semitrasparente (alpha ~60)
+        // Colore dominante della copertina potenziato in HSV (S >= 0.78, V >= 0.90) con alpha 255
+        val activeHsv = FloatArray(3)
+        Color.colorToHSV(dominantColor, activeHsv)
+        if (activeHsv[1] > 0.08f) {
+            activeHsv[1] = activeHsv[1].coerceAtLeast(0.78f)
+        }
+        activeHsv[2] = activeHsv[2].coerceAtLeast(0.90f)
+        val activeArcColor = Color.HSVToColor(255, activeHsv)
+
+        // Traccia di sfondo dello stesso colore dominante scuro e discreto (alpha = 70)
+        val trackHsv = floatArrayOf(
+            activeHsv[0],
+            activeHsv[1] * 0.75f,
+            (activeHsv[2] * 0.42f).coerceIn(0.20f, 0.38f)
+        )
+        val trackBase = Color.HSVToColor(255, trackHsv)
         val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(60, 255, 255, 255)
+            color = Color.argb(70, Color.red(trackBase), Color.green(trackBase), Color.blue(trackBase))
             style = Paint.Style.STROKE
-            strokeWidth = strokeW * 0.78f
+            strokeWidth = strokeW
+            strokeCap = Paint.Cap.ROUND
         }
         canvas.drawOval(oval, trackPaint)
 
-        val sweepDeg = (progressFraction.coerceIn(0f, 1f) * 360f).coerceAtLeast(18f)
+        val sweepDeg = (progressFraction.coerceIn(0f, 1f) * 360f).coerceAtLeast(38f)
 
-        // Leggero bagliore esterno attorno all'arco dominante
-        val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(
-                76,
-                Color.red(dominantColor),
-                Color.green(dominantColor),
-                Color.blue(dominantColor)
-            )
-            style = Paint.Style.STROKE
-            strokeWidth = strokeW * 1.48f
-            strokeCap = Paint.Cap.ROUND
-        }
-        canvas.drawArc(oval, -90f, sweepDeg, false, glowPaint)
-
-        // Arco principale spesso con colore dominante della copertina
+        // Arco principale visibile e luminoso ad alto contrasto sul nero della pillola
         val arcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = dominantColor
+            color = activeArcColor
             style = Paint.Style.STROKE
             strokeWidth = strokeW
             strokeCap = Paint.Cap.ROUND
         }
         canvas.drawArc(oval, -90f, sweepDeg, false, arcPaint)
-
-        // Sottile riflesso interno nitido per stacco sul nero HyperOS
-        val innerHighlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(90, 255, 255, 255)
-            style = Paint.Style.STROKE
-            strokeWidth = (strokeW * 0.28f).coerceAtLeast(1.8f)
-            strokeCap = Paint.Cap.ROUND
-        }
-        canvas.drawArc(oval, -90f, sweepDeg, false, innerHighlightPaint)
 
         return bmp
     }

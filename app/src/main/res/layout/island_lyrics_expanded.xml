@@ -19,9 +19,9 @@
         android:gravity="center_vertical"
         android:orientation="horizontal"
         android:paddingStart="14dp"
-        android:paddingTop="13dp"
+        android:paddingTop="12dp"
         android:paddingEnd="14dp"
-        android:paddingBottom="15dp">
+        android:paddingBottom="13dp">
 
     <FrameLayout
         android:layout_width="56dp"
@@ -77,22 +77,24 @@
             android:layout_height="wrap_content"
             android:ellipsize="end"
             android:fontFamily="sans-serif"
+            android:includeFontPadding="false"
             android:maxLines="1"
-            android:textColor="#B3FFFFFF"
-            android:textSize="11.5sp" />
+            android:textColor="#8CFFFFFF"
+            android:textSize="11sp" />
 
         <TextView
             android:id="@+id/tv_lyric_curr"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="1.5dp"
-            android:layout_marginBottom="1.5dp"
+            android:layout_marginTop="2dp"
+            android:layout_marginBottom="2dp"
             android:ellipsize="end"
             android:fontFamily="sans-serif-medium"
-            android:lineSpacingMultiplier="0.95"
+            android:includeFontPadding="false"
+            android:lineSpacingMultiplier="0.92"
             android:maxLines="2"
             android:textColor="#FFFFFFFF"
-            android:textSize="14sp"
+            android:textSize="16.5sp"
             android:textStyle="bold" />
 
         <TextView
@@ -101,9 +103,10 @@
             android:layout_height="wrap_content"
             android:ellipsize="end"
             android:fontFamily="sans-serif"
+            android:includeFontPadding="false"
             android:maxLines="1"
-            android:textColor="#B3FFFFFF"
-            android:textSize="11.5sp" />
+            android:textColor="#8CFFFFFF"
+            android:textSize="11sp" />
     </LinearLayout>
 
     <!-- Pulsante Play / Pausa effetto vetro traslucido -->
