@@ -42,10 +42,12 @@ class HyperIslandNotifier(private val context: Context) {
         const val CHANNEL_ID = "bitchord_lyrics_live_pill"
         const val NOTIFICATION_ID = 3601
 
-        private const val SCROLL_WINDOW_CHARS = 9
-        private const val SCROLL_STEP_INTERVAL_MS = 1_800L
-        private const val PHASE_1_END_MS = 5_000L
+        private const val MAX_PAGE_CHARS = 10
+        private const val NARROW_FONT_WIDTH_THRESHOLD = 8.2f
+        private const val PHASE_1_END_MS = 5_500L
+        private const val PHASE_1_GIANT_STEP_MS = 2_500L
         private const val PHASE_2_END_MS = 14_000L
+        private const val PHASE_2_STEP_MS = 2_000L
         private const val PHASE_3_END_MS = 19_000L
 
         private const val TRAILING_JUNK_CHARS = "([{-–—/:,&+.|•"
@@ -76,14 +78,18 @@ class HyperIslandNotifier(private val context: Context) {
         private val REGEX_LEADING_EXPLICIT_TAG = Regex("""^[\[\(]E[\]\)]\s*""", RegexOption.IGNORE_CASE)
         private val REGEX_PARENS = Regex("""\s*[\(\[].*?[\)\]]""")
         private val REGEX_UNCLOSED_PAREN = Regex("""\s*[\(\[][^\)\]]*$""")
-        private val REGEX_FEAT = Regex("""\s+(feat\.|ft\.|prod\.).*$""", RegexOption.IGNORE_CASE)
+        private val REGEX_FEAT = Regex("""\s+(?:feat\.?|ft\.?|featuring|prod\.?)\b.*$""", RegexOption.IGNORE_CASE)
+        private val REGEX_DASH_SUFFIX = Regex("""\s+[-–—]\s+.*$""")
+        private val REGEX_ARTIST_SPLIT = Regex("""(?i)\s*(?:,|&|/|\s+x\s+|\s+(?:feat\.?|ft\.?|featuring|prod\.?)\b)\s*""")
     }
 
     data class DualWingState(
         val leftText: String,
         val leftIconKey: String,
+        val leftNarrowFont: Boolean,
         val rightText: String,
         val rightIconKey: String,
+        val rightNarrowFont: Boolean,
         val progressStep: Int
     )
 
@@ -194,12 +200,13 @@ class HyperIslandNotifier(private val context: Context) {
         val result = if (clean.isEmpty()) {
             ""
         } else {
-            val withoutParens = clean
+            val stripped = clean
                 .replace(REGEX_PARENS, "")
                 .replace(REGEX_UNCLOSED_PAREN, "")
                 .replace(REGEX_FEAT, "")
+                .replace(REGEX_DASH_SUFFIX, "")
                 .trim()
-            val base = if (withoutParens.isNotEmpty()) withoutParens else clean
+            val base = if (stripped.isNotEmpty()) stripped else clean
             val trimmed = sanitizeTrailingJunk(cleanLine(base))
             if (trimmed.isNotEmpty()) trimmed else clean
         }
@@ -218,7 +225,7 @@ class HyperIslandNotifier(private val context: Context) {
             .replace(REGEX_UNCLOSED_PAREN, "")
             .replace(REGEX_FEAT, "")
             .trim()
-        val primary = clean.split(",", "&", " x ", " X ")
+        val primary = clean.split(REGEX_ARTIST_SPLIT, limit = 2)
             .firstOrNull()?.trim().orEmpty()
         val finalClean = sanitizeTrailingJunk(cleanLine(primary.ifEmpty { clean }))
         cachedRawArtist = raw
@@ -226,14 +233,103 @@ class HyperIslandNotifier(private val context: Context) {
         return finalClean
     }
 
-    private fun slowScrollWindow(text: String, stepIndex: Int): String {
-        if (text.length <= SCROLL_WINDOW_CHARS) {
-            return text
+    fun estimateVisualWidth(text: String): Float {
+        if (text.isEmpty()) return 0f
+        var width = 0f
+        for (ch in text) {
+            width += when (ch) {
+                'i', 'I', 'l', 't', '1', ' ', '.', '\'', ',', ':', ';', '!', '|' -> 0.55f
+                'W', 'M', '@', 'G', 'm' -> 1.3f
+                else -> 1.0f
+            }
         }
-        val maxOffset = (text.length - SCROLL_WINDOW_CHARS).coerceAtLeast(1)
-        val stride = max(1, (maxOffset + 3) / 4)
-        val offset = (stepIndex * stride).coerceAtMost(maxOffset)
-        return text.substring(offset, offset + SCROLL_WINDOW_CHARS)
+        return width
+    }
+
+    private fun shouldUseNarrowFont(text: String): Boolean {
+        return estimateVisualWidth(text) > NARROW_FONT_WIDTH_THRESHOLD
+    }
+
+    fun splitIntoWordPages(text: String, maxChars: Int = MAX_PAGE_CHARS): List<String> {
+        val normalized = cleanLine(text)
+        if (normalized.isEmpty()) return emptyList()
+        val limit = maxChars.coerceAtLeast(4)
+        val rawWords = normalized.split(' ').filter { it.isNotEmpty() }
+        val words = rawWords.map { token ->
+            val trimmed = token.trimEnd(',', ';', ':')
+            trimmed.ifEmpty { token }
+        }
+
+        val pages = mutableListOf<String>()
+        val current = StringBuilder()
+
+        fun flushCurrent() {
+            if (current.isNotEmpty()) {
+                pages += current.toString()
+                current.clear()
+            }
+        }
+
+        for (word in words) {
+            if (word.length > limit) {
+                flushCurrent()
+                if (word.length <= limit * 2) {
+                    val mid = (word.length + 1) / 2
+                    pages += word.substring(0, mid)
+                    pages += word.substring(mid)
+                } else {
+                    var idx = 0
+                    while (idx < word.length) {
+                        val end = (idx + limit).coerceAtMost(word.length)
+                        pages += word.substring(idx, end)
+                        idx = end
+                    }
+                }
+                continue
+            }
+
+            if (current.isEmpty()) {
+                current.append(word)
+            } else if (current.length + 1 + word.length <= limit) {
+                current.append(' ').append(word)
+            } else {
+                flushCurrent()
+                current.append(word)
+            }
+        }
+        flushCurrent()
+        return pages
+    }
+
+    private fun splitMediumTitleSymmetrically(cleanTitle: String): Pair<String, String> {
+        if (!cleanTitle.contains(' ')) {
+            val mid = (cleanTitle.length + 1) / 2
+            return cleanTitle.substring(0, mid) to cleanTitle.substring(mid)
+        }
+        val mid = cleanTitle.length / 2
+        var bestSpace = -1
+        var bestMaxWing = Int.MAX_VALUE
+        var bestDist = Int.MAX_VALUE
+        for (i in 1 until cleanTitle.lastIndex) {
+            if (cleanTitle[i] == ' ') {
+                val leftLen = i
+                val rightLen = cleanTitle.length - 1 - i
+                val maxWing = max(leftLen, rightLen)
+                val dist = kotlin.math.abs(i - mid)
+                if (maxWing < bestMaxWing || (maxWing == bestMaxWing && dist < bestDist)) {
+                    bestMaxWing = maxWing
+                    bestDist = dist
+                    bestSpace = i
+                }
+            }
+        }
+        if (bestSpace <= 0) {
+            val splitMid = (cleanTitle.length + 1) / 2
+            return cleanTitle.substring(0, splitMid) to cleanTitle.substring(splitMid)
+        }
+        val left = cleanTitle.substring(0, bestSpace).trimEnd(',', ';', ':').trim()
+        val right = cleanTitle.substring(bestSpace + 1).trim()
+        return left to right
     }
 
     fun computeProgressStep(posMs: Long, durationMs: Long): Int {
@@ -242,17 +338,36 @@ class HyperIslandNotifier(private val context: Context) {
         return (fraction * PROGRESS_STEP_MAX).roundToInt().coerceIn(0, PROGRESS_STEP_MAX)
     }
 
+    private fun makeDualWingState(
+        leftText: String,
+        leftIconKey: String,
+        rightText: String,
+        rightIconKey: String,
+        progressStep: Int
+    ): DualWingState {
+        return DualWingState(
+            leftText = leftText,
+            leftIconKey = leftIconKey,
+            leftNarrowFont = shouldUseNarrowFont(leftText),
+            rightText = rightText,
+            rightIconKey = rightIconKey,
+            rightNarrowFont = shouldUseNarrowFont(rightText),
+            progressStep = progressStep
+        )
+    }
+
     fun computeDualWingState(
         title: String,
         artist: String,
         isPlaying: Boolean,
         posMs: Long,
         durationMs: Long,
-        audioQualityBadge: String
+        audioCodecBadge: String,
+        audioSpecBadge: String
     ): DualWingState {
         // 1. Stato Pausa (!isPlaying)
         if (!isPlaying) {
-            return DualWingState(
+            return makeDualWingState(
                 leftText = "",
                 leftIconKey = PIC_DISC,
                 rightText = "In pausa",
@@ -261,63 +376,86 @@ class HyperIslandNotifier(private val context: Context) {
             )
         }
 
+        val codecLabel = audioCodecBadge.ifBlank { "Hi-Fi" }
+        val specLabel = audioSpecBadge.ifBlank { "Lossless" }
         val cleanTitle = getCleanTitle(title).ifBlank { "Lyrics" }
-        val cleanArtist = getCleanArtist(artist).ifBlank { audioQualityBadge.ifBlank { "Music" } }
+        val cleanArtist = getCleanArtist(artist).ifBlank { codecLabel }
+        val titlePages = splitIntoWordPages(cleanTitle, MAX_PAGE_CHARS)
+        val artistPages = splitIntoWordPages(cleanArtist, MAX_PAGE_CHARS)
         val safePos = posMs.coerceAtLeast(0L)
         val step = computeProgressStep(safePos, durationMs)
         val ringKey = "miui.focus.pic_progress_$step"
 
-        // 2. Fase 1 — Attacco Simmetrico del Titolo (0 <= posMs < 5_000)
+        // 2. Fase 1 — Attacco Simmetrico del Titolo a Parole Intere (0 <= posMs < 5_500)
         if (safePos < PHASE_1_END_MS) {
-            return if (cleanTitle.length > SCROLL_WINDOW_CHARS) {
-                val mid = cleanTitle.length / 2
-                val leftHalf = cleanTitle.substring(0, mid).takeLast(10)
-                val rightHalf = cleanTitle.substring(mid).take(10)
-                DualWingState(
-                    leftText = leftHalf,
-                    leftIconKey = PIC_DISC,
-                    rightText = rightHalf,
-                    rightIconKey = PIC_WAVE,
-                    progressStep = -1
-                )
-            } else {
-                DualWingState(
-                    leftText = cleanTitle,
-                    leftIconKey = PIC_DISC,
-                    rightText = cleanArtist.take(SCROLL_WINDOW_CHARS),
-                    rightIconKey = PIC_WAVE,
-                    progressStep = -1
-                )
+            val firstArtistPage = artistPages.firstOrNull().orEmpty()
+            val (leftText, rightText) = when {
+                cleanTitle.length <= MAX_PAGE_CHARS -> {
+                    cleanTitle to firstArtistPage
+                }
+                cleanTitle.length <= MAX_PAGE_CHARS * 2 -> {
+                    splitMediumTitleSymmetrically(cleanTitle)
+                }
+                else -> {
+                    if (titlePages.size <= 2) {
+                        val p0 = titlePages.firstOrNull().orEmpty()
+                        val p1 = titlePages.getOrNull(1) ?: firstArtistPage
+                        p0 to p1
+                    } else {
+                        val slot = if (safePos < PHASE_1_GIANT_STEP_MS) 0 else 1
+                        val baseIdx = slot * 2
+                        val leftPage = titlePages.getOrNull(baseIdx)
+                            ?: titlePages.lastOrNull().orEmpty()
+                        val rightPage = titlePages.getOrNull(baseIdx + 1)
+                            ?: firstArtistPage
+                        leftPage to rightPage
+                    }
+                }
             }
+            return makeDualWingState(
+                leftText = leftText,
+                leftIconKey = PIC_DISC,
+                rightText = rightText,
+                rightIconKey = PIC_WAVE,
+                progressStep = -1
+            )
         }
 
-        // 3. Fase 2 — Presentazione Artista (Sx) + Titolo (Dx) con Scorrimento Lento Condizionale (5_000 <= posMs < 14_000)
+        // 3. Fase 2 — Artista (Sx) + Titolo (Dx) a Parole Intere (5_500 <= posMs < 14_000)
         if (safePos < PHASE_2_END_MS) {
-            val stepIndex = ((safePos - PHASE_1_END_MS) / SCROLL_STEP_INTERVAL_MS).toInt().coerceAtLeast(0)
-            val leftScrolled = slowScrollWindow(cleanArtist, stepIndex)
-            val rightScrolled = slowScrollWindow(cleanTitle, stepIndex)
-            return DualWingState(
-                leftText = leftScrolled,
+            val pageStep = ((safePos - PHASE_1_END_MS) / PHASE_2_STEP_MS).toInt().coerceAtLeast(0)
+            val leftPage = when {
+                artistPages.isEmpty() -> cleanArtist.take(MAX_PAGE_CHARS)
+                artistPages.size > 1 -> artistPages[pageStep % artistPages.size]
+                else -> artistPages[0]
+            }
+            val rightPage = when {
+                titlePages.isEmpty() -> cleanTitle.take(MAX_PAGE_CHARS)
+                titlePages.size > 1 -> titlePages[pageStep % titlePages.size]
+                else -> titlePages[0]
+            }
+            return makeDualWingState(
+                leftText = leftPage,
                 leftIconKey = PIC_DISC,
-                rightText = rightScrolled,
+                rightText = rightPage,
                 rightIconKey = ringKey,
                 progressStep = step
             )
         }
 
-        // 4. Fase 3 — Badge Qualità Audio (14_000 <= posMs < 19_000)
+        // 4. Fase 3 — Doppia Ala Qualità Audio (14_000 <= posMs < 19_000)
         if (safePos < PHASE_3_END_MS) {
-            return DualWingState(
-                leftText = "",
+            return makeDualWingState(
+                leftText = codecLabel,
                 leftIconKey = PIC_DISC,
-                rightText = audioQualityBadge.ifBlank { "Hi-Fi" },
+                rightText = specLabel,
                 rightIconKey = ringKey,
                 progressStep = step
             )
         }
 
-        // 5. Fase 4 — Riposo Minimal con Disco + Cerchio Colorato dalla Copertina (posMs >= 19_000)
-        return DualWingState(
+        // 5. Fase 4 — Riposo Minimal con Disco + Anello Colorato dalla Copertina (posMs >= 19_000)
+        return makeDualWingState(
             leftText = "",
             leftIconKey = PIC_DISC,
             rightText = "",
@@ -339,6 +477,16 @@ class HyperIslandNotifier(private val context: Context) {
         return String.format(Locale.US, "%02d:%02d / %02d:%02d", pMin, pSec, dMin, dSec)
     }
 
+    private fun formatCombinedQualityLabel(audioCodecBadge: String, audioSpecBadge: String): String {
+        val codec = audioCodecBadge.ifBlank { "Hi-Fi" }
+        val spec = audioSpecBadge.ifBlank { "" }
+        return if (spec.isNotBlank() && !spec.equals(codec, ignoreCase = true)) {
+            "$codec • $spec"
+        } else {
+            codec
+        }
+    }
+
     private fun resolveDisplayLines(
         prevLyric: String,
         currentLine: LyricLine?,
@@ -347,15 +495,16 @@ class HyperIslandNotifier(private val context: Context) {
         artist: String,
         posMs: Long,
         durationMs: Long,
-        audioQualityBadge: String,
+        audioCodecBadge: String,
+        audioSpecBadge: String,
         hasSyncedLyrics: Boolean,
         isPlaying: Boolean
     ): Triple<String, String, String> {
         if (!hasSyncedLyrics) {
             val cleanTitle = cleanLine(title).ifBlank { "DynamicLyrics" }
-            val cleanArtist = cleanLine(artist).ifBlank { audioQualityBadge.ifBlank { "Musica attiva" } }
+            val cleanArtist = cleanLine(artist).ifBlank { audioCodecBadge.ifBlank { "Musica attiva" } }
             val progressTime = formatElapsedDuration(posMs, durationMs)
-            val badge = audioQualityBadge.ifBlank { "Hi-Fi" }
+            val badge = formatCombinedQualityLabel(audioCodecBadge, audioSpecBadge)
             val qualityLine = if (isPlaying) {
                 "$badge  •  $progressTime"
             } else {
@@ -530,7 +679,7 @@ class HyperIslandNotifier(private val context: Context) {
                         "textInfo",
                         JSONObject().apply {
                             put("title", wingState.leftText)
-                            put("narrowFont", true)
+                            put("narrowFont", wingState.leftNarrowFont)
                             put("showHighlightColor", false)
                         }
                     )
@@ -551,7 +700,7 @@ class HyperIslandNotifier(private val context: Context) {
                         "textInfo",
                         JSONObject().apply {
                             put("title", wingState.rightText)
-                            put("narrowFont", true)
+                            put("narrowFont", wingState.rightNarrowFont)
                             put("showHighlightColor", false)
                         }
                     )
@@ -594,7 +743,9 @@ class HyperIslandNotifier(private val context: Context) {
         fallbackTitle: String,
         accentHex: String
     ): Pair<String, String> {
-        val key = "${wingState.leftText}|${wingState.rightText}|${wingState.leftIconKey}|${wingState.rightIconKey}|$accentHex"
+        val key = "${wingState.leftText}|${wingState.leftNarrowFont}|" +
+            "${wingState.rightText}|${wingState.rightNarrowFont}|" +
+            "${wingState.leftIconKey}|${wingState.rightIconKey}|$accentHex"
         val existing = cachedFocusJsonPair
         if (existing != null && cachedFocusJsonKey == key) {
             return existing
@@ -787,7 +938,8 @@ class HyperIslandNotifier(private val context: Context) {
         isPlaying: Boolean,
         posMs: Long,
         durationMs: Long,
-        audioQualityBadge: String,
+        audioCodecBadge: String,
+        audioSpecBadge: String,
         hasSyncedLyrics: Boolean
     ): Notification {
         val wingState = computeDualWingState(
@@ -796,7 +948,8 @@ class HyperIslandNotifier(private val context: Context) {
             isPlaying = isPlaying,
             posMs = posMs,
             durationMs = durationMs,
-            audioQualityBadge = audioQualityBadge
+            audioCodecBadge = audioCodecBadge,
+            audioSpecBadge = audioSpecBadge
         )
         val dominantColor = resolveDominantColor(cover, palette)
         val (prevText, currText, nextText) = resolveDisplayLines(
@@ -807,7 +960,8 @@ class HyperIslandNotifier(private val context: Context) {
             artist = artist,
             posMs = posMs,
             durationMs = durationMs,
-            audioQualityBadge = audioQualityBadge,
+            audioCodecBadge = audioCodecBadge,
+            audioSpecBadge = audioSpecBadge,
             hasSyncedLyrics = hasSyncedLyrics,
             isPlaying = isPlaying
         )
@@ -838,7 +992,8 @@ class HyperIslandNotifier(private val context: Context) {
         isPlaying: Boolean,
         posMs: Long,
         durationMs: Long,
-        audioQualityBadge: String,
+        audioCodecBadge: String,
+        audioSpecBadge: String,
         hasSyncedLyrics: Boolean
     ) {
         val wingState = computeDualWingState(
@@ -847,7 +1002,8 @@ class HyperIslandNotifier(private val context: Context) {
             isPlaying = isPlaying,
             posMs = posMs,
             durationMs = durationMs,
-            audioQualityBadge = audioQualityBadge
+            audioCodecBadge = audioCodecBadge,
+            audioSpecBadge = audioSpecBadge
         )
         val dominantColor = resolveDominantColor(cover, palette)
         val (prevText, currText, nextText) = resolveDisplayLines(
@@ -858,12 +1014,15 @@ class HyperIslandNotifier(private val context: Context) {
             artist = artist,
             posMs = posMs,
             durationMs = durationMs,
-            audioQualityBadge = audioQualityBadge,
+            audioCodecBadge = audioCodecBadge,
+            audioSpecBadge = audioSpecBadge,
             hasSyncedLyrics = hasSyncedLyrics,
             isPlaying = isPlaying
         )
         lastFullStateKey =
-            "${wingState.leftText}|${wingState.leftIconKey}|${wingState.rightText}|${wingState.rightIconKey}|$isPlaying|$dominantColor|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
+            "${wingState.leftText}|${wingState.leftNarrowFont}|${wingState.leftIconKey}|" +
+            "${wingState.rightText}|${wingState.rightNarrowFont}|${wingState.rightIconKey}|" +
+            "$isPlaying|$dominantColor|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
     }
 
     fun resetCache() {
@@ -882,7 +1041,8 @@ class HyperIslandNotifier(private val context: Context) {
         isPlaying: Boolean,
         posMs: Long,
         durationMs: Long,
-        audioQualityBadge: String,
+        audioCodecBadge: String,
+        audioSpecBadge: String,
         hasSyncedLyrics: Boolean
     ) {
         val isScreenOn = powerManager?.isInteractive ?: true
@@ -894,7 +1054,8 @@ class HyperIslandNotifier(private val context: Context) {
             isPlaying = isPlaying,
             posMs = posMs,
             durationMs = durationMs,
-            audioQualityBadge = audioQualityBadge
+            audioCodecBadge = audioCodecBadge,
+            audioSpecBadge = audioSpecBadge
         )
         val dominantColor = resolveDominantColor(cover, palette)
         val (prevText, currText, nextText) = resolveDisplayLines(
@@ -905,13 +1066,16 @@ class HyperIslandNotifier(private val context: Context) {
             artist = artist,
             posMs = posMs,
             durationMs = durationMs,
-            audioQualityBadge = audioQualityBadge,
+            audioCodecBadge = audioCodecBadge,
+            audioSpecBadge = audioSpecBadge,
             hasSyncedLyrics = hasSyncedLyrics,
             isPlaying = isPlaying
         )
 
         val fullStateKey =
-            "${wingState.leftText}|${wingState.leftIconKey}|${wingState.rightText}|${wingState.rightIconKey}|$isPlaying|$dominantColor|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
+            "${wingState.leftText}|${wingState.leftNarrowFont}|${wingState.leftIconKey}|" +
+            "${wingState.rightText}|${wingState.rightNarrowFont}|${wingState.rightIconKey}|" +
+            "$isPlaying|$dominantColor|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
 
         if (fullStateKey == lastFullStateKey) return
         lastFullStateKey = fullStateKey

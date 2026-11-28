@@ -11,6 +11,11 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -40,9 +45,10 @@ class BitChordListenerService : NotificationListenerService() {
         private const val LINE_HYSTERESIS_MS = 1500L
         private const val HARD_REBIND_COOLDOWN_MS = 2500L
 
-        private val REGEX_BIT_DEPTH = Regex("""\b(32|24|16)[\s_-]?bit\b""", RegexOption.IGNORE_CASE)
-        private val REGEX_SAMPLE_RATE = Regex("""\b(384|352\.8|192|176\.4|96|88\.2|48|44\.1)\s*khz\b""", RegexOption.IGNORE_CASE)
-        private val REGEX_CODEC_TAG = Regex("""\b(flac|alac|mqa|wav|dsd\d*)\b""", RegexOption.IGNORE_CASE)
+        private val REGEX_CODEC_TAG = Regex("""\b(flac|alac|wav|mqa|dsd\d*|opus|aac|mp3)\b""", RegexOption.IGNORE_CASE)
+        private val REGEX_BIT_DEPTH = Regex("""\b(\d{2})\s*-?\s*bit\b""", RegexOption.IGNORE_CASE)
+        private val REGEX_SAMPLE_RATE = Regex("""\b(\d{2,3}(?:\.\d)?)\s*k?hz\b""", RegexOption.IGNORE_CASE)
+        private val REGEX_SAMPLE_RATE_RAW_HZ = Regex("""\b(384000|352800|192000|176400|96000|88200|48000|44100)\s*hz\b""", RegexOption.IGNORE_CASE)
         private val REGEX_HIRES_TAG = Regex("""\bhi[\s_-]?res\b""", RegexOption.IGNORE_CASE)
         private val REGEX_LOSSLESS_TAG = Regex("""\blossless\b""", RegexOption.IGNORE_CASE)
 
@@ -197,6 +203,7 @@ class BitChordListenerService : NotificationListenerService() {
     private lateinit var sessionManager: MediaSessionManager
     private lateinit var uiModeManager: UiModeManager
     private lateinit var powerManager: PowerManager
+    private lateinit var audioManager: AudioManager
 
     private var activeController: MediaController? = null
     private var fetchJob: Job? = null
@@ -215,8 +222,22 @@ class BitChordListenerService : NotificationListenerService() {
     private var currentPalette = CoverPalette()
     private var currentLines: List<LyricLine> = emptyList()
     private var currentPlayerPackage = ""
-    private var currentNotificationBadge: String? = null
-    private var currentSourceLabel = "Hi-Fi"
+    private var currentNotificationCodec: String? = null
+    private var currentNotificationRateKhz: String? = null
+    private var currentNotificationBitDepth: String? = null
+    private var currentNotificationHiRes = false
+    private var currentCodecBadge = "Hi-Fi"
+    private var currentSpecBadge = "Lossless"
+
+    private val audioDeviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+            handleAudioRouteChanged()
+        }
+
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+            handleAudioRouteChanged()
+        }
+    }
 
     private var lastLineIndex = -1
     private var lastRenderKey = ""
@@ -312,10 +333,15 @@ class BitChordListenerService : NotificationListenerService() {
             activeController?.unregisterCallback(this)
             activeController = null
             currentPlayerPackage = ""
-            currentNotificationBadge = null
-            currentSourceLabel = "Hi-Fi"
+            currentNotificationCodec = null
+            currentNotificationRateKhz = null
+            currentNotificationBitDepth = null
+            currentNotificationHiRes = false
+            currentCodecBadge = "Hi-Fi"
+            currentSpecBadge = "Lossless"
             LyricsPlaybackStore.activePlayerPackage.value = ""
-            LyricsPlaybackStore.audioQualityBadge.value = ""
+            LyricsPlaybackStore.audioCodecBadge.value = ""
+            LyricsPlaybackStore.audioSpecBadge.value = ""
             stopTicker()
             LyricsPlaybackStore.isPlaying.value = false
             wearBridge.clearTrack()
@@ -332,6 +358,11 @@ class BitChordListenerService : NotificationListenerService() {
         sessionManager = getSystemService(MediaSessionManager::class.java)
         uiModeManager = getSystemService(UiModeManager::class.java)
         powerManager = getSystemService(PowerManager::class.java)
+        audioManager = getSystemService(AudioManager::class.java)
+        try {
+            audioManager.registerAudioDeviceCallback(audioDeviceCallback, handler)
+        } catch (_: Throwable) {
+        }
         isScreenInteractive = try {
             powerManager.isInteractive
         } catch (_: Throwable) {
@@ -508,7 +539,10 @@ class BitChordListenerService : NotificationListenerService() {
 
         val switchingSession = target?.sessionToken != activeController?.sessionToken
         if (switchingSession) {
-            currentNotificationBadge = null
+            currentNotificationCodec = null
+            currentNotificationRateKhz = null
+            currentNotificationBitDepth = null
+            currentNotificationHiRes = false
         }
 
         currentPlayerPackage = target?.packageName.orEmpty()
@@ -560,13 +594,38 @@ class BitChordListenerService : NotificationListenerService() {
         } else {
             stopTicker()
             currentPlayerPackage = ""
-            currentNotificationBadge = null
-            currentSourceLabel = "Hi-Fi"
-            LyricsPlaybackStore.audioQualityBadge.value = ""
+            currentNotificationCodec = null
+            currentNotificationRateKhz = null
+            currentNotificationBitDepth = null
+            currentNotificationHiRes = false
+            currentCodecBadge = "Hi-Fi"
+            currentSpecBadge = "Lossless"
+            LyricsPlaybackStore.audioCodecBadge.value = ""
+            LyricsPlaybackStore.audioSpecBadge.value = ""
             LyricsPlaybackStore.isPlaying.value = false
             AutoLyricsBridge.clear()
             wearBridge.clearTrack()
             hidePhoneNotificationOnly()
+        }
+    }
+
+    private data class ParsedAudioInfo(
+        val codec: String? = null,
+        val rateKhzRaw: String? = null,
+        val bitDepth: String? = null,
+        val isHiRes: Boolean = false
+    )
+
+    private fun handleAudioRouteChanged() {
+        val pkg = currentPlayerPackage
+        if (pkg.isBlank() || !pkg.lowercase().contains("bitchord")) return
+        val prevCodec = currentCodecBadge
+        val prevSpec = currentSpecBadge
+        refreshSourceQuality(activeController?.metadata, activeController?.extras)
+        if (currentCodecBadge != prevCodec || currentSpecBadge != prevSpec) {
+            lastRenderKey = ""
+            val playing = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+            syncLyrics(isPlaying = playing, forceImmediate = true)
         }
     }
 
@@ -576,12 +635,20 @@ class BitChordListenerService : NotificationListenerService() {
         val pkg = currentPlayerPackage
         if (pkg.isBlank() || sbn.packageName != pkg) return
 
-        val notifBadge = extractAudioQualityFromNotification(sbn)
-        if (!notifBadge.isNullOrBlank() && notifBadge != currentNotificationBadge) {
-            currentNotificationBadge = notifBadge
-            val prevLabel = currentSourceLabel
+        val notifInfo = extractAudioInfoFromNotification(sbn)
+        val changed = notifInfo.codec != currentNotificationCodec ||
+            notifInfo.rateKhzRaw != currentNotificationRateKhz ||
+            notifInfo.bitDepth != currentNotificationBitDepth ||
+            notifInfo.isHiRes != currentNotificationHiRes
+        if (changed) {
+            currentNotificationCodec = notifInfo.codec
+            currentNotificationRateKhz = notifInfo.rateKhzRaw
+            currentNotificationBitDepth = notifInfo.bitDepth
+            currentNotificationHiRes = notifInfo.isHiRes
+            val prevCodec = currentCodecBadge
+            val prevSpec = currentSpecBadge
             refreshSourceQuality(activeController?.metadata, activeController?.extras)
-            if (currentSourceLabel != prevLabel) {
+            if (currentCodecBadge != prevCodec || currentSpecBadge != prevSpec) {
                 lastRenderKey = ""
                 val playing = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
                 syncLyrics(isPlaying = playing, forceImmediate = true)
@@ -589,43 +656,102 @@ class BitChordListenerService : NotificationListenerService() {
         }
     }
 
-    private fun extractQualityTag(candidates: List<String>, isBitChord: Boolean): String? {
-        if (candidates.isEmpty()) return null
-        val nonBlank = candidates.filter { it.isNotBlank() }
-        if (nonBlank.isEmpty()) return null
-
-        for (text in nonBlank) {
-            REGEX_BIT_DEPTH.find(text)?.let { match ->
-                return "${match.groupValues[1]}-bit".take(7)
+    private fun normalizeRateKhz(numStr: String, hasKiloPrefix: Boolean): String? {
+        if (!hasKiloPrefix) {
+            return when (numStr) {
+                "44100" -> "44.1"
+                "48000" -> "48"
+                "88200" -> "88.2"
+                "96000" -> "96"
+                "176400" -> "176.4"
+                "192000" -> "192"
+                "352800" -> "352.8"
+                "384000" -> "384"
+                else -> null
             }
         }
-        for (text in nonBlank) {
-            REGEX_SAMPLE_RATE.find(text)?.let { match ->
-                val rawRate = match.groupValues[1]
-                val clean = "${rawRate}kHz"
-                return if (clean.length <= 7) {
-                    clean
-                } else {
-                    "${rawRate.substringBefore('.')}kHz".take(7)
+        val num = numStr.toFloatOrNull() ?: return null
+        if (num !in 22f..768f) return null
+        return when {
+            numStr.startsWith("44.") -> "44.1"
+            numStr.startsWith("88.") -> "88.2"
+            numStr.startsWith("176.") -> "176.4"
+            numStr.startsWith("352.") -> "352.8"
+            else -> num.toInt().toString()
+        }
+    }
+
+    private fun parseAudioInfoFromFields(candidates: List<String>): ParsedAudioInfo {
+        var codec: String? = null
+        var rateKhzRaw: String? = null
+        var bitDepth: String? = null
+        var isHiRes = false
+
+        for (text in candidates) {
+            if (text.isBlank()) continue
+            if (codec == null) {
+                REGEX_CODEC_TAG.find(text)?.let { m ->
+                    codec = m.groupValues[1].uppercase().take(7)
+                }
+            }
+            if (bitDepth == null) {
+                REGEX_BIT_DEPTH.find(text)?.let { m ->
+                    val bits = m.groupValues[1].toIntOrNull()
+                    if (bits in setOf(16, 24, 32, 64)) {
+                        bitDepth = m.groupValues[1]
+                    }
+                }
+            }
+            if (rateKhzRaw == null) {
+                REGEX_SAMPLE_RATE_RAW_HZ.find(text)?.let { m ->
+                    rateKhzRaw = normalizeRateKhz(m.groupValues[1], hasKiloPrefix = false)
+                }
+            }
+            if (rateKhzRaw == null) {
+                REGEX_SAMPLE_RATE.find(text)?.let { m ->
+                    val matchedLower = m.value.lowercase()
+                    if (matchedLower.contains('k')) {
+                        rateKhzRaw = normalizeRateKhz(m.groupValues[1], hasKiloPrefix = true)
+                    }
+                }
+            }
+            if (!isHiRes && REGEX_HIRES_TAG.containsMatchIn(text)) {
+                isHiRes = true
+            }
+        }
+
+        if (codec == null) {
+            for (text in candidates) {
+                if (text.isNotBlank() && REGEX_LOSSLESS_TAG.containsMatchIn(text)) {
+                    codec = "FLAC"
+                    break
                 }
             }
         }
-        for (text in nonBlank) {
-            REGEX_CODEC_TAG.find(text)?.let { match ->
-                return match.groupValues[1].uppercase().take(7)
+
+        return ParsedAudioInfo(
+            codec = codec,
+            rateKhzRaw = rateKhzRaw,
+            bitDepth = bitDepth,
+            isHiRes = isHiRes
+        )
+    }
+
+    private fun formatSpecBadge(rateKhzRaw: String?, bitDepth: String?): String? {
+        val shortKhz = rateKhzRaw?.substringBefore('.')?.takeIf { it.isNotBlank() }
+        val cleanBit = bitDepth?.takeIf { it.isNotBlank() }
+        return when {
+            shortKhz != null && cleanBit != null -> {
+                val full = "${shortKhz}k ${cleanBit}Bit"
+                if (full.length <= 9) full else "${shortKhz}k ${cleanBit}b"
             }
-        }
-        for (text in nonBlank) {
-            if (REGEX_HIRES_TAG.containsMatchIn(text)) {
-                return "Hi-Res"
+            cleanBit != null -> "${cleanBit}Bit"
+            rateKhzRaw != null -> {
+                val solo = "${rateKhzRaw}kHz"
+                if (solo.length <= 9) solo else "${shortKhz}kHz"
             }
+            else -> null
         }
-        for (text in nonBlank) {
-            if (REGEX_LOSSLESS_TAG.containsMatchIn(text)) {
-                return if (isBitChord) "FLAC" else "Hi-Res"
-            }
-        }
-        return null
     }
 
     private fun collectBundleQualityStrings(bundle: Bundle?, out: MutableList<String>) {
@@ -650,8 +776,9 @@ class BitChordListenerService : NotificationListenerService() {
                         48000L -> out += "48kHz"
                         88200L -> out += "88.2kHz"
                         96000L -> out += "96kHz"
-                        176400L -> out += "176kHz"
+                        176400L -> out += "176.4kHz"
                         192000L -> out += "192kHz"
+                        352800L -> out += "352.8kHz"
                         384000L -> out += "384kHz"
                     }
                 } else if (keyLower.contains("bit") && keyLower.contains("depth")) {
@@ -665,17 +792,17 @@ class BitChordListenerService : NotificationListenerService() {
         }
     }
 
-    private fun extractAudioQualityFromNotification(sbn: StatusBarNotification): String? {
+    private fun extractAudioInfoFromNotification(sbn: StatusBarNotification): ParsedAudioInfo {
         return try {
-            val extras = sbn.notification?.extras ?: return null
+            val extras = sbn.notification?.extras ?: return ParsedAudioInfo()
             val fields = mutableListOf<String>()
             listOf(
-                Notification.EXTRA_TITLE,
                 Notification.EXTRA_TEXT,
                 Notification.EXTRA_SUB_TEXT,
-                Notification.EXTRA_INFO_TEXT,
                 Notification.EXTRA_BIG_TEXT,
+                Notification.EXTRA_INFO_TEXT,
                 Notification.EXTRA_SUMMARY_TEXT,
+                Notification.EXTRA_TITLE,
                 Notification.EXTRA_TITLE_BIG
             ).forEach { extraKey ->
                 extras.getCharSequence(extraKey)?.toString()?.takeIf { it.isNotBlank() }?.let {
@@ -683,7 +810,98 @@ class BitChordListenerService : NotificationListenerService() {
                 }
             }
             collectBundleQualityStrings(extras, fields)
-            extractQualityTag(fields, currentPlayerPackage.lowercase().contains("bitchord"))
+            parseAudioInfoFromFields(fields)
+        } catch (_: Throwable) {
+            ParsedAudioInfo()
+        }
+    }
+
+    private fun devicePriorityScore(type: Int): Int = when (type) {
+        AudioDeviceInfo.TYPE_USB_DEVICE,
+        AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_USB_ACCESSORY -> 4
+        AudioDeviceInfo.TYPE_BLE_HEADSET,
+        AudioDeviceInfo.TYPE_BLE_SPEAKER,
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 3
+        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        AudioDeviceInfo.TYPE_LINE_DIGITAL,
+        AudioDeviceInfo.TYPE_LINE_ANALOG -> 2
+        else -> 1
+    }
+
+    private fun estimateSpecFromAudioManager(): String? {
+        return try {
+            val mediaAttrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+            val routedSinks = try {
+                audioManager.getAudioDevicesForAttributes(mediaAttrs).filter { it.isSink }
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            val candidateDevices = if (routedSinks.isNotEmpty()) {
+                routedSinks
+            } else {
+                audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { it.isSink }
+            }
+            val preferredDevice = candidateDevices.maxByOrNull { devicePriorityScore(it.type) }
+
+            val propRateHz = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
+                ?.toIntOrNull()
+                ?.takeIf { it in 44100..192000 }
+            val devRates = preferredDevice?.sampleRates?.filter { it in 44100..192000 }.orEmpty()
+            val isUsbDac = preferredDevice != null && (
+                preferredDevice.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                    preferredDevice.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                    preferredDevice.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
+                )
+            val isBtAudio = preferredDevice != null && (
+                preferredDevice.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    preferredDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    preferredDevice.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                )
+
+            val resolvedRateHz: Int? = if (devRates.isNotEmpty()) {
+                when {
+                    isUsbDac && 96000 in devRates -> 96000
+                    isBtAudio && propRateHz != null && propRateHz in devRates -> propRateHz
+                    isBtAudio && 48000 in devRates -> 48000
+                    isBtAudio && 44100 in devRates -> 44100
+                    propRateHz != null && propRateHz in devRates -> propRateHz
+                    48000 in devRates -> 48000
+                    44100 in devRates -> 44100
+                    else -> devRates.firstOrNull()
+                }
+            } else {
+                propRateHz
+            }
+
+            val rateKhzRaw = when (resolvedRateHz) {
+                44100 -> "44.1"
+                48000 -> "48"
+                88200 -> "88.2"
+                96000 -> "96"
+                176400 -> "176.4"
+                192000 -> "192"
+                else -> resolvedRateHz?.let { (it / 1000).toString() }
+            }
+
+            val encodings = preferredDevice?.encodings ?: IntArray(0)
+            val supportsHighBit = encodings.any {
+                it == AudioFormat.ENCODING_PCM_24BIT_PACKED ||
+                    it == AudioFormat.ENCODING_PCM_32BIT ||
+                    it == AudioFormat.ENCODING_PCM_FLOAT
+            }
+            val supports16Bit = AudioFormat.ENCODING_PCM_16BIT in encodings
+            val bitDepth = when {
+                supportsHighBit -> "24"
+                supports16Bit -> "16"
+                else -> null
+            }
+
+            formatSpecBadge(rateKhzRaw, bitDepth)
         } catch (_: Throwable) {
             null
         }
@@ -693,14 +911,25 @@ class BitChordListenerService : NotificationListenerService() {
         val pkgLower = currentPlayerPackage.lowercase()
         val isBitChord = pkgLower.contains("bitchord")
         val metadataFields = mutableListOf<String>()
-        if (currentTitle.isNotBlank()) metadataFields += currentTitle
-        if (currentArtist.isNotBlank()) metadataFields += currentArtist
 
         if (metadata != null) {
             try {
+                metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE)?.takeIf { it.isNotBlank() }?.let {
+                    metadataFields += it
+                }
+                metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION)?.takeIf { it.isNotBlank() }?.let {
+                    metadataFields += it
+                }
                 for (key in metadata.keySet()) {
                     val keyLower = key.lowercase()
-                    if (keyLower.contains("bitmap") || keyLower.contains("art") || keyLower.contains("icon") || keyLower.contains("rating")) {
+                    if (
+                        keyLower.contains("bitmap") ||
+                        keyLower.contains("art") ||
+                        keyLower.contains("icon") ||
+                        keyLower.contains("rating") ||
+                        key == MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE ||
+                        key == MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION
+                    ) {
                         continue
                     }
                     val strVal = try {
@@ -719,8 +948,9 @@ class BitChordListenerService : NotificationListenerService() {
                             48000L -> metadataFields += "48kHz"
                             88200L -> metadataFields += "88.2kHz"
                             96000L -> metadataFields += "96kHz"
-                            176400L -> metadataFields += "176kHz"
+                            176400L -> metadataFields += "176.4kHz"
                             192000L -> metadataFields += "192kHz"
+                            352800L -> metadataFields += "352.8kHz"
                             384000L -> metadataFields += "384kHz"
                         }
                     } else if (keyLower.contains("bit") && keyLower.contains("depth")) {
@@ -736,35 +966,59 @@ class BitChordListenerService : NotificationListenerService() {
         }
         collectBundleQualityStrings(controllerExtras, metadataFields)
 
-        if (currentNotificationBadge == null && currentPlayerPackage.isNotBlank()) {
-            currentNotificationBadge = try {
+        if (
+            currentNotificationCodec == null &&
+            currentNotificationRateKhz == null &&
+            currentNotificationBitDepth == null &&
+            !currentNotificationHiRes &&
+            currentPlayerPackage.isNotBlank()
+        ) {
+            val notifInfo = try {
                 activeNotifications
                     ?.firstOrNull { it.packageName == currentPlayerPackage }
-                    ?.let { extractAudioQualityFromNotification(it) }
+                    ?.let { extractAudioInfoFromNotification(it) }
             } catch (_: Throwable) {
                 null
             }
+            if (notifInfo != null) {
+                currentNotificationCodec = notifInfo.codec
+                currentNotificationRateKhz = notifInfo.rateKhzRaw
+                currentNotificationBitDepth = notifInfo.bitDepth
+                currentNotificationHiRes = notifInfo.isHiRes
+            }
         }
 
-        val combinedFields = buildList {
-            currentNotificationBadge?.let { add(it) }
-            addAll(metadataFields)
-        }
-        val detectedBadge = extractQualityTag(combinedFields, isBitChord)
+        val parsedMeta = parseAudioInfoFromFields(metadataFields)
+        val detectedCodec = parsedMeta.codec ?: currentNotificationCodec
+        val detectedRate = parsedMeta.rateKhzRaw ?: currentNotificationRateKhz
+        val detectedBit = parsedMeta.bitDepth ?: currentNotificationBitDepth
+        val hasHiResTag = parsedMeta.isHiRes || currentNotificationHiRes
 
-        currentSourceLabel = when {
-            !detectedBadge.isNullOrBlank() -> detectedBadge.take(7)
-            isBitChord -> "FLAC"
-            pkgLower.contains("spotify") -> "Spotify"
-            pkgLower.contains("youtube.music") -> "YT Mus"
-            pkgLower.contains("apple.android.music") -> "Apple"
-            pkgLower.contains("tidal") -> "TIDAL"
-            pkgLower.contains("amazon.mp3") -> "Amazon"
-            pkgLower.contains("deezer") -> "Deezer"
-            pkgLower.contains("soundcloud") -> "SCloud"
-            else -> "Hi-Fi"
-        }.take(7)
-        LyricsPlaybackStore.audioQualityBadge.value = currentSourceLabel
+        val metadataSpec = formatSpecBadge(detectedRate, detectedBit)
+
+        if (isBitChord) {
+            currentCodecBadge = detectedCodec ?: "FLAC"
+            currentSpecBadge = metadataSpec
+                ?: estimateSpecFromAudioManager()
+                ?: if (hasHiResTag) "Hi-Res" else "Lossless"
+        } else {
+            val (defaultCodec, defaultSpec) = when {
+                pkgLower.contains("spotify") -> "Spotify" to "320k"
+                pkgLower.contains("youtube.music") -> "YT Music" to "HQ"
+                pkgLower.contains("apple.android.music") -> "ALAC" to "Lossless"
+                pkgLower.contains("tidal") -> "TIDAL" to "Lossless"
+                pkgLower.contains("amazon.mp3") -> "Amazon" to "HD"
+                pkgLower.contains("deezer") -> "Deezer" to "Hi-Fi"
+                pkgLower.contains("soundcloud") -> "SCloud" to "HQ"
+                pkgLower.contains("qobuz") -> "Qobuz" to "Hi-Res"
+                else -> "Hi-Fi" to "Lossless"
+            }
+            currentCodecBadge = detectedCodec ?: defaultCodec
+            currentSpecBadge = metadataSpec ?: if (hasHiResTag) "Hi-Res" else defaultSpec
+        }
+
+        LyricsPlaybackStore.audioCodecBadge.value = currentCodecBadge
+        LyricsPlaybackStore.audioSpecBadge.value = currentSpecBadge
     }
 
     private fun rawExtrapolatedPositionMs(now: Long): Long {
@@ -871,7 +1125,10 @@ class BitChordListenerService : NotificationListenerService() {
         LyricsPlaybackStore.title.value = title
         LyricsPlaybackStore.artist.value = artist
         if (isNewTrack) {
-            currentNotificationBadge = null
+            currentNotificationCodec = null
+            currentNotificationRateKhz = null
+            currentNotificationBitDepth = null
+            currentNotificationHiRes = false
         }
         refreshSourceQuality(metadata, activeController?.extras)
 
@@ -986,28 +1243,37 @@ class BitChordListenerService : NotificationListenerService() {
         val durMs = currentDurationMs
         val cleanArtist = notifier.getCleanArtist(currentArtist)
         val cleanTitle = notifier.getCleanTitle(currentTitle)
-        val needsPhase2Scroll = cleanArtist.length > 9 || cleanTitle.length > 9
+        val artistPages = notifier.splitIntoWordPages(cleanArtist)
+        val titlePages = notifier.splitIntoWordPages(cleanTitle)
 
         val wingDelayMs: Long = when {
-            // Fase 1 (0s .. 5s): testo statico, prossimo risveglio al passaggio in Fase 2
-            rawPosMs < 5_000L -> {
-                ((5_000L - rawPosMs + 25L) / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
+            // Fase 1 (0s .. 5.5s): split per parole intere; eventuale cambio coppia a 2.5s solo se titolo > 20 car. e >= 3 pagine
+            rawPosMs < 5_500L -> {
+                val deltaPhaseEndMs = 5_500L - rawPosMs + 25L
+                val deltaGiantFlipMs = if (cleanTitle.length > 20 && titlePages.size >= 3 && rawPosMs < 2_500L) {
+                    2_500L - rawPosMs + 25L
+                } else {
+                    Long.MAX_VALUE
+                }
+                val rawWing = min(deltaPhaseEndMs, deltaGiantFlipMs)
+                (rawWing / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
             }
-            // Fase 2 (5s .. 14s): scorrimento lento 1.8s solo se artist/title > 9 chars + step anello
+            // Fase 2 (5.5s .. 14s): scatto pagina ogni 2.0s SOLO se almeno un lato supera 1 pagina + step anello
             rawPosMs < 14_000L -> {
                 val deltaPhaseEndMs = 14_000L - rawPosMs + 25L
-                val deltaScrollMs = if (needsPhase2Scroll) {
-                    val inPhaseMs = (rawPosMs - 5_000L).coerceAtLeast(0L)
-                    val nextScrollPos = 5_000L + ((inPhaseMs / 1_800L) + 1L) * 1_800L
-                    if (nextScrollPos < 14_000L) (nextScrollPos - rawPosMs + 25L) else Long.MAX_VALUE
+                val needsPhase2Paging = artistPages.size > 1 || titlePages.size > 1
+                val deltaPageMs = if (needsPhase2Paging) {
+                    val inPhaseMs = (rawPosMs - 5_500L).coerceAtLeast(0L)
+                    val nextPagePos = 5_500L + ((inPhaseMs / 2_000L) + 1L) * 2_000L
+                    if (nextPagePos < 14_000L) (nextPagePos - rawPosMs + 25L) else Long.MAX_VALUE
                 } else {
                     Long.MAX_VALUE
                 }
                 val deltaRingMs = deltaToNextRingStepMs(rawPosMs, durMs)
-                val rawWing = minOf(deltaPhaseEndMs, deltaScrollMs, deltaRingMs)
+                val rawWing = minOf(deltaPhaseEndMs, deltaPageMs, deltaRingMs)
                 (rawWing / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
             }
-            // Fase 3 (14s .. 19s): badge statico + step anello + transizione a Fase 4
+            // Fase 3 (14s .. 19s): doppia ala qualità audio statica + step anello + transizione a Fase 4
             rawPosMs < 19_000L -> {
                 val deltaPhaseEndMs = 19_000L - rawPosMs + 25L
                 val deltaRingMs = deltaToNextRingStepMs(rawPosMs, durMs)
@@ -1075,14 +1341,15 @@ class BitChordListenerService : NotificationListenerService() {
             isPlaying = isPlaying,
             posMs = rawPosMs,
             durationMs = currentDurationMs,
-            audioQualityBadge = currentSourceLabel
+            audioCodecBadge = currentCodecBadge,
+            audioSpecBadge = currentSpecBadge
         )
         val albumArtHash = (currentCoverSig xor (currentCoverSig ushr 32)).toInt()
 
         val renderKey = "$currentTrackKey|$idx|$isPlaying|" +
-            "${wingState.leftText}|${wingState.leftIconKey}|" +
-            "${wingState.rightText}|${wingState.rightIconKey}|" +
-            "${wingState.progressStep}|$currentSourceLabel|$albumArtHash"
+            "${wingState.leftText}|${wingState.leftNarrowFont}|${wingState.leftIconKey}|" +
+            "${wingState.rightText}|${wingState.rightNarrowFont}|${wingState.rightIconKey}|" +
+            "${wingState.progressStep}|$currentCodecBadge|$currentSpecBadge|$albumArtHash"
         if (!forceImmediate && renderKey == lastRenderKey) return
 
         if (!forceImmediate && isForegroundStarted && now - lastNotifyRealtimeMs < MIN_LINE_INTERVAL_MS) {
@@ -1150,7 +1417,8 @@ class BitChordListenerService : NotificationListenerService() {
                 isPlaying = isPlaying,
                 posMs = rawPosMs,
                 durationMs = currentDurationMs,
-                audioQualityBadge = currentSourceLabel,
+                audioCodecBadge = currentCodecBadge,
+                audioSpecBadge = currentSpecBadge,
                 hasSyncedLyrics = hasSyncedLyrics
             )
             try {
@@ -1172,7 +1440,8 @@ class BitChordListenerService : NotificationListenerService() {
                     isPlaying = isPlaying,
                     posMs = rawPosMs,
                     durationMs = currentDurationMs,
-                    audioQualityBadge = currentSourceLabel,
+                    audioCodecBadge = currentCodecBadge,
+                    audioSpecBadge = currentSpecBadge,
                     hasSyncedLyrics = hasSyncedLyrics
                 )
             } catch (_: Exception) {
@@ -1188,7 +1457,8 @@ class BitChordListenerService : NotificationListenerService() {
                     isPlaying = isPlaying,
                     posMs = rawPosMs,
                     durationMs = currentDurationMs,
-                    audioQualityBadge = currentSourceLabel,
+                    audioCodecBadge = currentCodecBadge,
+                    audioSpecBadge = currentSpecBadge,
                     hasSyncedLyrics = hasSyncedLyrics
                 )
             }
@@ -1205,7 +1475,8 @@ class BitChordListenerService : NotificationListenerService() {
                 isPlaying = isPlaying,
                 posMs = rawPosMs,
                 durationMs = currentDurationMs,
-                audioQualityBadge = currentSourceLabel,
+                audioCodecBadge = currentCodecBadge,
+                audioSpecBadge = currentSpecBadge,
                 hasSyncedLyrics = hasSyncedLyrics
             )
         }
@@ -1216,6 +1487,10 @@ class BitChordListenerService : NotificationListenerService() {
         if (instance === this) instance = null
         stopTicker()
         handler.removeCallbacksAndMessages(null)
+        try {
+            audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+        } catch (_: Throwable) {
+        }
         fetchJob?.cancel()
         paletteJob?.cancel()
         activeController?.unregisterCallback(mediaCallback)

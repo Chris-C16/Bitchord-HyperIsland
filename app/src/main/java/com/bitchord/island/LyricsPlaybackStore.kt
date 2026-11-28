@@ -19,7 +19,8 @@ object LyricsPlaybackStore {
     val speed = MutableStateFlow(1f)
     val syncOffsetMs = MutableStateFlow(DEFAULT_SYNC_OFFSET_MS)
     val activePlayerPackage = MutableStateFlow("")
-    val audioQualityBadge = MutableStateFlow("")
+    val audioCodecBadge = MutableStateFlow("")
+    val audioSpecBadge = MutableStateFlow("")
 
     var onPlayPause: (() -> Unit)? = null
     var onNext: (() -> Unit)? = null
