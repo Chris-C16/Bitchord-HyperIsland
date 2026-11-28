@@ -305,6 +305,11 @@ object AppPreferences {
         return lastActiveMusicPackage.value.takeIf { it.isNotBlank() }
     }
 
+    private fun isRealRateOrBitSpec(spec: String): Boolean {
+        if (spec.isBlank()) return false
+        return Regex("""\d+\s*(?:k|khz|bit|b)\b""", RegexOption.IGNORE_CASE).containsMatchIn(spec)
+    }
+
     private fun loadQualityCacheLocked(sp: SharedPreferences) {
         val raw = safeString(sp, KEY_BITCHORD_QUALITY_LRU, "")
         if (raw.isBlank()) return
@@ -318,7 +323,7 @@ object AppPreferences {
                     val k = obj.optString("k")
                     val c = obj.optString("c")
                     val s = obj.optString("s")
-                    if (k.isNotBlank() && c.isNotBlank() && s.isNotBlank()) {
+                    if (k.isNotBlank() && c.isNotBlank() && isRealRateOrBitSpec(s)) {
                         qualityCache[k] = c to s
                     }
                 }
@@ -331,7 +336,7 @@ object AppPreferences {
         if (trackKey.isBlank()) return null
         init(context)
         return synchronized(qualityLock) {
-            qualityCache[trackKey]
+            qualityCache[trackKey]?.takeIf { isRealRateOrBitSpec(it.second) }
         }
     }
 
@@ -341,7 +346,7 @@ object AppPreferences {
         codec: String,
         spec: String
     ) {
-        if (trackKey.isBlank() || codec.isBlank() || spec.isBlank()) return
+        if (trackKey.isBlank() || codec.isBlank() || !isRealRateOrBitSpec(spec)) return
         init(context)
         val serialized = synchronized(qualityLock) {
             qualityCache[trackKey] = codec to spec

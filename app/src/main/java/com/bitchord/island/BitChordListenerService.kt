@@ -39,12 +39,12 @@ class BitChordListenerService : NotificationListenerService() {
         private const val FORWARD_JITTER_GUARD_MS = 220L
         private const val LINE_HYSTERESIS_MS = 1500L
         private const val HARD_REBIND_COOLDOWN_MS = 2500L
+        private const val QUALITY_FLASH_DURATION_MS = 4_500L
 
         private val REGEX_CODEC_TAG = Regex("""\b(flac|alac|wav|mqa|dsd\d*|opus|aac|mp3)\b""", RegexOption.IGNORE_CASE)
         private val REGEX_BIT_DEPTH = Regex("""\b(\d{2})\s*-?\s*bit\b""", RegexOption.IGNORE_CASE)
         private val REGEX_SAMPLE_RATE = Regex("""\b(\d{2,3}(?:\.\d)?)\s*k?hz\b""", RegexOption.IGNORE_CASE)
         private val REGEX_SAMPLE_RATE_RAW_HZ = Regex("""\b(384000|352800|192000|176400|96000|88200|48000|44100)\s*hz\b""", RegexOption.IGNORE_CASE)
-        private val REGEX_HIRES_TAG = Regex("""\bhi[\s_-]?res\b""", RegexOption.IGNORE_CASE)
         private val REGEX_LOSSLESS_TAG = Regex("""\blossless\b""", RegexOption.IGNORE_CASE)
 
         @Volatile
@@ -169,11 +169,34 @@ class BitChordListenerService : NotificationListenerService() {
                 if (activeKey == trackKey) {
                     val prevCodec = inst.currentCodecBadge
                     val prevSpec = inst.currentSpecBadge
-                    inst.refreshSourceQuality(inst.activeController?.metadata, inst.activeController?.extras)
-                    if (inst.currentCodecBadge != prevCodec || inst.currentSpecBadge != prevSpec) {
+                    inst.refreshSourceQuality(
+                        metadata = inst.activeController?.metadata,
+                        controllerExtras = inst.activeController?.extras,
+                        playbackExtras = inst.activeController?.playbackState?.extras
+                    )
+                    val playing = inst.activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+                    val specJustCaptured = !inst.notifier.hasRealAudioSpec(prevSpec) &&
+                        inst.notifier.hasRealAudioSpec(inst.currentSpecBadge)
+                    if (specJustCaptured && playing) {
+                        val rawPos = LyricsPlaybackStore.rawPositionMs().coerceAtLeast(0L)
+                        val normalPhase3End = inst.notifier.normalPhase3EndMs(
+                            inst.currentTitle,
+                            inst.currentArtist,
+                            hasRealSpec = true
+                        )
+                        val normalPhase3Start = (normalPhase3End - QUALITY_FLASH_DURATION_MS).coerceAtLeast(0L)
+                        if (rawPos >= normalPhase3Start) {
+                            inst.qualityFlashTrackKey = trackKey
+                            inst.qualityFlashUntilElapsedMs =
+                                SystemClock.elapsedRealtime() + QUALITY_FLASH_DURATION_MS
+                        }
+                    }
+                    if (inst.currentCodecBadge != prevCodec || inst.currentSpecBadge != prevSpec || specJustCaptured) {
                         inst.lastRenderKey = ""
-                        val playing = inst.activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
                         inst.syncLyrics(isPlaying = playing, forceImmediate = true)
+                        if (playing) {
+                            inst.scheduleNextTick()
+                        }
                     }
                 }
             }
@@ -236,9 +259,10 @@ class BitChordListenerService : NotificationListenerService() {
     private var currentNotificationCodec: String? = null
     private var currentNotificationRateKhz: String? = null
     private var currentNotificationBitDepth: String? = null
-    private var currentNotificationHiRes = false
-    private var currentCodecBadge = "Hi-Fi"
-    private var currentSpecBadge = "Lossless"
+    private var currentCodecBadge = "FLAC"
+    private var currentSpecBadge = ""
+    private var qualityFlashTrackKey = ""
+    private var qualityFlashUntilElapsedMs = 0L
 
     private var lastLineIndex = -1
     private var lastRenderKey = ""
@@ -325,6 +349,7 @@ class BitChordListenerService : NotificationListenerService() {
                 syncLyrics(isPlaying = true, forceImmediate = clockChanged)
             } else {
                 stopTicker()
+                qualityFlashUntilElapsedMs = 0L
                 lastRenderKey = ""
                 syncLyrics(isPlaying = false, forceImmediate = true)
             }
@@ -337,9 +362,10 @@ class BitChordListenerService : NotificationListenerService() {
             currentNotificationCodec = null
             currentNotificationRateKhz = null
             currentNotificationBitDepth = null
-            currentNotificationHiRes = false
-            currentCodecBadge = "Hi-Fi"
-            currentSpecBadge = "Lossless"
+            currentCodecBadge = "FLAC"
+            currentSpecBadge = ""
+            qualityFlashTrackKey = ""
+            qualityFlashUntilElapsedMs = 0L
             LyricsPlaybackStore.activePlayerPackage.value = ""
             LyricsPlaybackStore.audioCodecBadge.value = ""
             LyricsPlaybackStore.audioSpecBadge.value = ""
@@ -538,13 +564,14 @@ class BitChordListenerService : NotificationListenerService() {
             currentNotificationCodec = null
             currentNotificationRateKhz = null
             currentNotificationBitDepth = null
-            currentNotificationHiRes = false
+            qualityFlashTrackKey = ""
+            qualityFlashUntilElapsedMs = 0L
         }
 
         currentPlayerPackage = target?.packageName.orEmpty()
         LyricsPlaybackStore.activePlayerPackage.value = currentPlayerPackage
         if (target != null) {
-            refreshSourceQuality(target.metadata, target.extras)
+            refreshSourceQuality(target.metadata, target.extras, target.playbackState?.extras)
         }
 
         if (!switchingSession) {
@@ -593,9 +620,10 @@ class BitChordListenerService : NotificationListenerService() {
             currentNotificationCodec = null
             currentNotificationRateKhz = null
             currentNotificationBitDepth = null
-            currentNotificationHiRes = false
-            currentCodecBadge = "Hi-Fi"
-            currentSpecBadge = "Lossless"
+            currentCodecBadge = "FLAC"
+            currentSpecBadge = ""
+            qualityFlashTrackKey = ""
+            qualityFlashUntilElapsedMs = 0L
             LyricsPlaybackStore.audioCodecBadge.value = ""
             LyricsPlaybackStore.audioSpecBadge.value = ""
             LyricsPlaybackStore.isPlaying.value = false
@@ -608,8 +636,7 @@ class BitChordListenerService : NotificationListenerService() {
     private data class ParsedAudioInfo(
         val codec: String? = null,
         val rateKhzRaw: String? = null,
-        val bitDepth: String? = null,
-        val isHiRes: Boolean = false
+        val bitDepth: String? = null
     )
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -621,16 +648,18 @@ class BitChordListenerService : NotificationListenerService() {
         val notifInfo = extractAudioInfoFromNotification(sbn)
         val changed = notifInfo.codec != currentNotificationCodec ||
             notifInfo.rateKhzRaw != currentNotificationRateKhz ||
-            notifInfo.bitDepth != currentNotificationBitDepth ||
-            notifInfo.isHiRes != currentNotificationHiRes
+            notifInfo.bitDepth != currentNotificationBitDepth
         if (changed) {
             currentNotificationCodec = notifInfo.codec
             currentNotificationRateKhz = notifInfo.rateKhzRaw
             currentNotificationBitDepth = notifInfo.bitDepth
-            currentNotificationHiRes = notifInfo.isHiRes
             val prevCodec = currentCodecBadge
             val prevSpec = currentSpecBadge
-            refreshSourceQuality(activeController?.metadata, activeController?.extras)
+            refreshSourceQuality(
+                metadata = activeController?.metadata,
+                controllerExtras = activeController?.extras,
+                playbackExtras = activeController?.playbackState?.extras
+            )
             if (currentCodecBadge != prevCodec || currentSpecBadge != prevSpec) {
                 lastRenderKey = ""
                 val playing = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
@@ -668,7 +697,6 @@ class BitChordListenerService : NotificationListenerService() {
         var codec: String? = null
         var rateKhzRaw: String? = null
         var bitDepth: String? = null
-        var isHiRes = false
 
         for (text in candidates) {
             if (text.isBlank()) continue
@@ -698,9 +726,6 @@ class BitChordListenerService : NotificationListenerService() {
                     }
                 }
             }
-            if (!isHiRes && REGEX_HIRES_TAG.containsMatchIn(text)) {
-                isHiRes = true
-            }
         }
 
         if (codec == null) {
@@ -715,8 +740,7 @@ class BitChordListenerService : NotificationListenerService() {
         return ParsedAudioInfo(
             codec = codec,
             rateKhzRaw = rateKhzRaw,
-            bitDepth = bitDepth,
-            isHiRes = isHiRes
+            bitDepth = bitDepth
         )
     }
 
@@ -805,7 +829,11 @@ class BitChordListenerService : NotificationListenerService() {
         }
     }
 
-    private fun refreshSourceQuality(metadata: MediaMetadata?, controllerExtras: Bundle? = activeController?.extras) {
+    private fun refreshSourceQuality(
+        metadata: MediaMetadata?,
+        controllerExtras: Bundle? = activeController?.extras,
+        playbackExtras: Bundle? = activeController?.playbackState?.extras
+    ) {
         val pkgLower = currentPlayerPackage.lowercase()
         val isBitChord = pkgLower.contains("bitchord")
         val metadataFields = mutableListOf<String>()
@@ -863,12 +891,12 @@ class BitChordListenerService : NotificationListenerService() {
             }
         }
         collectBundleQualityStrings(controllerExtras, metadataFields)
+        collectBundleQualityStrings(playbackExtras, metadataFields)
 
         if (
             currentNotificationCodec == null &&
             currentNotificationRateKhz == null &&
             currentNotificationBitDepth == null &&
-            !currentNotificationHiRes &&
             currentPlayerPackage.isNotBlank()
         ) {
             val notifInfo = try {
@@ -882,7 +910,6 @@ class BitChordListenerService : NotificationListenerService() {
                 currentNotificationCodec = notifInfo.codec
                 currentNotificationRateKhz = notifInfo.rateKhzRaw
                 currentNotificationBitDepth = notifInfo.bitDepth
-                currentNotificationHiRes = notifInfo.isHiRes
             }
         }
 
@@ -890,9 +917,9 @@ class BitChordListenerService : NotificationListenerService() {
         val detectedCodec = parsedMeta.codec ?: currentNotificationCodec
         val detectedRate = parsedMeta.rateKhzRaw ?: currentNotificationRateKhz
         val detectedBit = parsedMeta.bitDepth ?: currentNotificationBitDepth
-        val hasHiResTag = parsedMeta.isHiRes || currentNotificationHiRes
 
         val metadataSpec = formatSpecBadge(detectedRate, detectedBit)
+            ?.takeIf { notifier.hasRealAudioSpec(it) }
         val trackQualityKey = LyricsPlaybackStore.buildTrackQualityKey(currentTitle, currentArtist)
 
         if (isBitChord) {
@@ -905,28 +932,28 @@ class BitChordListenerService : NotificationListenerService() {
                 }
             } else {
                 val cached = AppPreferences.getCachedBitChordQuality(this, trackQualityKey)
-                if (cached != null) {
+                if (cached != null && notifier.hasRealAudioSpec(cached.second)) {
                     currentCodecBadge = detectedCodec ?: cached.first
                     currentSpecBadge = cached.second
                 } else {
                     currentCodecBadge = detectedCodec ?: "FLAC"
-                    currentSpecBadge = if (hasHiResTag) "Hi-Res" else "Lossless"
+                    currentSpecBadge = ""
                 }
             }
         } else {
-            val (defaultCodec, defaultSpec) = when {
-                pkgLower.contains("spotify") -> "Spotify" to "320k"
-                pkgLower.contains("youtube.music") -> "YT Music" to "HQ"
-                pkgLower.contains("apple.android.music") -> "ALAC" to "Lossless"
-                pkgLower.contains("tidal") -> "TIDAL" to "Lossless"
-                pkgLower.contains("amazon.mp3") -> "Amazon" to "HD"
-                pkgLower.contains("deezer") -> "Deezer" to "Hi-Fi"
-                pkgLower.contains("soundcloud") -> "SCloud" to "HQ"
-                pkgLower.contains("qobuz") -> "Qobuz" to "Hi-Res"
-                else -> "Hi-Fi" to "Lossless"
+            val defaultCodec = when {
+                pkgLower.contains("spotify") -> "Spotify"
+                pkgLower.contains("youtube.music") -> "YT Music"
+                pkgLower.contains("apple.android.music") -> "ALAC"
+                pkgLower.contains("tidal") -> "TIDAL"
+                pkgLower.contains("amazon.mp3") -> "Amazon"
+                pkgLower.contains("deezer") -> "Deezer"
+                pkgLower.contains("soundcloud") -> "SCloud"
+                pkgLower.contains("qobuz") -> "Qobuz"
+                else -> "Hi-Fi"
             }
             currentCodecBadge = detectedCodec ?: defaultCodec
-            currentSpecBadge = metadataSpec ?: if (hasHiResTag) "Hi-Res" else defaultSpec
+            currentSpecBadge = metadataSpec.orEmpty()
         }
 
         LyricsPlaybackStore.audioCodecBadge.value = currentCodecBadge
@@ -1040,9 +1067,10 @@ class BitChordListenerService : NotificationListenerService() {
             currentNotificationCodec = null
             currentNotificationRateKhz = null
             currentNotificationBitDepth = null
-            currentNotificationHiRes = false
+            qualityFlashTrackKey = ""
+            qualityFlashUntilElapsedMs = 0L
         }
-        refreshSourceQuality(metadata, activeController?.extras)
+        refreshSourceQuality(metadata, activeController?.extras, activeController?.playbackState?.extras)
 
         val cover = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
             ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
@@ -1131,6 +1159,14 @@ class BitChordListenerService : NotificationListenerService() {
         return if (nextBoundaryMs > rawPosMs) (nextBoundaryMs - rawPosMs) else 40L
     }
 
+    private fun isQualityFlashActive(nowRealtimeMs: Long): Boolean {
+        if (qualityFlashUntilElapsedMs <= nowRealtimeMs) return false
+        val activeKey = LyricsPlaybackStore.buildTrackQualityKey(currentTitle, currentArtist)
+        return activeKey.isNotBlank() &&
+            activeKey == qualityFlashTrackKey &&
+            notifier.hasRealAudioSpec(currentSpecBadge)
+    }
+
     private fun scheduleNextTick() {
         handler.removeCallbacks(tickRunnable)
         if (!isTicking || !LyricsPlaybackStore.isPlaying.value) return
@@ -1151,58 +1187,38 @@ class BitChordListenerService : NotificationListenerService() {
             Long.MAX_VALUE
         }
 
+        val now = SystemClock.elapsedRealtime()
         val rawPosMs = LyricsPlaybackStore.rawPositionMs().coerceAtLeast(0L)
         val durMs = currentDurationMs
-        val cleanArtist = notifier.getCleanArtist(currentArtist)
-        val cleanTitle = notifier.getCleanTitle(currentTitle)
-        val artistPages = notifier.splitIntoWordPages(cleanArtist)
-        val titlePages = notifier.splitIntoWordPages(cleanTitle)
+        val hasRealSpec = notifier.hasRealAudioSpec(currentSpecBadge)
+        val flashActive = isQualityFlashActive(now)
 
-        val wingDelayMs: Long = when {
-            // Fase 1 (0s .. 5.5s): split per parole intere; eventuale cambio coppia a 2.5s solo se titolo > 20 car. e >= 3 pagine
-            rawPosMs < 5_500L -> {
-                val deltaPhaseEndMs = 5_500L - rawPosMs + 25L
-                val deltaGiantFlipMs = if (cleanTitle.length > 20 && titlePages.size >= 3 && rawPosMs < 2_500L) {
-                    2_500L - rawPosMs + 25L
-                } else {
-                    Long.MAX_VALUE
-                }
-                val rawWing = min(deltaPhaseEndMs, deltaGiantFlipMs)
-                (rawWing / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
-            }
-            // Fase 2 (5.5s .. 14s): scatto pagina ogni 2.0s SOLO se almeno un lato supera 1 pagina + step anello
-            rawPosMs < 14_000L -> {
-                val deltaPhaseEndMs = 14_000L - rawPosMs + 25L
-                val needsPhase2Paging = artistPages.size > 1 || titlePages.size > 1
-                val deltaPageMs = if (needsPhase2Paging) {
-                    val inPhaseMs = (rawPosMs - 5_500L).coerceAtLeast(0L)
-                    val nextPagePos = 5_500L + ((inPhaseMs / 2_000L) + 1L) * 2_000L
-                    if (nextPagePos < 14_000L) (nextPagePos - rawPosMs + 25L) else Long.MAX_VALUE
-                } else {
-                    Long.MAX_VALUE
-                }
-                val deltaRingMs = deltaToNextRingStepMs(rawPosMs, durMs)
-                val rawWing = minOf(deltaPhaseEndMs, deltaPageMs, deltaRingMs)
-                (rawWing / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
-            }
-            // Fase 3 (14s .. 19s): doppia ala qualità audio statica + step anello + transizione a Fase 4
-            rawPosMs < 19_000L -> {
-                val deltaPhaseEndMs = 19_000L - rawPosMs + 25L
-                val deltaRingMs = deltaToNextRingStepMs(rawPosMs, durMs)
-                val rawWing = min(deltaPhaseEndMs, deltaRingMs)
-                (rawWing / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
-            }
-            // Fase 4 (>= 19s): risveglio SOLO al cambio step 10% dell'anello (o nuova riga testi espansa)
-            else -> {
-                val deltaRingMs = deltaToNextRingStepMs(rawPosMs, durMs)
-                if (deltaRingMs < Long.MAX_VALUE) {
-                    (deltaRingMs / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
-                } else {
-                    Long.MAX_VALUE
-                }
-            }
+        val nextPhasePosMs = notifier.nextPhaseTransitionPosMs(
+            rawPosMs = rawPosMs,
+            title = currentTitle,
+            artist = currentArtist,
+            hasRealSpec = hasRealSpec
+        )
+        val deltaPhaseMs = if (nextPhasePosMs < Long.MAX_VALUE && nextPhasePosMs > rawPosMs) {
+            ((nextPhasePosMs - rawPosMs + 25L) / speed).toLong().coerceAtLeast(MIN_TICK_DELAY_MS)
+        } else {
+            Long.MAX_VALUE
         }
 
+        val deltaFlashMs = if (flashActive) {
+            (qualityFlashUntilElapsedMs - now + 30L).coerceAtLeast(MIN_TICK_DELAY_MS)
+        } else {
+            Long.MAX_VALUE
+        }
+
+        val inPhase1NoRing = rawPosMs < 4_500L && !flashActive
+        val deltaRingMs = if (!inPhase1NoRing && durMs > 0L) {
+            ((deltaToNextRingStepMs(rawPosMs, durMs) / speed).toLong()).coerceAtLeast(MIN_TICK_DELAY_MS)
+        } else {
+            Long.MAX_VALUE
+        }
+
+        val wingDelayMs = minOf(deltaPhaseMs, deltaFlashMs, deltaRingMs)
         val nextDelayMs = min(lyricDelayMs, wingDelayMs)
         if (nextDelayMs < Long.MAX_VALUE) {
             handler.postDelayed(tickRunnable, nextDelayMs.coerceAtLeast(MIN_TICK_DELAY_MS))
@@ -1247,6 +1263,7 @@ class BitChordListenerService : NotificationListenerService() {
         }
 
         val currLine = if (idx in currentLines.indices) currentLines[idx] else null
+        val forcePhase3Flash = isPlaying && isQualityFlashActive(now)
         val wingState = notifier.computeDualWingState(
             title = currentTitle,
             artist = currentArtist,
@@ -1254,11 +1271,12 @@ class BitChordListenerService : NotificationListenerService() {
             posMs = rawPosMs,
             durationMs = currentDurationMs,
             audioCodecBadge = currentCodecBadge,
-            audioSpecBadge = currentSpecBadge
+            audioSpecBadge = currentSpecBadge,
+            forcePhase3Flash = forcePhase3Flash
         )
         val albumArtHash = (currentCoverSig xor (currentCoverSig ushr 32)).toInt()
 
-        val renderKey = "$currentTrackKey|$idx|$isPlaying|" +
+        val renderKey = "$currentTrackKey|$idx|$isPlaying|$forcePhase3Flash|" +
             "${wingState.leftText}|${wingState.leftIconKey}|" +
             "${wingState.rightText}|${wingState.rightIconKey}|" +
             "${wingState.progressStep}|$currentCodecBadge|$currentSpecBadge|$albumArtHash"
@@ -1331,7 +1349,8 @@ class BitChordListenerService : NotificationListenerService() {
                 durationMs = currentDurationMs,
                 audioCodecBadge = currentCodecBadge,
                 audioSpecBadge = currentSpecBadge,
-                hasSyncedLyrics = hasSyncedLyrics
+                hasSyncedLyrics = hasSyncedLyrics,
+                forcePhase3Flash = forcePhase3Flash
             )
             try {
                 startForeground(
@@ -1354,7 +1373,8 @@ class BitChordListenerService : NotificationListenerService() {
                     durationMs = currentDurationMs,
                     audioCodecBadge = currentCodecBadge,
                     audioSpecBadge = currentSpecBadge,
-                    hasSyncedLyrics = hasSyncedLyrics
+                    hasSyncedLyrics = hasSyncedLyrics,
+                    forcePhase3Flash = forcePhase3Flash
                 )
             } catch (_: Exception) {
                 notifier.update(
@@ -1371,7 +1391,8 @@ class BitChordListenerService : NotificationListenerService() {
                     durationMs = currentDurationMs,
                     audioCodecBadge = currentCodecBadge,
                     audioSpecBadge = currentSpecBadge,
-                    hasSyncedLyrics = hasSyncedLyrics
+                    hasSyncedLyrics = hasSyncedLyrics,
+                    forcePhase3Flash = forcePhase3Flash
                 )
             }
         } else {
@@ -1389,7 +1410,8 @@ class BitChordListenerService : NotificationListenerService() {
                 durationMs = currentDurationMs,
                 audioCodecBadge = currentCodecBadge,
                 audioSpecBadge = currentSpecBadge,
-                hasSyncedLyrics = hasSyncedLyrics
+                hasSyncedLyrics = hasSyncedLyrics,
+                forcePhase3Flash = forcePhase3Flash
             )
         }
     }

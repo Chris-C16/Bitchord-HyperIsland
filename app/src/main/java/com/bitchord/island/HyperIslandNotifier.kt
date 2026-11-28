@@ -29,6 +29,7 @@ import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
 import android.util.Log
 import android.util.LruCache
+import android.util.TypedValue
 import android.view.View
 import android.widget.RemoteViews
 import androidx.core.graphics.ColorUtils
@@ -48,11 +49,13 @@ class HyperIslandNotifier(private val context: Context) {
         private const val MAX_PAGE_CHARS = 10
         private const val EXPANDED_BG_WIDTH = 240
         private const val EXPANDED_BG_HEIGHT = 96
-        private const val PHASE_1_END_MS = 5_500L
-        private const val PHASE_1_GIANT_STEP_MS = 2_500L
-        private const val PHASE_2_END_MS = 14_000L
+        private const val PHASE_1_END_MS = 4_500L
+        private const val PHASE_1_GIANT_STEP_MS = 2_250L
         private const val PHASE_2_STEP_MS = 2_000L
-        private const val PHASE_3_END_MS = 19_000L
+        private const val PHASE_2_SINGLE_PAGE_MS = 2_500L
+        private const val PHASE_3_DURATION_MS = 4_500L
+
+        private val REGEX_REAL_SPEC = Regex("""\d+\s*(?:k|khz|bit|b)\b""", RegexOption.IGNORE_CASE)
 
         private const val TRAILING_JUNK_CHARS = "([{-–—/:,&+.|•"
 
@@ -99,6 +102,17 @@ class HyperIslandNotifier(private val context: Context) {
         val bgStartColor: Int,
         val bgEndColor: Int,
         val activeLyricColor: Int
+    )
+
+    private data class PhaseBounds(
+        val cleanTitle: String,
+        val cleanArtist: String,
+        val titlePages: List<String>,
+        val artistPages: List<String>,
+        val skipPhase2: Boolean,
+        val phase2PageCount: Int,
+        val phase2EndMs: Long,
+        val phase3EndMs: Long
     )
 
     private data class VinylAssets(
@@ -334,6 +348,78 @@ class HyperIslandNotifier(private val context: Context) {
         return (fraction * PROGRESS_STEP_MAX).roundToInt().coerceIn(0, PROGRESS_STEP_MAX)
     }
 
+    fun hasRealAudioSpec(audioSpecBadge: String): Boolean {
+        return audioSpecBadge.isNotBlank() && REGEX_REAL_SPEC.containsMatchIn(audioSpecBadge)
+    }
+
+    private fun computePhaseBounds(
+        title: String,
+        artist: String,
+        codecFallback: String,
+        hasRealSpec: Boolean
+    ): PhaseBounds {
+        val cleanTitle = getCleanTitle(title).ifBlank { "Lyrics" }
+        val cleanArtist = getCleanArtist(artist).ifBlank { codecFallback.ifBlank { "Music" } }
+        val titlePages = splitIntoWordPages(cleanTitle, MAX_PAGE_CHARS)
+        val artistPages = splitIntoWordPages(cleanArtist, MAX_PAGE_CHARS)
+        val skipPhase2 = cleanTitle.length <= 9 && cleanArtist.length <= 9
+        val phase2PageCount = if (skipPhase2) 0 else max(artistPages.size, titlePages.size).coerceAtLeast(1)
+        val phase2DurationMs = when {
+            skipPhase2 -> 0L
+            phase2PageCount <= 1 -> PHASE_2_SINGLE_PAGE_MS
+            else -> phase2PageCount * PHASE_2_STEP_MS
+        }
+        val phase2EndMs = PHASE_1_END_MS + phase2DurationMs
+        val phase3EndMs = phase2EndMs + if (hasRealSpec) PHASE_3_DURATION_MS else 0L
+        return PhaseBounds(
+            cleanTitle = cleanTitle,
+            cleanArtist = cleanArtist,
+            titlePages = titlePages,
+            artistPages = artistPages,
+            skipPhase2 = skipPhase2,
+            phase2PageCount = phase2PageCount,
+            phase2EndMs = phase2EndMs,
+            phase3EndMs = phase3EndMs
+        )
+    }
+
+    fun normalPhase3EndMs(title: String, artist: String, hasRealSpec: Boolean): Long {
+        return computePhaseBounds(title, artist, "Music", hasRealSpec).phase3EndMs
+    }
+
+    fun nextPhaseTransitionPosMs(
+        rawPosMs: Long,
+        title: String,
+        artist: String,
+        hasRealSpec: Boolean
+    ): Long {
+        val bounds = computePhaseBounds(title, artist, "Music", hasRealSpec)
+        val pos = rawPosMs.coerceAtLeast(0L)
+        if (pos < PHASE_1_END_MS) {
+            return if (
+                bounds.cleanTitle.length > 20 &&
+                bounds.titlePages.size >= 3 &&
+                pos < PHASE_1_GIANT_STEP_MS
+            ) {
+                PHASE_1_GIANT_STEP_MS
+            } else {
+                PHASE_1_END_MS
+            }
+        }
+        if (!bounds.skipPhase2 && pos < bounds.phase2EndMs) {
+            if (bounds.phase2PageCount > 1) {
+                val nextPagePos = PHASE_1_END_MS +
+                    (((pos - PHASE_1_END_MS) / PHASE_2_STEP_MS) + 1L) * PHASE_2_STEP_MS
+                return min(nextPagePos, bounds.phase2EndMs)
+            }
+            return bounds.phase2EndMs
+        }
+        if (hasRealSpec && pos < bounds.phase3EndMs) {
+            return bounds.phase3EndMs
+        }
+        return Long.MAX_VALUE
+    }
+
     fun computeDualWingState(
         title: String,
         artist: String,
@@ -341,12 +427,17 @@ class HyperIslandNotifier(private val context: Context) {
         posMs: Long,
         durationMs: Long,
         audioCodecBadge: String,
-        audioSpecBadge: String
+        audioSpecBadge: String,
+        forcePhase3Flash: Boolean = false
     ): DualWingState {
-        // 1. Stato Pausa (!isPlaying)
+        // 1. Stato Pausa bilanciato (!isPlaying): [Vinile] + 1a pagina titolo (max 9 car.) | "In pausa" + [Pausa]
         if (!isPlaying) {
+            val cleanPauseTitle = getCleanTitle(title).ifBlank { "Lyrics" }
+            val pauseLeftTitle = splitIntoWordPages(cleanPauseTitle, 9)
+                .firstOrNull()?.takeIf { it.isNotBlank() }
+                ?: cleanPauseTitle.take(9).ifBlank { "Lyrics" }
             return DualWingState(
-                leftText = "",
+                leftText = pauseLeftTitle,
                 leftIconKey = PIC_DISC,
                 rightText = "In pausa",
                 rightIconKey = PIC_PAUSE,
@@ -354,37 +445,47 @@ class HyperIslandNotifier(private val context: Context) {
             )
         }
 
-        val codecLabel = audioCodecBadge.ifBlank { "Hi-Fi" }
-        val specLabel = audioSpecBadge.ifBlank { "Lossless" }
-        val cleanTitle = getCleanTitle(title).ifBlank { "Lyrics" }
-        val cleanArtist = getCleanArtist(artist).ifBlank { codecLabel }
-        val titlePages = splitIntoWordPages(cleanTitle, MAX_PAGE_CHARS)
-        val artistPages = splitIntoWordPages(cleanArtist, MAX_PAGE_CHARS)
+        val codecLabel = audioCodecBadge.ifBlank { "FLAC" }
+        val realSpecLabel = audioSpecBadge.takeIf { hasRealAudioSpec(it) }.orEmpty()
+        val hasRealSpec = realSpecLabel.isNotEmpty()
         val safePos = posMs.coerceAtLeast(0L)
         val step = computeProgressStep(safePos, durationMs)
         val ringKey = "miui.focus.pic_progress_$step"
 
-        // 2. Fase 1 — Attacco Simmetrico del Titolo a Parole Intere (0 <= posMs < 5_500)
+        // Flash one-shot 4.5s quando AccessibilityService rileva kHz/Bit reali a brano iniziato
+        if (forcePhase3Flash && hasRealSpec) {
+            return DualWingState(
+                leftText = codecLabel,
+                leftIconKey = PIC_DISC,
+                rightText = realSpecLabel,
+                rightIconKey = ringKey,
+                progressStep = step
+            )
+        }
+
+        val bounds = computePhaseBounds(title, artist, codecLabel, hasRealSpec)
+
+        // 2. Fase 1 — Attacco Simmetrico del Titolo a Parole Intere (0 <= posMs < 4_500)
         if (safePos < PHASE_1_END_MS) {
-            val firstArtistPage = artistPages.firstOrNull().orEmpty()
+            val firstArtistPage = bounds.artistPages.firstOrNull().orEmpty()
             val (leftText, rightText) = when {
-                cleanTitle.length <= MAX_PAGE_CHARS -> {
-                    cleanTitle to firstArtistPage
+                bounds.cleanTitle.length <= MAX_PAGE_CHARS -> {
+                    bounds.cleanTitle to firstArtistPage
                 }
-                cleanTitle.length <= MAX_PAGE_CHARS * 2 -> {
-                    splitMediumTitleSymmetrically(cleanTitle)
+                bounds.cleanTitle.length <= MAX_PAGE_CHARS * 2 -> {
+                    splitMediumTitleSymmetrically(bounds.cleanTitle)
                 }
                 else -> {
-                    if (titlePages.size <= 2) {
-                        val p0 = titlePages.firstOrNull().orEmpty()
-                        val p1 = titlePages.getOrNull(1) ?: firstArtistPage
+                    if (bounds.titlePages.size <= 2) {
+                        val p0 = bounds.titlePages.firstOrNull().orEmpty()
+                        val p1 = bounds.titlePages.getOrNull(1) ?: firstArtistPage
                         p0 to p1
                     } else {
                         val slot = if (safePos < PHASE_1_GIANT_STEP_MS) 0 else 1
                         val baseIdx = slot * 2
-                        val leftPage = titlePages.getOrNull(baseIdx)
-                            ?: titlePages.lastOrNull().orEmpty()
-                        val rightPage = titlePages.getOrNull(baseIdx + 1)
+                        val leftPage = bounds.titlePages.getOrNull(baseIdx)
+                            ?: bounds.titlePages.lastOrNull().orEmpty()
+                        val rightPage = bounds.titlePages.getOrNull(baseIdx + 1)
                             ?: firstArtistPage
                         leftPage to rightPage
                     }
@@ -399,18 +500,18 @@ class HyperIslandNotifier(private val context: Context) {
             )
         }
 
-        // 3. Fase 2 — Artista (Sx) + Titolo (Dx) a Parole Intere (5_500 <= posMs < 14_000)
-        if (safePos < PHASE_2_END_MS) {
+        // 3. Fase 2 — Artista (Sx) + Titolo (Dx) a Parole Intere (1 solo giro, saltata se entrambi <= 9 car.)
+        if (!bounds.skipPhase2 && safePos < bounds.phase2EndMs) {
             val pageStep = ((safePos - PHASE_1_END_MS) / PHASE_2_STEP_MS).toInt().coerceAtLeast(0)
-            val leftPage = when {
-                artistPages.isEmpty() -> cleanArtist.take(MAX_PAGE_CHARS)
-                artistPages.size > 1 -> artistPages[pageStep % artistPages.size]
-                else -> artistPages[0]
+            val leftPage = if (bounds.artistPages.isEmpty()) {
+                bounds.cleanArtist.take(MAX_PAGE_CHARS)
+            } else {
+                bounds.artistPages[pageStep.coerceAtMost(bounds.artistPages.lastIndex)]
             }
-            val rightPage = when {
-                titlePages.isEmpty() -> cleanTitle.take(MAX_PAGE_CHARS)
-                titlePages.size > 1 -> titlePages[pageStep % titlePages.size]
-                else -> titlePages[0]
+            val rightPage = if (bounds.titlePages.isEmpty()) {
+                bounds.cleanTitle.take(MAX_PAGE_CHARS)
+            } else {
+                bounds.titlePages[pageStep.coerceAtMost(bounds.titlePages.lastIndex)]
             }
             return DualWingState(
                 leftText = leftPage,
@@ -421,18 +522,18 @@ class HyperIslandNotifier(private val context: Context) {
             )
         }
 
-        // 4. Fase 3 — Doppia Ala Qualità Audio (14_000 <= posMs < 19_000)
-        if (safePos < PHASE_3_END_MS) {
+        // 4. Fase 3 — Doppia Ala Qualità Audio (4.5s SOLO se audioSpecBadge reale con k/Bit presente)
+        if (hasRealSpec && safePos < bounds.phase3EndMs) {
             return DualWingState(
                 leftText = codecLabel,
                 leftIconKey = PIC_DISC,
-                rightText = specLabel,
+                rightText = realSpecLabel,
                 rightIconKey = ringKey,
                 progressStep = step
             )
         }
 
-        // 5. Fase 4 — Riposo Minimal con Disco + Anello Colorato dalla Copertina (posMs >= 19_000)
+        // 5. Fase 4 — Riposo Minimal con Disco + Anello Colorato dalla Copertina
         return DualWingState(
             leftText = "",
             leftIconKey = PIC_DISC,
@@ -456,10 +557,10 @@ class HyperIslandNotifier(private val context: Context) {
     }
 
     private fun formatCombinedQualityLabel(audioCodecBadge: String, audioSpecBadge: String): String {
-        val codec = audioCodecBadge.ifBlank { "Hi-Fi" }
-        val spec = audioSpecBadge.ifBlank { "" }
-        return if (spec.isNotBlank() && !spec.equals(codec, ignoreCase = true)) {
-            "$codec • $spec"
+        val codec = audioCodecBadge.ifBlank { "FLAC" }
+        val realSpec = audioSpecBadge.takeIf { hasRealAudioSpec(it) }.orEmpty()
+        return if (realSpec.isNotBlank() && !realSpec.equals(codec, ignoreCase = true)) {
+            "$codec • $realSpec"
         } else {
             codec
         }
@@ -597,6 +698,7 @@ class HyperIslandNotifier(private val context: Context) {
                     setSpan(RelativeSizeSpan(0.88f), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
                 rv.setViewVisibility(R.id.tv_lyric_curr, View.VISIBLE)
+                rv.setTextViewTextSize(R.id.tv_lyric_curr, TypedValue.COMPLEX_UNIT_SP, 14f)
                 rv.setTextColor(R.id.tv_lyric_curr, Color.argb(205, 255, 255, 255))
                 rv.setTextViewText(R.id.tv_lyric_curr, styledArtist)
             } else {
@@ -622,7 +724,9 @@ class HyperIslandNotifier(private val context: Context) {
                 rv.setViewVisibility(R.id.tv_lyric_prev, View.GONE)
             }
 
+            val currSizeSp = if (curr.length > 28) 12f else 14f
             rv.setViewVisibility(R.id.tv_lyric_curr, View.VISIBLE)
+            rv.setTextViewTextSize(R.id.tv_lyric_curr, TypedValue.COMPLEX_UNIT_SP, currSizeSp)
             rv.setTextViewText(R.id.tv_lyric_curr, curr)
             rv.setTextColor(R.id.tv_lyric_curr, theme.activeLyricColor)
 
@@ -1112,7 +1216,8 @@ class HyperIslandNotifier(private val context: Context) {
         durationMs: Long,
         audioCodecBadge: String,
         audioSpecBadge: String,
-        hasSyncedLyrics: Boolean
+        hasSyncedLyrics: Boolean,
+        forcePhase3Flash: Boolean = false
     ): Notification {
         val wingState = computeDualWingState(
             title = title,
@@ -1121,7 +1226,8 @@ class HyperIslandNotifier(private val context: Context) {
             posMs = posMs,
             durationMs = durationMs,
             audioCodecBadge = audioCodecBadge,
-            audioSpecBadge = audioSpecBadge
+            audioSpecBadge = audioSpecBadge,
+            forcePhase3Flash = forcePhase3Flash
         )
         val theme = resolveExpandedTheme(cover)
         val (prevText, currText, nextText) = resolveDisplayLines(
@@ -1166,7 +1272,8 @@ class HyperIslandNotifier(private val context: Context) {
         durationMs: Long,
         audioCodecBadge: String,
         audioSpecBadge: String,
-        hasSyncedLyrics: Boolean
+        hasSyncedLyrics: Boolean,
+        forcePhase3Flash: Boolean = false
     ) {
         val wingState = computeDualWingState(
             title = title,
@@ -1175,7 +1282,8 @@ class HyperIslandNotifier(private val context: Context) {
             posMs = posMs,
             durationMs = durationMs,
             audioCodecBadge = audioCodecBadge,
-            audioSpecBadge = audioSpecBadge
+            audioSpecBadge = audioSpecBadge,
+            forcePhase3Flash = forcePhase3Flash
         )
         val theme = resolveExpandedTheme(cover)
         val (prevText, currText, nextText) = resolveDisplayLines(
@@ -1215,7 +1323,8 @@ class HyperIslandNotifier(private val context: Context) {
         durationMs: Long,
         audioCodecBadge: String,
         audioSpecBadge: String,
-        hasSyncedLyrics: Boolean
+        hasSyncedLyrics: Boolean,
+        forcePhase3Flash: Boolean = false
     ) {
         val isScreenOn = powerManager?.isInteractive ?: true
         if (!isScreenOn) return
@@ -1227,7 +1336,8 @@ class HyperIslandNotifier(private val context: Context) {
             posMs = posMs,
             durationMs = durationMs,
             audioCodecBadge = audioCodecBadge,
-            audioSpecBadge = audioSpecBadge
+            audioSpecBadge = audioSpecBadge,
+            forcePhase3Flash = forcePhase3Flash
         )
         val theme = resolveExpandedTheme(cover)
         val (prevText, currText, nextText) = resolveDisplayLines(

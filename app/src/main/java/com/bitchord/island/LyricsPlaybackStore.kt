@@ -21,6 +21,8 @@ object LyricsPlaybackStore {
     val activePlayerPackage = MutableStateFlow("")
     val audioCodecBadge = MutableStateFlow("")
     val audioSpecBadge = MutableStateFlow("")
+    val lastAccessibilityPackage = MutableStateFlow("")
+    val lastAccessibilityRawMatch = MutableStateFlow("")
 
     var onPlayPause: (() -> Unit)? = null
     var onNext: (() -> Unit)? = null

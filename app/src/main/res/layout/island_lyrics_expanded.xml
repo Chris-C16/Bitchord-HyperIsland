@@ -19,9 +19,9 @@
         android:gravity="center_vertical"
         android:orientation="horizontal"
         android:paddingStart="14dp"
-        android:paddingTop="12dp"
+        android:paddingTop="13dp"
         android:paddingEnd="14dp"
-        android:paddingBottom="12dp">
+        android:paddingBottom="15dp">
 
     <FrameLayout
         android:layout_width="56dp"
@@ -78,20 +78,21 @@
             android:ellipsize="end"
             android:fontFamily="sans-serif"
             android:maxLines="1"
-            android:textColor="#7AFFFFFF"
-            android:textSize="12sp" />
+            android:textColor="#B3FFFFFF"
+            android:textSize="11.5sp" />
 
         <TextView
             android:id="@+id/tv_lyric_curr"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="2dp"
-            android:layout_marginBottom="2dp"
+            android:layout_marginTop="1.5dp"
+            android:layout_marginBottom="1.5dp"
             android:ellipsize="end"
             android:fontFamily="sans-serif-medium"
+            android:lineSpacingMultiplier="0.95"
             android:maxLines="2"
             android:textColor="#FFFFFFFF"
-            android:textSize="15sp"
+            android:textSize="14sp"
             android:textStyle="bold" />
 
         <TextView
@@ -101,8 +102,8 @@
             android:ellipsize="end"
             android:fontFamily="sans-serif"
             android:maxLines="1"
-            android:textColor="#7AFFFFFF"
-            android:textSize="12sp" />
+            android:textColor="#B3FFFFFF"
+            android:textSize="11.5sp" />
     </LinearLayout>
 
     <!-- Pulsante Play / Pausa effetto vetro traslucido -->
