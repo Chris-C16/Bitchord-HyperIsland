@@ -10,6 +10,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
@@ -30,10 +31,12 @@ import android.util.Log
 import android.util.LruCache
 import android.view.View
 import android.widget.RemoteViews
-import androidx.compose.ui.graphics.toArgb
+import androidx.core.graphics.ColorUtils
 import org.json.JSONObject
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 class HyperIslandNotifier(private val context: Context) {
@@ -43,7 +46,8 @@ class HyperIslandNotifier(private val context: Context) {
         const val NOTIFICATION_ID = 3601
 
         private const val MAX_PAGE_CHARS = 10
-        private const val NARROW_FONT_WIDTH_THRESHOLD = 8.2f
+        private const val EXPANDED_BG_WIDTH = 240
+        private const val EXPANDED_BG_HEIGHT = 96
         private const val PHASE_1_END_MS = 5_500L
         private const val PHASE_1_GIANT_STEP_MS = 2_500L
         private const val PHASE_2_END_MS = 14_000L
@@ -86,11 +90,15 @@ class HyperIslandNotifier(private val context: Context) {
     data class DualWingState(
         val leftText: String,
         val leftIconKey: String,
-        val leftNarrowFont: Boolean,
         val rightText: String,
         val rightIconKey: String,
-        val rightNarrowFont: Boolean,
         val progressStep: Int
+    )
+
+    private data class ExpandedTwoToneTheme(
+        val bgStartColor: Int,
+        val bgEndColor: Int,
+        val activeLyricColor: Int
     )
 
     private data class VinylAssets(
@@ -119,8 +127,13 @@ class HyperIslandNotifier(private val context: Context) {
     private var cachedDiscAccent: Int = 0
     private var cachedVinylAssets: VinylAssets? = null
 
+    private var cachedThemeCoverRef: Bitmap? = null
+    private var cachedTwoToneTheme: ExpandedTwoToneTheme? = null
+
     // Cache anelli di progresso HD indicizzati per albumArtHash + step 0..10
     private val progressRingIconCache = LruCache<String, Icon>(44)
+    // Cache sfondi sfumati pillola espansa indicizzati per albumArtHash + colori
+    private val expandedBgCache = LruCache<String, Bitmap>(16)
 
     private var lastSpinStep: Int = 0
     private var cachedPausedStep: Int = -1
@@ -233,23 +246,6 @@ class HyperIslandNotifier(private val context: Context) {
         return finalClean
     }
 
-    fun estimateVisualWidth(text: String): Float {
-        if (text.isEmpty()) return 0f
-        var width = 0f
-        for (ch in text) {
-            width += when (ch) {
-                'i', 'I', 'l', 't', '1', ' ', '.', '\'', ',', ':', ';', '!', '|' -> 0.55f
-                'W', 'M', '@', 'G', 'm' -> 1.3f
-                else -> 1.0f
-            }
-        }
-        return width
-    }
-
-    private fun shouldUseNarrowFont(text: String): Boolean {
-        return estimateVisualWidth(text) > NARROW_FONT_WIDTH_THRESHOLD
-    }
-
     fun splitIntoWordPages(text: String, maxChars: Int = MAX_PAGE_CHARS): List<String> {
         val normalized = cleanLine(text)
         if (normalized.isEmpty()) return emptyList()
@@ -338,24 +334,6 @@ class HyperIslandNotifier(private val context: Context) {
         return (fraction * PROGRESS_STEP_MAX).roundToInt().coerceIn(0, PROGRESS_STEP_MAX)
     }
 
-    private fun makeDualWingState(
-        leftText: String,
-        leftIconKey: String,
-        rightText: String,
-        rightIconKey: String,
-        progressStep: Int
-    ): DualWingState {
-        return DualWingState(
-            leftText = leftText,
-            leftIconKey = leftIconKey,
-            leftNarrowFont = shouldUseNarrowFont(leftText),
-            rightText = rightText,
-            rightIconKey = rightIconKey,
-            rightNarrowFont = shouldUseNarrowFont(rightText),
-            progressStep = progressStep
-        )
-    }
-
     fun computeDualWingState(
         title: String,
         artist: String,
@@ -367,7 +345,7 @@ class HyperIslandNotifier(private val context: Context) {
     ): DualWingState {
         // 1. Stato Pausa (!isPlaying)
         if (!isPlaying) {
-            return makeDualWingState(
+            return DualWingState(
                 leftText = "",
                 leftIconKey = PIC_DISC,
                 rightText = "In pausa",
@@ -412,7 +390,7 @@ class HyperIslandNotifier(private val context: Context) {
                     }
                 }
             }
-            return makeDualWingState(
+            return DualWingState(
                 leftText = leftText,
                 leftIconKey = PIC_DISC,
                 rightText = rightText,
@@ -434,7 +412,7 @@ class HyperIslandNotifier(private val context: Context) {
                 titlePages.size > 1 -> titlePages[pageStep % titlePages.size]
                 else -> titlePages[0]
             }
-            return makeDualWingState(
+            return DualWingState(
                 leftText = leftPage,
                 leftIconKey = PIC_DISC,
                 rightText = rightPage,
@@ -445,7 +423,7 @@ class HyperIslandNotifier(private val context: Context) {
 
         // 4. Fase 3 — Doppia Ala Qualità Audio (14_000 <= posMs < 19_000)
         if (safePos < PHASE_3_END_MS) {
-            return makeDualWingState(
+            return DualWingState(
                 leftText = codecLabel,
                 leftIconKey = PIC_DISC,
                 rightText = specLabel,
@@ -455,7 +433,7 @@ class HyperIslandNotifier(private val context: Context) {
         }
 
         // 5. Fase 4 — Riposo Minimal con Disco + Anello Colorato dalla Copertina (posMs >= 19_000)
-        return makeDualWingState(
+        return DualWingState(
             leftText = "",
             leftIconKey = PIC_DISC,
             rightText = "",
@@ -572,14 +550,19 @@ class HyperIslandNotifier(private val context: Context) {
 
     private fun buildExpandedRemoteViews(
         vinyl: VinylAssets,
+        albumArtHash: Int,
+        theme: ExpandedTwoToneTheme,
         prev: String,
         curr: String,
         next: String,
-        accentColor: Int,
         hasSyncedLyrics: Boolean,
         isPlaying: Boolean
     ): RemoteViews {
         val rv = RemoteViews(context.packageName, R.layout.island_lyrics_expanded)
+        rv.setImageViewBitmap(
+            R.id.iv_expanded_bg,
+            getOrCreateExpandedBgBitmap(albumArtHash, theme)
+        )
 
         if (isPlaying) {
             val startStep = ((SystemClock.elapsedRealtime() / SPIN_INTERVAL_MS) % SPIN_FRAME_COUNT).toInt()
@@ -596,6 +579,8 @@ class HyperIslandNotifier(private val context: Context) {
             rv.setViewVisibility(R.id.iv_disc_cover, View.VISIBLE)
             rv.setImageViewBitmap(R.id.iv_disc_cover, getPausedDiscBitmap(vinyl.baseDisc, lastSpinStep))
         }
+
+        val secondaryLineColor = Color.argb(179, 255, 255, 255) // #B3FFFFFF nitido sul gradiente
 
         if (!hasSyncedLyrics) {
             val styledTitle = SpannableStringBuilder(prev).apply {
@@ -623,7 +608,7 @@ class HyperIslandNotifier(private val context: Context) {
                     setSpan(StyleSpan(Typeface.BOLD), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
                 rv.setViewVisibility(R.id.tv_lyric_next, View.VISIBLE)
-                rv.setTextColor(R.id.tv_lyric_next, accentColor)
+                rv.setTextColor(R.id.tv_lyric_next, theme.activeLyricColor)
                 rv.setTextViewText(R.id.tv_lyric_next, styledBadge)
             } else {
                 rv.setViewVisibility(R.id.tv_lyric_next, View.GONE)
@@ -631,7 +616,7 @@ class HyperIslandNotifier(private val context: Context) {
         } else {
             if (prev.isNotBlank()) {
                 rv.setViewVisibility(R.id.tv_lyric_prev, View.VISIBLE)
-                rv.setTextColor(R.id.tv_lyric_prev, Color.argb(122, 255, 255, 255))
+                rv.setTextColor(R.id.tv_lyric_prev, secondaryLineColor)
                 rv.setTextViewText(R.id.tv_lyric_prev, prev)
             } else {
                 rv.setViewVisibility(R.id.tv_lyric_prev, View.GONE)
@@ -639,11 +624,11 @@ class HyperIslandNotifier(private val context: Context) {
 
             rv.setViewVisibility(R.id.tv_lyric_curr, View.VISIBLE)
             rv.setTextViewText(R.id.tv_lyric_curr, curr)
-            rv.setTextColor(R.id.tv_lyric_curr, accentColor)
+            rv.setTextColor(R.id.tv_lyric_curr, theme.activeLyricColor)
 
             if (next.isNotBlank()) {
                 rv.setViewVisibility(R.id.tv_lyric_next, View.VISIBLE)
-                rv.setTextColor(R.id.tv_lyric_next, Color.argb(122, 255, 255, 255))
+                rv.setTextColor(R.id.tv_lyric_next, secondaryLineColor)
                 rv.setTextViewText(R.id.tv_lyric_next, next)
             } else {
                 rv.setViewVisibility(R.id.tv_lyric_next, View.GONE)
@@ -679,7 +664,7 @@ class HyperIslandNotifier(private val context: Context) {
                         "textInfo",
                         JSONObject().apply {
                             put("title", wingState.leftText)
-                            put("narrowFont", wingState.leftNarrowFont)
+                            put("narrowFont", true)
                             put("showHighlightColor", false)
                         }
                     )
@@ -700,7 +685,7 @@ class HyperIslandNotifier(private val context: Context) {
                         "textInfo",
                         JSONObject().apply {
                             put("title", wingState.rightText)
-                            put("narrowFont", wingState.rightNarrowFont)
+                            put("narrowFont", true)
                             put("showHighlightColor", false)
                         }
                     )
@@ -743,9 +728,7 @@ class HyperIslandNotifier(private val context: Context) {
         fallbackTitle: String,
         accentHex: String
     ): Pair<String, String> {
-        val key = "${wingState.leftText}|${wingState.leftNarrowFont}|" +
-            "${wingState.rightText}|${wingState.rightNarrowFont}|" +
-            "${wingState.leftIconKey}|${wingState.rightIconKey}|$accentHex"
+        val key = "${wingState.leftText}|${wingState.rightText}|${wingState.leftIconKey}|${wingState.rightIconKey}|$accentHex"
         val existing = cachedFocusJsonPair
         if (existing != null && cachedFocusJsonKey == key) {
             return existing
@@ -815,7 +798,7 @@ class HyperIslandNotifier(private val context: Context) {
         cleanTitleFallback: String,
         wingState: DualWingState,
         albumArtHash: Int,
-        dominantColor: Int,
+        theme: ExpandedTwoToneTheme,
         prevText: String,
         currText: String,
         nextText: String,
@@ -823,18 +806,20 @@ class HyperIslandNotifier(private val context: Context) {
         hasSyncedLyrics: Boolean,
         isPlaying: Boolean
     ): Notification {
-        val accentHex = String.format("#%06X", 0xFFFFFF and dominantColor)
-        val expandedBody = formatStyledExpandedLyrics(prevText, currText, nextText, dominantColor, hasSyncedLyrics)
-        val vinyl = getOrCreateVinylAssets(cover, dominantColor)
+        val accentColor = theme.activeLyricColor
+        val accentHex = String.format("#%06X", 0xFFFFFF and accentColor)
+        val expandedBody = formatStyledExpandedLyrics(prevText, currText, nextText, accentColor, hasSyncedLyrics)
+        val vinyl = getOrCreateVinylAssets(cover, accentColor)
         val smallIcon = if (isPlaying) smallWaveIcon else smallPauseIcon
-        val rightIcon = resolveRightWingIcon(wingState, albumArtHash, dominantColor)
+        val rightIcon = resolveRightWingIcon(wingState, albumArtHash, accentColor)
 
         val expandedRv = buildExpandedRemoteViews(
             vinyl = vinyl,
+            albumArtHash = albumArtHash,
+            theme = theme,
             prev = prevText,
             curr = currText,
             next = nextText,
-            accentColor = dominantColor,
             hasSyncedLyrics = hasSyncedLyrics,
             isPlaying = isPlaying
         )
@@ -867,7 +852,7 @@ class HyperIslandNotifier(private val context: Context) {
             .setLargeIcon(vinyl.baseDisc)
             .setContentTitle(cleanTitleFallback.ifBlank { "DynamicLyrics" })
             .setContentText(expandedBody)
-            .setColor(dominantColor)
+            .setColor(accentColor)
             .setColorized(false)
             .setShowWhen(false)
             .setOngoing(isPlaying)
@@ -884,46 +869,233 @@ class HyperIslandNotifier(private val context: Context) {
         return builder.build()
     }
 
-    private fun resolveDominantColor(cover: Bitmap?, palette: CoverPalette): Int {
-        val sampled = if (cover != null && !cover.isRecycled) {
-            sampleDominantCoverColor(cover)
-        } else {
-            null
-        }
-        val paletteAccent = palette.accent.toArgb()
-        val defaultAccent = CoverPalette().accent.toArgb()
-        val rawColor = when {
-            paletteAccent != defaultAccent -> paletteAccent
-            sampled != null -> sampled
-            else -> defaultAccent
-        }
-        return boostAccentBrightness(rawColor)
-    }
-
-    private fun sampleDominantCoverColor(cover: Bitmap): Int? {
+    private fun extractTwoTonePalette(bitmap: Bitmap): ExpandedTwoToneTheme {
         return try {
-            if (cover.isRecycled || cover.width <= 0 || cover.height <= 0) return null
-            val mini = Bitmap.createScaledBitmap(cover, 14, 14, true)
-            var bestColor = 0
-            var bestScore = -1f
+            if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) {
+                return ExpandedTwoToneTheme(
+                    bgStartColor = 0xFF1C2029.toInt(),
+                    bgEndColor = 0xFF10131A.toInt(),
+                    activeLyricColor = Color.WHITE
+                )
+            }
+
+            val mini = Bitmap.createScaledBitmap(bitmap, 24, 24, true)
+            val colorRSum = FloatArray(12)
+            val colorGSum = FloatArray(12)
+            val colorBSum = FloatArray(12)
+            val colorWeight = FloatArray(12)
+            var totalColorWeight = 0f
+
+            var monoRSum = 0f
+            var monoGSum = 0f
+            var monoBSum = 0f
+            var monoWeight = 0f
+
             for (y in 0 until mini.height) {
                 for (x in 0 until mini.width) {
                     val px = mini.getPixel(x, y)
+                    if (Color.alpha(px) < 128) continue
                     Color.colorToHSV(px, hsvBuffer)
-                    val sat = hsvBuffer[1]
-                    val valB = hsvBuffer[2]
-                    val score = sat * 1.8f + if (valB in 0.22f..0.94f) 0.45f else 0f
-                    if (score > bestScore) {
-                        bestScore = score
-                        bestColor = px
+                    val h = hsvBuffer[0]
+                    val s = hsvBuffer[1]
+                    val v = hsvBuffer[2]
+
+                    val r = Color.red(px).toFloat()
+                    val g = Color.green(px).toFloat()
+                    val b = Color.blue(px).toFloat()
+
+                    val isNearBlackOrWhite = v < 0.08f || (v > 0.95f && s < 0.09f)
+                    if (!isNearBlackOrWhite && s >= 0.14f) {
+                        val bin = ((h / 30f).toInt()).coerceIn(0, 11)
+                        val w = 1.0f + s * 2.2f + if (v in 0.16f..0.90f) 0.45f else 0f
+                        colorRSum[bin] += r * w
+                        colorGSum[bin] += g * w
+                        colorBSum[bin] += b * w
+                        colorWeight[bin] += w
+                        totalColorWeight += w
+                    } else if (v >= 0.05f && v <= 0.96f) {
+                        val w = 1.0f
+                        monoRSum += r * w
+                        monoGSum += g * w
+                        monoBSum += b * w
+                        monoWeight += w
                     }
                 }
             }
-            if (mini !== cover) mini.recycle()
-            if (bestScore > 0f) bestColor else null
+            if (mini !== bitmap) mini.recycle()
+
+            if (totalColorWeight <= 0.01f) {
+                if (monoWeight <= 0f) {
+                    return ExpandedTwoToneTheme(
+                        bgStartColor = 0xFF1C2029.toInt(),
+                        bgEndColor = 0xFF10131A.toInt(),
+                        activeLyricColor = Color.WHITE
+                    )
+                }
+                val avg = Color.rgb(
+                    (monoRSum / monoWeight).roundToInt().coerceIn(0, 255),
+                    (monoGSum / monoWeight).roundToInt().coerceIn(0, 255),
+                    (monoBSum / monoWeight).roundToInt().coerceIn(0, 255)
+                )
+                Color.colorToHSV(avg, hsvBuffer)
+                val baseHue = hsvBuffer[0]
+                val satMuted = hsvBuffer[1].coerceAtMost(0.16f)
+                val bgStart = Color.HSVToColor(255, floatArrayOf(baseHue, satMuted, 0.18f))
+                val bgEnd = Color.HSVToColor(255, floatArrayOf(baseHue, satMuted, 0.09f))
+                val activeNeutral = Color.rgb(245, 247, 252)
+                return ExpandedTwoToneTheme(bgStart, bgEnd, activeNeutral)
+            }
+
+            var dominantBin = 0
+            for (i in 1 until 12) {
+                if (colorWeight[i] > colorWeight[dominantBin]) {
+                    dominantBin = i
+                }
+            }
+            val domRaw = Color.rgb(
+                (colorRSum[dominantBin] / colorWeight[dominantBin]).roundToInt().coerceIn(0, 255),
+                (colorGSum[dominantBin] / colorWeight[dominantBin]).roundToInt().coerceIn(0, 255),
+                (colorBSum[dominantBin] / colorWeight[dominantBin]).roundToInt().coerceIn(0, 255)
+            )
+
+            val domHsv = FloatArray(3)
+            Color.colorToHSV(domRaw, domHsv)
+            val domHue = domHsv[0]
+            val domSat = domHsv[1].coerceIn(0.45f, 0.70f)
+            val vStart = (0.14f + domHsv[2].coerceIn(0f, 1f) * 0.08f).coerceIn(0.14f, 0.22f)
+            val vEnd = (0.07f + domHsv[2].coerceIn(0f, 1f) * 0.04f).coerceIn(0.07f, 0.11f)
+
+            val bgStartColor = Color.HSVToColor(255, floatArrayOf(domHue, domSat, vStart))
+            val bgEndColor = Color.HSVToColor(255, floatArrayOf(domHue, (domSat * 0.92f).coerceIn(0.40f, 0.68f), vEnd))
+
+            // Seleziona colore secondario armonico distinto dal dominante
+            var bestSecBin = -1
+            var bestSecScore = -1f
+            val candidateHsv = FloatArray(3)
+            for (i in 0 until 12) {
+                if (i == dominantBin || colorWeight[i] < totalColorWeight * 0.035f) continue
+                val binColor = Color.rgb(
+                    (colorRSum[i] / colorWeight[i]).roundToInt().coerceIn(0, 255),
+                    (colorGSum[i] / colorWeight[i]).roundToInt().coerceIn(0, 255),
+                    (colorBSum[i] / colorWeight[i]).roundToInt().coerceIn(0, 255)
+                )
+                Color.colorToHSV(binColor, candidateHsv)
+                val rawDiff = abs(candidateHsv[0] - domHue)
+                val hueDiff = min(rawDiff, 360f - rawDiff)
+                if (hueDiff < 24f && abs(candidateHsv[2] - domHsv[2]) < 0.22f) continue
+                val prominence = (colorWeight[i] / totalColorWeight).coerceAtMost(0.45f)
+                val score = (hueDiff / 180f) * 1.45f + candidateHsv[1] * 1.1f + candidateHsv[2] * 0.65f + prominence
+                if (score > bestSecScore) {
+                    bestSecScore = score
+                    bestSecBin = i
+                }
+            }
+
+            val secHsv = FloatArray(3)
+            if (bestSecBin >= 0) {
+                val secRaw = Color.rgb(
+                    (colorRSum[bestSecBin] / colorWeight[bestSecBin]).roundToInt().coerceIn(0, 255),
+                    (colorGSum[bestSecBin] / colorWeight[bestSecBin]).roundToInt().coerceIn(0, 255),
+                    (colorBSum[bestSecBin] / colorWeight[bestSecBin]).roundToInt().coerceIn(0, 255)
+                )
+                Color.colorToHSV(secRaw, secHsv)
+                secHsv[1] = secHsv[1].coerceIn(0.42f, 0.88f)
+                secHsv[2] = secHsv[2].coerceAtLeast(0.88f)
+            } else {
+                // Cover monocromatica: genera colore analogo spostando la hue di ±22°
+                val hueShift = if (domHue in 25f..180f) -22f else 24f
+                secHsv[0] = (domHue + hueShift + 360f) % 360f
+                secHsv[1] = domHsv[1].coerceIn(0.45f, 0.78f)
+                secHsv[2] = 0.94f
+            }
+
+            var activeColor = enforceContrastRatio(Color.HSVToColor(255, secHsv), bgStartColor, minRatio = 5.5)
+            ExpandedTwoToneTheme(bgStartColor, bgEndColor, activeColor)
         } catch (_: Throwable) {
-            null
+            ExpandedTwoToneTheme(
+                bgStartColor = 0xFF1C2029.toInt(),
+                bgEndColor = 0xFF10131A.toInt(),
+                activeLyricColor = Color.WHITE
+            )
         }
+    }
+
+    private fun enforceContrastRatio(fgColor: Int, bgColor: Int, minRatio: Double): Int {
+        if (ColorUtils.calculateContrast(fgColor, bgColor) >= minRatio) {
+            return fgColor
+        }
+        val hsv = FloatArray(3)
+        Color.colorToHSV(fgColor, hsv)
+        var candidate = fgColor
+        for (step in 1..20) {
+            val factor = step / 20f
+            hsv[2] = (hsv[2] + (1f - hsv[2]) * 0.34f).coerceAtMost(1f)
+            hsv[1] = (hsv[1] * (1f - 0.16f * factor)).coerceAtLeast(0.06f)
+            candidate = Color.HSVToColor(255, hsv)
+            if (step >= 10) {
+                candidate = ColorUtils.blendARGB(candidate, Color.rgb(255, 250, 244), 0.25f)
+                Color.colorToHSV(candidate, hsv)
+            }
+            if (ColorUtils.calculateContrast(candidate, bgColor) >= minRatio) {
+                return candidate
+            }
+        }
+        return Color.WHITE
+    }
+
+    private fun resolveExpandedTheme(cover: Bitmap?): ExpandedTwoToneTheme {
+        if (cover == null || cover.isRecycled || cover.width <= 0 || cover.height <= 0) {
+            return ExpandedTwoToneTheme(
+                bgStartColor = 0xFF1C2029.toInt(),
+                bgEndColor = 0xFF10131A.toInt(),
+                activeLyricColor = Color.WHITE
+            )
+        }
+        val existing = cachedTwoToneTheme
+        if (existing != null && cachedThemeCoverRef === cover) {
+            return existing
+        }
+        val extracted = extractTwoTonePalette(cover)
+        cachedThemeCoverRef = cover
+        cachedTwoToneTheme = extracted
+        return extracted
+    }
+
+    private fun getOrCreateExpandedBgBitmap(
+        albumArtHash: Int,
+        theme: ExpandedTwoToneTheme
+    ): Bitmap {
+        val key = "${albumArtHash}_${theme.bgStartColor}_${theme.bgEndColor}"
+        expandedBgCache.get(key)?.let { if (!it.isRecycled) return it }
+
+        val w = EXPANDED_BG_WIDTH
+        val h = EXPANDED_BG_HEIGHT
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = LinearGradient(
+                0f,
+                0f,
+                w.toFloat(),
+                h.toFloat(),
+                theme.bgStartColor,
+                theme.bgEndColor,
+                Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), bgPaint)
+
+        // Leggerissimo bordo interno lucido (1px bianco alpha 22)
+        val borderPaint = Paint().apply {
+            color = Color.argb(22, 255, 255, 255)
+            style = Paint.Style.STROKE
+            strokeWidth = 1f
+        }
+        canvas.drawRect(0.5f, 0.5f, w - 0.5f, h - 0.5f, borderPaint)
+
+        expandedBgCache.put(key, bmp)
+        return bmp
     }
 
     fun buildNotification(
@@ -951,7 +1123,7 @@ class HyperIslandNotifier(private val context: Context) {
             audioCodecBadge = audioCodecBadge,
             audioSpecBadge = audioSpecBadge
         )
-        val dominantColor = resolveDominantColor(cover, palette)
+        val theme = resolveExpandedTheme(cover)
         val (prevText, currText, nextText) = resolveDisplayLines(
             prevLyric = prevLyric,
             currentLine = currentLine,
@@ -970,7 +1142,7 @@ class HyperIslandNotifier(private val context: Context) {
             cleanTitleFallback = getCleanTitle(title),
             wingState = wingState,
             albumArtHash = albumArtHash,
-            dominantColor = dominantColor,
+            theme = theme,
             prevText = prevText,
             currText = currText,
             nextText = nextText,
@@ -1005,7 +1177,7 @@ class HyperIslandNotifier(private val context: Context) {
             audioCodecBadge = audioCodecBadge,
             audioSpecBadge = audioSpecBadge
         )
-        val dominantColor = resolveDominantColor(cover, palette)
+        val theme = resolveExpandedTheme(cover)
         val (prevText, currText, nextText) = resolveDisplayLines(
             prevLyric = prevLyric,
             currentLine = currentLine,
@@ -1020,9 +1192,9 @@ class HyperIslandNotifier(private val context: Context) {
             isPlaying = isPlaying
         )
         lastFullStateKey =
-            "${wingState.leftText}|${wingState.leftNarrowFont}|${wingState.leftIconKey}|" +
-            "${wingState.rightText}|${wingState.rightNarrowFont}|${wingState.rightIconKey}|" +
-            "$isPlaying|$dominantColor|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
+            "${wingState.leftText}|${wingState.leftIconKey}|" +
+            "${wingState.rightText}|${wingState.rightIconKey}|" +
+            "$isPlaying|${theme.bgStartColor}|${theme.activeLyricColor}|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
     }
 
     fun resetCache() {
@@ -1057,7 +1229,7 @@ class HyperIslandNotifier(private val context: Context) {
             audioCodecBadge = audioCodecBadge,
             audioSpecBadge = audioSpecBadge
         )
-        val dominantColor = resolveDominantColor(cover, palette)
+        val theme = resolveExpandedTheme(cover)
         val (prevText, currText, nextText) = resolveDisplayLines(
             prevLyric = prevLyric,
             currentLine = currentLine,
@@ -1073,9 +1245,9 @@ class HyperIslandNotifier(private val context: Context) {
         )
 
         val fullStateKey =
-            "${wingState.leftText}|${wingState.leftNarrowFont}|${wingState.leftIconKey}|" +
-            "${wingState.rightText}|${wingState.rightNarrowFont}|${wingState.rightIconKey}|" +
-            "$isPlaying|$dominantColor|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
+            "${wingState.leftText}|${wingState.leftIconKey}|" +
+            "${wingState.rightText}|${wingState.rightIconKey}|" +
+            "$isPlaying|${theme.bgStartColor}|${theme.activeLyricColor}|$albumArtHash|$hasSyncedLyrics|$prevText|$currText|$nextText"
 
         if (fullStateKey == lastFullStateKey) return
         lastFullStateKey = fullStateKey
@@ -1087,7 +1259,7 @@ class HyperIslandNotifier(private val context: Context) {
                     cleanTitleFallback = getCleanTitle(title),
                     wingState = wingState,
                     albumArtHash = albumArtHash,
-                    dominantColor = dominantColor,
+                    theme = theme,
                     prevText = prevText,
                     currText = currText,
                     nextText = nextText,
@@ -1104,16 +1276,6 @@ class HyperIslandNotifier(private val context: Context) {
     fun cancel() {
         lastFullStateKey = ""
         manager.cancel(NOTIFICATION_ID)
-    }
-
-    private fun boostAccentBrightness(color: Int): Int {
-        Color.colorToHSV(color, hsvBuffer)
-        if (hsvBuffer[1] < 0.14f) {
-            return Color.rgb(228, 236, 255)
-        }
-        hsvBuffer[2] = hsvBuffer[2].coerceAtLeast(0.95f)
-        hsvBuffer[1] = hsvBuffer[1].coerceIn(0.50f, 0.94f)
-        return Color.HSVToColor(255, hsvBuffer)
     }
 
     private fun getOrCreateProgressRingIcon(

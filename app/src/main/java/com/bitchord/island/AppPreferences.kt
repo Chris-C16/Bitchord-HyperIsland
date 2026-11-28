@@ -7,6 +7,8 @@ import android.content.SharedPreferences
 import android.os.Build
 import android.os.Process
 import kotlinx.coroutines.flow.MutableStateFlow
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.PrintWriter
 import java.io.StringWriter
 import kotlin.system.exitProcess
@@ -59,8 +61,17 @@ object AppPreferences {
     private const val KEY_LAST_CRASH = "last_uncaught_crash"
     private const val KEY_SHADER_SAFE_MODE = "shader_safe_mode"
     private const val KEY_SHADER_PENDING_FRAME = "shader_pending_frame"
+    private const val KEY_BITCHORD_QUALITY_LRU = "bitchord_quality_lru_v1"
+    private const val MAX_QUALITY_CACHE_ENTRIES = 100
 
     const val FACTORY_DEFAULT_OFFSET_MS = 600L
+
+    private val qualityLock = Any()
+    private val qualityCache = object : LinkedHashMap<String, Pair<String, String>>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, String>>?): Boolean {
+            return size > MAX_QUALITY_CACHE_ENTRIES
+        }
+    }
 
     @Volatile
     private var prefs: SharedPreferences? = null
@@ -127,6 +138,7 @@ object AppPreferences {
         lastActiveMusicPackage.value = safeString(sp, KEY_LAST_ACTIVE_PKG, "")
         targetFps.value = TargetFps.fromFps(safeInt(sp, KEY_TARGET_FPS, TargetFps.FPS_60.fps))
         lastUncaughtCrash.value = safeString(sp, KEY_LAST_CRASH, "")
+        loadQualityCacheLocked(sp)
 
         val wasPending = safeBoolean(sp, KEY_SHADER_PENDING_FRAME, false)
         val savedSafeMode = safeBoolean(sp, KEY_SHADER_SAFE_MODE, false)
@@ -291,5 +303,63 @@ object AppPreferences {
                 ?: lastActiveMusicPackage.value.takeIf { it.isNotBlank() }
         }
         return lastActiveMusicPackage.value.takeIf { it.isNotBlank() }
+    }
+
+    private fun loadQualityCacheLocked(sp: SharedPreferences) {
+        val raw = safeString(sp, KEY_BITCHORD_QUALITY_LRU, "")
+        if (raw.isBlank()) return
+        synchronized(qualityLock) {
+            qualityCache.clear()
+            try {
+                val arr = JSONArray(raw)
+                val start = (arr.length() - MAX_QUALITY_CACHE_ENTRIES).coerceAtLeast(0)
+                for (i in start until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val k = obj.optString("k")
+                    val c = obj.optString("c")
+                    val s = obj.optString("s")
+                    if (k.isNotBlank() && c.isNotBlank() && s.isNotBlank()) {
+                        qualityCache[k] = c to s
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun getCachedBitChordQuality(context: Context, trackKey: String): Pair<String, String>? {
+        if (trackKey.isBlank()) return null
+        init(context)
+        return synchronized(qualityLock) {
+            qualityCache[trackKey]
+        }
+    }
+
+    fun putCachedBitChordQuality(
+        context: Context,
+        trackKey: String,
+        codec: String,
+        spec: String
+    ) {
+        if (trackKey.isBlank() || codec.isBlank() || spec.isBlank()) return
+        init(context)
+        val serialized = synchronized(qualityLock) {
+            qualityCache[trackKey] = codec to spec
+            val arr = JSONArray()
+            for ((k, v) in qualityCache) {
+                arr.put(
+                    JSONObject().apply {
+                        put("k", k)
+                        put("c", v.first)
+                        put("s", v.second)
+                    }
+                )
+            }
+            arr.toString()
+        }
+        try {
+            prefs?.edit()?.putString(KEY_BITCHORD_QUALITY_LRU, serialized)?.apply()
+        } catch (_: Throwable) {
+        }
     }
 }

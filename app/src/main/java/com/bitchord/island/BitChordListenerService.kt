@@ -11,11 +11,6 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
-import android.media.AudioAttributes
-import android.media.AudioDeviceCallback
-import android.media.AudioDeviceInfo
-import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -167,6 +162,23 @@ class BitChordListenerService : NotificationListenerService() {
             }
         }
 
+        fun onBitChordQualityDetected(context: Context, trackKey: String) {
+            companionHandler.post {
+                val inst = instance ?: return@post
+                val activeKey = LyricsPlaybackStore.buildTrackQualityKey(inst.currentTitle, inst.currentArtist)
+                if (activeKey == trackKey) {
+                    val prevCodec = inst.currentCodecBadge
+                    val prevSpec = inst.currentSpecBadge
+                    inst.refreshSourceQuality(inst.activeController?.metadata, inst.activeController?.extras)
+                    if (inst.currentCodecBadge != prevCodec || inst.currentSpecBadge != prevSpec) {
+                        inst.lastRenderKey = ""
+                        val playing = inst.activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
+                        inst.syncLyrics(isPlaying = playing, forceImmediate = true)
+                    }
+                }
+            }
+        }
+
         private fun launchOrResumePreferredApp(context: Context) {
             val pkg = AppPreferences.getLaunchTargetPackage(context) ?: return
             try {
@@ -203,7 +215,6 @@ class BitChordListenerService : NotificationListenerService() {
     private lateinit var sessionManager: MediaSessionManager
     private lateinit var uiModeManager: UiModeManager
     private lateinit var powerManager: PowerManager
-    private lateinit var audioManager: AudioManager
 
     private var activeController: MediaController? = null
     private var fetchJob: Job? = null
@@ -228,16 +239,6 @@ class BitChordListenerService : NotificationListenerService() {
     private var currentNotificationHiRes = false
     private var currentCodecBadge = "Hi-Fi"
     private var currentSpecBadge = "Lossless"
-
-    private val audioDeviceCallback = object : AudioDeviceCallback() {
-        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-            handleAudioRouteChanged()
-        }
-
-        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-            handleAudioRouteChanged()
-        }
-    }
 
     private var lastLineIndex = -1
     private var lastRenderKey = ""
@@ -358,11 +359,6 @@ class BitChordListenerService : NotificationListenerService() {
         sessionManager = getSystemService(MediaSessionManager::class.java)
         uiModeManager = getSystemService(UiModeManager::class.java)
         powerManager = getSystemService(PowerManager::class.java)
-        audioManager = getSystemService(AudioManager::class.java)
-        try {
-            audioManager.registerAudioDeviceCallback(audioDeviceCallback, handler)
-        } catch (_: Throwable) {
-        }
         isScreenInteractive = try {
             powerManager.isInteractive
         } catch (_: Throwable) {
@@ -616,19 +612,6 @@ class BitChordListenerService : NotificationListenerService() {
         val isHiRes: Boolean = false
     )
 
-    private fun handleAudioRouteChanged() {
-        val pkg = currentPlayerPackage
-        if (pkg.isBlank() || !pkg.lowercase().contains("bitchord")) return
-        val prevCodec = currentCodecBadge
-        val prevSpec = currentSpecBadge
-        refreshSourceQuality(activeController?.metadata, activeController?.extras)
-        if (currentCodecBadge != prevCodec || currentSpecBadge != prevSpec) {
-            lastRenderKey = ""
-            val playing = activeController?.playbackState?.state == PlaybackState.STATE_PLAYING
-            syncLyrics(isPlaying = playing, forceImmediate = true)
-        }
-    }
-
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         sbn ?: return
         if (sbn.packageName == packageName) return
@@ -738,17 +721,23 @@ class BitChordListenerService : NotificationListenerService() {
     }
 
     private fun formatSpecBadge(rateKhzRaw: String?, bitDepth: String?): String? {
-        val shortKhz = rateKhzRaw?.substringBefore('.')?.takeIf { it.isNotBlank() }
+        val cleanRate = rateKhzRaw?.let { if (it.endsWith(".0")) it.removeSuffix(".0") else it }?.takeIf { it.isNotBlank() }
         val cleanBit = bitDepth?.takeIf { it.isNotBlank() }
         return when {
-            shortKhz != null && cleanBit != null -> {
-                val full = "${shortKhz}k ${cleanBit}Bit"
-                if (full.length <= 9) full else "${shortKhz}k ${cleanBit}b"
+            cleanRate != null && cleanBit != null -> {
+                val full = "${cleanRate}k ${cleanBit}Bit"
+                if (full.length <= 10) {
+                    full
+                } else {
+                    val intRate = cleanRate.substringBefore('.')
+                    val compact = "${intRate}k ${cleanBit}Bit"
+                    if (compact.length <= 10) compact else "${intRate}k ${cleanBit}b"
+                }
             }
             cleanBit != null -> "${cleanBit}Bit"
-            rateKhzRaw != null -> {
-                val solo = "${rateKhzRaw}kHz"
-                if (solo.length <= 9) solo else "${shortKhz}kHz"
+            cleanRate != null -> {
+                val solo = "${cleanRate}kHz"
+                if (solo.length <= 10) solo else "${cleanRate.substringBefore('.')}kHz"
             }
             else -> null
         }
@@ -813,97 +802,6 @@ class BitChordListenerService : NotificationListenerService() {
             parseAudioInfoFromFields(fields)
         } catch (_: Throwable) {
             ParsedAudioInfo()
-        }
-    }
-
-    private fun devicePriorityScore(type: Int): Int = when (type) {
-        AudioDeviceInfo.TYPE_USB_DEVICE,
-        AudioDeviceInfo.TYPE_USB_HEADSET,
-        AudioDeviceInfo.TYPE_USB_ACCESSORY -> 4
-        AudioDeviceInfo.TYPE_BLE_HEADSET,
-        AudioDeviceInfo.TYPE_BLE_SPEAKER,
-        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 3
-        AudioDeviceInfo.TYPE_WIRED_HEADSET,
-        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-        AudioDeviceInfo.TYPE_LINE_DIGITAL,
-        AudioDeviceInfo.TYPE_LINE_ANALOG -> 2
-        else -> 1
-    }
-
-    private fun estimateSpecFromAudioManager(): String? {
-        return try {
-            val mediaAttrs = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                .build()
-            val routedSinks = try {
-                audioManager.getAudioDevicesForAttributes(mediaAttrs).filter { it.isSink }
-            } catch (_: Throwable) {
-                emptyList()
-            }
-            val candidateDevices = if (routedSinks.isNotEmpty()) {
-                routedSinks
-            } else {
-                audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { it.isSink }
-            }
-            val preferredDevice = candidateDevices.maxByOrNull { devicePriorityScore(it.type) }
-
-            val propRateHz = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
-                ?.toIntOrNull()
-                ?.takeIf { it in 44100..192000 }
-            val devRates = preferredDevice?.sampleRates?.filter { it in 44100..192000 }.orEmpty()
-            val isUsbDac = preferredDevice != null && (
-                preferredDevice.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
-                    preferredDevice.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
-                    preferredDevice.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
-                )
-            val isBtAudio = preferredDevice != null && (
-                preferredDevice.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                    preferredDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                    preferredDevice.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
-                )
-
-            val resolvedRateHz: Int? = if (devRates.isNotEmpty()) {
-                when {
-                    isUsbDac && 96000 in devRates -> 96000
-                    isBtAudio && propRateHz != null && propRateHz in devRates -> propRateHz
-                    isBtAudio && 48000 in devRates -> 48000
-                    isBtAudio && 44100 in devRates -> 44100
-                    propRateHz != null && propRateHz in devRates -> propRateHz
-                    48000 in devRates -> 48000
-                    44100 in devRates -> 44100
-                    else -> devRates.firstOrNull()
-                }
-            } else {
-                propRateHz
-            }
-
-            val rateKhzRaw = when (resolvedRateHz) {
-                44100 -> "44.1"
-                48000 -> "48"
-                88200 -> "88.2"
-                96000 -> "96"
-                176400 -> "176.4"
-                192000 -> "192"
-                else -> resolvedRateHz?.let { (it / 1000).toString() }
-            }
-
-            val encodings = preferredDevice?.encodings ?: IntArray(0)
-            val supportsHighBit = encodings.any {
-                it == AudioFormat.ENCODING_PCM_24BIT_PACKED ||
-                    it == AudioFormat.ENCODING_PCM_32BIT ||
-                    it == AudioFormat.ENCODING_PCM_FLOAT
-            }
-            val supports16Bit = AudioFormat.ENCODING_PCM_16BIT in encodings
-            val bitDepth = when {
-                supportsHighBit -> "24"
-                supports16Bit -> "16"
-                else -> null
-            }
-
-            formatSpecBadge(rateKhzRaw, bitDepth)
-        } catch (_: Throwable) {
-            null
         }
     }
 
@@ -995,12 +893,26 @@ class BitChordListenerService : NotificationListenerService() {
         val hasHiResTag = parsedMeta.isHiRes || currentNotificationHiRes
 
         val metadataSpec = formatSpecBadge(detectedRate, detectedBit)
+        val trackQualityKey = LyricsPlaybackStore.buildTrackQualityKey(currentTitle, currentArtist)
 
         if (isBitChord) {
-            currentCodecBadge = detectedCodec ?: "FLAC"
-            currentSpecBadge = metadataSpec
-                ?: estimateSpecFromAudioManager()
-                ?: if (hasHiResTag) "Hi-Res" else "Lossless"
+            if (metadataSpec != null) {
+                val resolvedCodec = detectedCodec ?: "FLAC"
+                currentCodecBadge = resolvedCodec
+                currentSpecBadge = metadataSpec
+                if (trackQualityKey.isNotBlank()) {
+                    AppPreferences.putCachedBitChordQuality(this, trackQualityKey, resolvedCodec, metadataSpec)
+                }
+            } else {
+                val cached = AppPreferences.getCachedBitChordQuality(this, trackQualityKey)
+                if (cached != null) {
+                    currentCodecBadge = detectedCodec ?: cached.first
+                    currentSpecBadge = cached.second
+                } else {
+                    currentCodecBadge = detectedCodec ?: "FLAC"
+                    currentSpecBadge = if (hasHiResTag) "Hi-Res" else "Lossless"
+                }
+            }
         } else {
             val (defaultCodec, defaultSpec) = when {
                 pkgLower.contains("spotify") -> "Spotify" to "320k"
@@ -1347,8 +1259,8 @@ class BitChordListenerService : NotificationListenerService() {
         val albumArtHash = (currentCoverSig xor (currentCoverSig ushr 32)).toInt()
 
         val renderKey = "$currentTrackKey|$idx|$isPlaying|" +
-            "${wingState.leftText}|${wingState.leftNarrowFont}|${wingState.leftIconKey}|" +
-            "${wingState.rightText}|${wingState.rightNarrowFont}|${wingState.rightIconKey}|" +
+            "${wingState.leftText}|${wingState.leftIconKey}|" +
+            "${wingState.rightText}|${wingState.rightIconKey}|" +
             "${wingState.progressStep}|$currentCodecBadge|$currentSpecBadge|$albumArtHash"
         if (!forceImmediate && renderKey == lastRenderKey) return
 
@@ -1487,10 +1399,6 @@ class BitChordListenerService : NotificationListenerService() {
         if (instance === this) instance = null
         stopTicker()
         handler.removeCallbacksAndMessages(null)
-        try {
-            audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
-        } catch (_: Throwable) {
-        }
         fetchJob?.cancel()
         paletteJob?.cancel()
         activeController?.unregisterCallback(mediaCallback)

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_bitchord_quality_label">Qualità reale BitChord</string>
+    <string name="accessibility_bitchord_quality_desc">Attiva DynamicLyrics per leggere Bit e kHz reali da BitChord</string>
+</resources>

@@ -3118,6 +3118,23 @@ private fun LiquidSettingsModal(
     val notifGranted = BitChordListenerService.isNotificationAccessGranted(context)
     val postNotifOk = BitChordListenerService.areNotificationsEnabled(context)
     val serviceAlive by BitChordListenerService.isServiceConnected.collectAsState()
+    val accConnected by BitChordQualityAccessibilityService.isServiceConnected.collectAsState()
+    var resumeTrigger by remember { mutableIntStateOf(0) }
+    val lifecycleOwner = context as? androidx.lifecycle.LifecycleOwner
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                resumeTrigger++
+            }
+        }
+        lifecycleOwner?.lifecycle?.addObserver(observer)
+        onDispose {
+            lifecycleOwner?.lifecycle?.removeObserver(observer)
+        }
+    }
+    val bitChordAccessibilityOk = remember(accConnected, resumeTrigger) {
+        accConnected || BitChordQualityAccessibilityService.isAccessibilityServiceEnabled(context)
+    }
     val (appFps, displayHz) = rememberFrameRateTelemetry(targetFps)
 
     Box(
@@ -3272,6 +3289,25 @@ private fun LiquidSettingsModal(
                 ok = notifGranted,
                 font = font,
                 onClick = { openNotificationListenerSettings(context) }
+            )
+            Spacer(Modifier.height(8.dp))
+            DiagnosticRow(
+                label = "Qualità reale BitChord",
+                status = if (bitChordAccessibilityOk) "Attivo" else "Non attivo",
+                ok = bitChordAccessibilityOk,
+                font = font,
+                onClick = { openAccessibilitySettings(context) }
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "Attiva DynamicLyrics per leggere Bit e kHz reali da BitChord",
+                fontFamily = font,
+                fontSize = 11.sp,
+                lineHeight = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = Color.White.copy(alpha = 0.68f),
+                modifier = Modifier.padding(horizontal = 6.dp)
             )
             Spacer(Modifier.height(8.dp))
             DiagnosticRow(
@@ -3893,6 +3929,16 @@ fun openAppNotificationSettings(context: Context) {
 fun openNotificationListenerSettings(context: Context) {
     try {
         val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (_: Throwable) {
+    }
+}
+
+fun openAccessibilitySettings(context: Context) {
+    try {
+        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)

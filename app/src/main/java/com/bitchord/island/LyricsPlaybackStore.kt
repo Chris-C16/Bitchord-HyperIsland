@@ -37,4 +37,11 @@ object LyricsPlaybackStore {
     fun currentPositionMs(): Long {
         return (rawPositionMs() + syncOffsetMs.value).coerceAtLeast(0L)
     }
+
+    fun buildTrackQualityKey(title: String, artist: String): String {
+        val cleanTitle = title.trim().replace(Regex("\\s+"), " ").lowercase()
+        if (cleanTitle.isEmpty()) return ""
+        val cleanArtist = artist.trim().replace(Regex("\\s+"), " ").lowercase()
+        return "$cleanTitle|$cleanArtist"
+    }
 }
